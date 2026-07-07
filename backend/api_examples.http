@@ -1,0 +1,186 @@
+### Data Quality Platform - API Examples
+### Use with VS Code REST Client extension or copy to Postman
+
+@baseUrl = http://localhost:8000/api/v1
+@database = YOUR_DATABASE
+@schema = YOUR_SCHEMA
+@table = YOUR_TABLE
+
+### Health Check
+GET http://localhost:8000/health
+
+### Root
+GET http://localhost:8000/
+
+###############################################################################
+# DISCOVERY
+###############################################################################
+
+### List Snowflake Databases
+GET {{baseUrl}}/assets/discover/databases
+
+### List Schemas in Database
+GET {{baseUrl}}/assets/discover/schemas/{{database}}
+
+### List Tables in Schema
+GET {{baseUrl}}/assets/discover/tables/{{database}}/{{schema}}
+
+###############################################################################
+# RULES
+###############################################################################
+
+### Initialize Default Rules (run once)
+POST {{baseUrl}}/rules/initialize
+
+### List All Rules
+GET {{baseUrl}}/rules
+
+### List Active Rules Only
+GET {{baseUrl}}/rules?is_active=true
+
+### Get Rule by ID
+GET {{baseUrl}}/rules/RULE_ID
+
+### Create Custom Rule
+POST {{baseUrl}}/rules
+Content-Type: application/json
+
+{
+  "code": "TABLE_NAME_UPPERCASE",
+  "name": "Table Name Should Be Uppercase",
+  "description": "All table names should follow uppercase naming convention",
+  "category": "naming",
+  "severity": "low",
+  "applies_to": ["table"],
+  "rule_config": {},
+  "is_active": true
+}
+
+###############################################################################
+# SCANS
+###############################################################################
+
+### Trigger Table Scan
+POST {{baseUrl}}/scans/table
+Content-Type: application/json
+
+{
+  "database": "{{database}}",
+  "schema": "{{schema}}",
+  "table": "{{table}}"
+}
+
+### List All Scans
+GET {{baseUrl}}/scans
+
+### List Scans for Specific Asset
+GET {{baseUrl}}/scans?asset_id=ASSET_ID
+
+### Get Scan Details
+GET {{baseUrl}}/scans/SCAN_ID
+
+###############################################################################
+# ASSETS
+###############################################################################
+
+### List All Assets
+GET {{baseUrl}}/assets
+
+### List Tables Only
+GET {{baseUrl}}/assets?asset_type=table
+
+### List Assets in Specific Database
+GET {{baseUrl}}/assets?database_name={{database}}
+
+### List Assets in Specific Schema
+GET {{baseUrl}}/assets?database_name={{database}}&schema_name={{schema}}
+
+### Get Asset Details
+GET {{baseUrl}}/assets/ASSET_ID
+
+###############################################################################
+# FINDINGS
+###############################################################################
+
+### List All Findings
+GET {{baseUrl}}/findings
+
+### List Findings - Critical Severity Only
+GET {{baseUrl}}/findings?severity=critical
+
+### List Findings - High Severity Only
+GET {{baseUrl}}/findings?severity=high
+
+### List Findings by Status
+GET {{baseUrl}}/findings?status=detected
+
+### List Findings for Specific Asset
+GET {{baseUrl}}/findings?asset_id=ASSET_ID
+
+### List Findings from Specific Scan
+GET {{baseUrl}}/findings?scan_id=SCAN_ID
+
+### Get Finding Details
+GET {{baseUrl}}/findings/FINDING_ID
+
+### Get Findings Summary Statistics
+GET {{baseUrl}}/findings/stats/summary
+
+### Update Finding Status - Validate
+PATCH {{baseUrl}}/findings/FINDING_ID
+Content-Type: application/json
+
+{
+  "status": "validated"
+}
+
+### Update Finding Status - Assign
+PATCH {{baseUrl}}/findings/FINDING_ID
+Content-Type: application/json
+
+{
+  "status": "assigned",
+  "assigned_to": "john.doe@company.com"
+}
+
+### Update Finding Status - Resolve
+PATCH {{baseUrl}}/findings/FINDING_ID
+Content-Type: application/json
+
+{
+  "status": "resolved",
+  "resolution_notes": "Added table comment with business context"
+}
+
+### Mark Finding as False Positive
+PATCH {{baseUrl}}/findings/FINDING_ID
+Content-Type: application/json
+
+{
+  "status": "false_positive",
+  "resolution_notes": "This table is intentionally undocumented as it's temporary"
+}
+
+###############################################################################
+# TYPICAL WORKFLOWS
+###############################################################################
+
+### Workflow 1: Discover and Scan
+# 1. List databases
+# 2. List schemas in chosen database
+# 3. List tables in chosen schema
+# 4. Trigger scan on chosen table
+# 5. View findings
+
+### Workflow 2: Review Findings
+# 1. Get findings summary
+# 2. List high severity findings
+# 3. Get finding details
+# 4. Update finding status
+# 5. Assign to team member
+
+### Workflow 3: Monitor Progress
+# 1. List all scans
+# 2. Check latest scan status
+# 3. View findings from scan
+# 4. Track resolution progress

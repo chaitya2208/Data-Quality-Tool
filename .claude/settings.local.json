@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/cshah/Downloads/**)",
+      "Bash(npx create-react-app *)",
+      "Bash(npm create *)"
+    ]
+  }
+}
