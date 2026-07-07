@@ -42,10 +42,12 @@ class FindingsAgent:
         classification: dict,
         ai_violations: List[Dict[str, Any]],
         intelligence_agent,  # RuleIntelligenceAgent instance for severity helpers
+        allowed_codes: set = None,  # if provided, overrides classification selection
     ) -> List[Finding]:
 
-        selected_codes: Set[str] = intelligence_agent.get_selected_codes(classification)
-        skipped_codes:  Set[str] = intelligence_agent.get_skipped_codes(classification)
+        # Use explicit allowed_codes if provided (post-review), else use classification
+        selected_codes: Set[str] = allowed_codes if allowed_codes is not None else intelligence_agent.get_selected_codes(classification)
+        skipped_codes:  Set[str] = intelligence_agent.get_skipped_codes(classification) if allowed_codes is None else set()
 
         logger.info(
             f"[FindingsAgent] Running {len(selected_codes)} selected rules + "

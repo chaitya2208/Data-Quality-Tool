@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { assetsApi, agentRunsApi } from '../api/client'
-import type { AgentRun, AgentTask } from '../api/client'
+import { assetsApi, agentRunsApi, findingsApi } from '../api/client'
+import type { AgentRun, AgentTask, RuleReviewEntry } from '../api/client'
 import {
   GitBranch, Database, BrainCircuit, Shield, AlertCircle,
   Wrench, CheckCircle2, Loader2, ChevronDown, ChevronRight,
@@ -67,10 +67,10 @@ const AGENTS = [
   },
 ] as const
 
-type RunStatus = 'pending' | 'running' | 'awaiting_fixes' | 'completed' | 'failed'
+type RunStatus = 'pending' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes' | 'completed' | 'failed'
 
 function isPolling(status: RunStatus) {
-  return status === 'running' || status === 'awaiting_fixes'
+  return status === 'running' || status === 'awaiting_rule_review' || status === 'awaiting_fixes'
 }
 
 function fixIssuesStatus(runStatus: RunStatus): string {
@@ -156,7 +156,7 @@ function AgentNode({
           } ${isFixNode && status === 'active' ? 'cursor-pointer hover:shadow-md' : ''}`}
           onClick={() => {
             if (isFixNode && status === 'active' && scanId) {
-              navigate(`/findings?scan_id=${scanId}`)
+              navigate(`/findings?scan_id=${scanId}&status=detected`)
             } else if (hasLogs) {
               setExpanded(e => !e)
             }
@@ -242,6 +242,22 @@ function ParallelGroup({ children }: { children: React.ReactNode }) {
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
+const STORAGE_KEY = 'dq_active_run_id'
+
+function usePersistedRunId() {
+  const [runId, setRunId] = useState<string | null>(() => {
+    try { return localStorage.getItem(STORAGE_KEY) } catch { return null }
+  })
+  const set = (id: string | null) => {
+    setRunId(id)
+    try {
+      if (id) localStorage.setItem(STORAGE_KEY, id)
+      else localStorage.removeItem(STORAGE_KEY)
+    } catch {}
+  }
+  return [runId, set] as const
+}
+
 export default function AgentWorkflow() {
   const navigate    = useNavigate()
   const queryClient = useQueryClient()
@@ -249,7 +265,13 @@ export default function AgentWorkflow() {
   const [selectedDatabase, setSelectedDatabase] = useState('')
   const [selectedSchema,   setSelectedSchema]   = useState('')
   const [selectedTable,    setSelectedTable]     = useState('')
-  const [activeRunId,      setActiveRunId]       = useState<string | null>(null)
+  const [activeRunId,      setActiveRunId]       = usePersistedRunId()
+  const [collapsed,        setCollapsed]         = useState(false)
+  // Local editable copy of rule review state — initialized from server on pause
+  const [reviewActive,  setReviewActive]  = useState<RuleReviewEntry[]>([])
+  const [reviewSkipped, setReviewSkipped] = useState<RuleReviewEntry[]>([])
+  const [editingRule,   setEditingRule]   = useState<string | null>(null) // rule code being edited
+  const [editForm,      setEditForm]      = useState<Partial<RuleReviewEntry>>({})
 
   const { data: databases } = useQuery({
     queryKey: ['databases'],
@@ -281,6 +303,7 @@ export default function AgentWorkflow() {
 
   const runStatus    = (activeRun?.status ?? 'pending') as RunStatus
   const isRunning    = runStatus === 'running'
+  const isReviewing  = runStatus === 'awaiting_rule_review'
   const isAwaiting   = runStatus === 'awaiting_fixes'
   const isCompleted  = runStatus === 'completed'
   const isFailed     = runStatus === 'failed'
@@ -309,12 +332,81 @@ export default function AgentWorkflow() {
     },
   })
 
+  const saveReviewMutation = useMutation({
+    mutationFn: (data: { active: RuleReviewEntry[]; skipped: RuleReviewEntry[] }) =>
+      agentRunsApi.reviewRules(activeRunId!, data).then(r => r.data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['agent-run', activeRunId] }),
+  })
+
+  const runPipelineMutation = useMutation({
+    mutationFn: () => agentRunsApi.runPipeline(activeRunId!),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['agent-run', activeRunId] })
+      const iv = setInterval(() => queryClient.invalidateQueries({ queryKey: ['agent-run', activeRunId] }), 2000)
+      setTimeout(() => clearInterval(iv), 60000)
+    },
+  })
+
+  // Sync server rule_review_state → local editable state when run enters review
+  const serverReviewState = activeRun?.rule_review_state
+  // Only initialize local state once when we first enter review mode
+  const [reviewInitialized, setReviewInitialized] = useState(false)
+  if (isReviewing && serverReviewState && !reviewInitialized) {
+    setReviewActive(serverReviewState.active || [])
+    setReviewSkipped(serverReviewState.skipped || [])
+    setReviewInitialized(true)
+  }
+  if (!isReviewing && reviewInitialized) {
+    setReviewInitialized(false)
+  }
+
+  // Move a rule from active → skipped
+  const rejectRule = (code: string) => {
+    const rule = reviewActive.find(r => r.code === code)
+    if (!rule) return
+    setReviewActive(prev => prev.filter(r => r.code !== code))
+    setReviewSkipped(prev => [...prev, { ...rule, reason: rule.reason || 'Rejected by user' }])
+  }
+
+  // Move a rule from skipped → active
+  const activateRule = (code: string) => {
+    const rule = reviewSkipped.find(r => r.code === code)
+    if (!rule) return
+    setReviewSkipped(prev => prev.filter(r => r.code !== code))
+    setReviewActive(prev => [...prev, rule])
+  }
+
+  // Save edits to an AI rule
+  const saveEdit = (code: string) => {
+    setReviewActive(prev => prev.map(r =>
+      r.code === code ? { ...r, ...editForm } : r
+    ))
+    setEditingRule(null)
+    setEditForm({})
+  }
+
   const getTask = (name: string): AgentTask | undefined =>
     activeRun?.tasks.find(t => t.agent_name === name)
 
   const verifyTask   = getTask('verification_agent')
   const verifyOutput = verifyTask?.output
   const verifyDone   = verifyTask?.status === 'completed'
+
+  // Live finding stats — polls every 5s when awaiting fixes so resolved count
+  // updates immediately when developer fixes something (no manual verify needed)
+  const { data: liveFindings } = useQuery({
+    queryKey: ['workflow-findings-stats', activeRun?.scan_id],
+    queryFn: () =>
+      findingsApi.list({ scan_id: activeRun!.scan_id!, limit: 500 }).then(r => r.data),
+    enabled: !!activeRun?.scan_id && (isAwaiting || isCompleted),
+    refetchInterval: isAwaiting ? 5000 : false,
+  })
+
+  const liveResolved  = liveFindings?.findings.filter(
+    f => ['resolved', 'false_positive', 'wont_fix', 'closed'].includes(f.status)
+  ).length ?? null
+  const liveTotal     = liveFindings?.findings.length ?? activeRun?.findings_count ?? 0
+  const liveRemaining = liveTotal - (liveResolved ?? 0)
 
   const totalDuration = (() => {
     if (!activeRun?.started_at || !activeRun?.completed_at) return null
@@ -384,106 +476,301 @@ export default function AgentWorkflow() {
 
       {/* Pipeline visualization */}
       {activeRunId && activeRun && (
-        <div className="bg-white rounded-xl shadow p-6">
-          <div className="flex items-center justify-between mb-5">
-            <div>
-              <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Pipeline</h2>
-              <p className="text-xs text-gray-400 mt-0.5 font-mono">
-                {activeRun.database}.{activeRun.schema_name}.{activeRun.table}
-              </p>
+        <div className="bg-white rounded-xl shadow overflow-hidden">
+          {/* Clickable header — always visible, click to expand/collapse */}
+          <div
+            className="flex items-center justify-between px-6 py-4 cursor-pointer hover:bg-gray-50 transition-colors"
+            onClick={() => setCollapsed(c => !c)}
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              {collapsed
+                ? <ChevronRight className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                : <ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />
+              }
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Pipeline</h2>
+                  {isRunning && (
+                    <span className="flex items-center gap-1 text-xs text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-full font-medium">
+                      <Loader2 className="w-3 h-3 animate-spin" />Running
+                    </span>
+                  )}
+                  {isReviewing && (
+                    <span className="flex items-center gap-1 text-xs text-purple-700 bg-purple-50 border border-purple-200 px-2 py-0.5 rounded-full font-medium">
+                      <BrainCircuit className="w-3 h-3" />Review Rules
+                    </span>
+                  )}
+                  {isAwaiting && (
+                    <span className="flex items-center gap-1 text-xs text-primary-700 bg-primary-50 border border-primary-200 px-2 py-0.5 rounded-full font-medium">
+                      <Wrench className="w-3 h-3" />Awaiting Fixes
+                    </span>
+                  )}
+                  {isCompleted && (
+                    <span className="flex items-center gap-1 text-xs text-green-700 bg-green-50 border border-green-200 px-2 py-0.5 rounded-full font-medium">
+                      <CheckCircle2 className="w-3 h-3" />Completed
+                    </span>
+                  )}
+                  {isFailed && (
+                    <span className="flex items-center gap-1 text-xs text-red-700 bg-red-50 border border-red-200 px-2 py-0.5 rounded-full font-medium">
+                      <AlertTriangle className="w-3 h-3" />Failed
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-400 mt-0.5 font-mono truncate">
+                  {activeRun.database}.{activeRun.schema_name}.{activeRun.table}
+                </p>
+              </div>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 flex-shrink-0" onClick={e => e.stopPropagation()}>
               {totalDuration && <span className="text-xs text-gray-400 flex items-center gap-1"><Clock className="w-3 h-3" />{totalDuration}</span>}
-              {isRunning && (
-                <span className="flex items-center gap-1.5 text-xs text-blue-700 bg-blue-50 border border-blue-200 px-2.5 py-1 rounded-full font-medium">
-                  <Loader2 className="w-3 h-3 animate-spin" />Running
-                </span>
-              )}
-              {isAwaiting && (
-                <span className="flex items-center gap-1.5 text-xs text-primary-700 bg-primary-50 border border-primary-200 px-2.5 py-1 rounded-full font-medium">
-                  <Wrench className="w-3 h-3" />Awaiting Fixes
-                </span>
-              )}
-              {isCompleted && (
-                <span className="flex items-center gap-1.5 text-xs text-green-700 bg-green-50 border border-green-200 px-2.5 py-1 rounded-full font-medium">
-                  <CheckCircle2 className="w-3.5 h-3.5" />Completed
-                </span>
-              )}
-              {isFailed && (
-                <span className="flex items-center gap-1.5 text-xs text-red-700 bg-red-50 border border-red-200 px-2.5 py-1 rounded-full font-medium">
-                  <AlertTriangle className="w-3.5 h-3.5" />Failed
-                </span>
-              )}
+              <button
+                onClick={() => setActiveRunId(null)}
+                className="text-xs text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 transition-colors"
+                title="Close this run"
+              >
+                ✕
+              </button>
             </div>
           </div>
 
-          {/* Pipeline nodes with parallel group */}
-          <div className="flex items-start overflow-x-auto pb-2 gap-0">
-            {/* Coordinator */}
-            <AgentNode agentDef={AGENTS[0]} task={getTask('coordinator')}
-              isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-
-            {/* Parallel: Metadata + Rules Fetch */}
-            <ParallelGroup>
-              <AgentNode agentDef={AGENTS[1]} task={getTask('metadata_agent')}
-                isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-              <AgentNode agentDef={AGENTS[2]} task={getTask('rules_fetch_agent')}
-                isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-            </ParallelGroup>
-
-            {/* Rule Intelligence */}
-            <AgentNode agentDef={AGENTS[3]} task={getTask('rule_intelligence_agent')}
-              isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-
-            {/* Findings */}
-            <AgentNode agentDef={AGENTS[4]} task={getTask('findings_agent')}
-              isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-
-            {/* Fix Issues (UI only) */}
-            <AgentNode agentDef={AGENTS[5]} task={undefined}
-              isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-
-            {/* Verification */}
-            <AgentNode agentDef={AGENTS[6]} task={getTask('verification_agent')}
-              isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-          </div>
-
-          {/* Stats row */}
-          <div className="mt-5 pt-4 border-t border-gray-100 grid grid-cols-4 gap-4">
-            <div className="text-center">
-              <p className="text-2xl font-bold text-gray-900">{activeRun.findings_count}</p>
-              <p className="text-xs text-gray-500">Findings</p>
-            </div>
-            <div className="text-center">
-              <p className="text-2xl font-bold text-purple-600 flex items-center justify-center gap-1">
-                <Sparkles className="w-5 h-5" />{activeRun.ai_rules_count}
-              </p>
-              <p className="text-xs text-gray-500">AI rules generated</p>
-            </div>
-            <div className="text-center">
-              {verifyDone && verifyOutput ? (
-                <>
-                  <p className="text-2xl font-bold text-green-600">
-                    {verifyOutput.resolved}/{verifyOutput.total_findings}
+          {/* Collapsible body */}
+          {!collapsed && (
+            <div className="px-6 pb-6">
+              <div className="flex items-start overflow-x-auto pb-2 gap-0">
+                <AgentNode agentDef={AGENTS[0]} task={getTask('coordinator')}
+                  isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                <ParallelGroup>
+                  <AgentNode agentDef={AGENTS[1]} task={getTask('metadata_agent')}
+                    isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                  <AgentNode agentDef={AGENTS[2]} task={getTask('rules_fetch_agent')}
+                    isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                </ParallelGroup>
+                <AgentNode agentDef={AGENTS[3]} task={getTask('rule_intelligence_agent')}
+                  isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                <AgentNode agentDef={AGENTS[4]} task={getTask('findings_agent')}
+                  isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                <AgentNode agentDef={AGENTS[5]} task={undefined}
+                  isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                <AgentNode agentDef={AGENTS[6]} task={getTask('verification_agent')}
+                  isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+              </div>
+              <div className="mt-5 pt-4 border-t border-gray-100 grid grid-cols-4 gap-4">
+                <div className="text-center">
+                  <p className="text-2xl font-bold text-gray-900">{activeRun.findings_count}</p>
+                  <p className="text-xs text-gray-500">Findings</p>
+                </div>
+                <div className="text-center">
+                  <p className="text-2xl font-bold text-purple-600 flex items-center justify-center gap-1">
+                    <Sparkles className="w-5 h-5" />{activeRun.ai_rules_count}
                   </p>
-                  <p className="text-xs text-gray-500">Resolved</p>
-                </>
-              ) : (
-                <>
-                  <p className="text-2xl font-bold text-gray-300">—</p>
-                  <p className="text-xs text-gray-400">Resolved</p>
-                </>
-              )}
+                  <p className="text-xs text-gray-500">AI rules generated</p>
+                </div>
+                <div className="text-center">
+                  {liveResolved !== null ? (
+                    <>
+                      <p className={`text-2xl font-bold ${liveResolved === liveTotal ? 'text-green-600' : 'text-primary-600'}`}>
+                        {liveResolved}/{liveTotal}
+                      </p>
+                      <p className="text-xs text-gray-500">Resolved (live)</p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-2xl font-bold text-gray-300">—</p>
+                      <p className="text-xs text-gray-400">Resolved</p>
+                    </>
+                  )}
+                </div>
+                <div className="text-center">
+                  {activeRun.scan_id ? (
+                    <button onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}`)}
+                      className="text-primary-600 hover:text-primary-800 text-xs font-medium flex items-center gap-1 mx-auto mt-1">
+                      View Findings <ExternalLink className="w-3 h-3" />
+                    </button>
+                  ) : (
+                    <p className="text-xs text-gray-400">—</p>
+                  )}
+                </div>
+              </div>
             </div>
-            <div className="text-center">
-              {activeRun.scan_id ? (
-                <button onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}`)}
-                  className="text-primary-600 hover:text-primary-800 text-xs font-medium flex items-center gap-1 mx-auto mt-1">
-                  View Findings <ExternalLink className="w-3 h-3" />
-                </button>
-              ) : (
-                <p className="text-xs text-gray-400">—</p>
-              )}
+          )}
+        </div>
+      )}
+
+      {/* ── RULE REVIEW PANEL (shown when awaiting_rule_review) ─────────────── */}
+      {isReviewing && activeRunId && (
+        <div className="bg-white rounded-xl shadow overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-100 bg-purple-50">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-semibold text-purple-900 flex items-center gap-2">
+                  <BrainCircuit className="w-5 h-5 text-purple-600" />
+                  Review Rules Before Running
+                </h2>
+                <p className="text-xs text-purple-700 mt-0.5">
+                  Claude has selected {reviewActive.length} active rules and skipped {reviewSkipped.length}.
+                  Reject rules to skip them, activate skipped ones, or edit AI-generated rules. Then click Run Pipeline.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  saveReviewMutation.mutate(
+                    { active: reviewActive, skipped: reviewSkipped },
+                    { onSuccess: () => runPipelineMutation.mutate() }
+                  )
+                }}
+                disabled={saveReviewMutation.isPending || runPipelineMutation.isPending}
+                className="flex items-center gap-2 px-5 py-2.5 bg-purple-600 text-white font-medium rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-colors text-sm"
+              >
+                {(saveReviewMutation.isPending || runPipelineMutation.isPending)
+                  ? <><Loader2 className="w-4 h-4 animate-spin" />Starting...</>
+                  : <><Play className="w-4 h-4" />Run Pipeline ({reviewActive.length} rules)</>
+                }
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 divide-x divide-gray-100">
+            {/* Active Rules column */}
+            <div className="p-5">
+              <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
+                Active Rules ({reviewActive.length})
+              </h3>
+              <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
+                {reviewActive.map(rule => (
+                  <div key={rule.code} className={`rounded-lg border p-3 text-sm ${
+                    rule.is_ai_generated ? 'border-purple-200 bg-purple-50/40' : 'border-gray-200 bg-white'
+                  }`}>
+                    {editingRule === rule.code ? (
+                      /* Edit form for AI rules */
+                      <div className="space-y-2">
+                        <input
+                          value={editForm.name ?? rule.name}
+                          onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))}
+                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs font-medium"
+                          placeholder="Rule name"
+                        />
+                        <textarea
+                          value={editForm.description ?? rule.description}
+                          onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
+                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs resize-none"
+                          rows={2}
+                          placeholder="Description"
+                        />
+                        <select
+                          value={editForm.severity ?? rule.severity}
+                          onChange={e => setEditForm(f => ({ ...f, severity: e.target.value }))}
+                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
+                        >
+                          {['critical', 'high', 'medium', 'low'].map(s => (
+                            <option key={s} value={s}>{s}</option>
+                          ))}
+                        </select>
+                        <div className="flex gap-2">
+                          <button onClick={() => saveEdit(rule.code)}
+                            className="flex-1 px-2 py-1 bg-purple-600 text-white rounded text-xs font-medium hover:bg-purple-700">
+                            Save
+                          </button>
+                          <button onClick={() => { setEditingRule(null); setEditForm({}) }}
+                            className="px-2 py-1 border border-gray-300 rounded text-xs text-gray-600 hover:bg-gray-50">
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
+                            <span className="font-mono text-xs font-bold text-gray-700">{rule.code}</span>
+                            {rule.is_ai_generated && (
+                              <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-medium">AI</span>
+                            )}
+                            {rule.violated && (
+                              <span className="text-xs bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">⚠ violated</span>
+                            )}
+                            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                              rule.severity === 'critical' ? 'bg-red-100 text-red-700' :
+                              rule.severity === 'high'     ? 'bg-orange-100 text-orange-700' :
+                              rule.severity === 'medium'   ? 'bg-yellow-100 text-yellow-700' :
+                                                             'bg-blue-100 text-blue-700'
+                            }`}>{rule.severity}</span>
+                            {rule.severity !== rule.original_severity && rule.original_severity && (
+                              <span className="text-xs text-gray-400 line-through">{rule.original_severity}</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-gray-600 truncate">{rule.name}</p>
+                          {rule.reason && (
+                            <p className="text-xs text-gray-400 mt-0.5 truncate" title={rule.reason}>
+                              {rule.reason}
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex gap-1 flex-shrink-0">
+                          {rule.is_ai_generated && (
+                            <button
+                              onClick={() => { setEditingRule(rule.code); setEditForm({}) }}
+                              className="text-xs px-1.5 py-1 text-purple-600 border border-purple-200 rounded hover:bg-purple-50"
+                              title="Edit this AI rule"
+                            >
+                              Edit
+                            </button>
+                          )}
+                          <button
+                            onClick={() => rejectRule(rule.code)}
+                            className="text-xs px-1.5 py-1 text-red-600 border border-red-200 rounded hover:bg-red-50"
+                            title="Skip this rule"
+                          >
+                            Skip
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {reviewActive.length === 0 && (
+                  <p className="text-xs text-gray-400 text-center py-4">No active rules — activate some from the Skipped column.</p>
+                )}
+              </div>
+            </div>
+
+            {/* Skipped Rules column */}
+            <div className="p-5">
+              <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />
+                Skipped Rules ({reviewSkipped.length})
+              </h3>
+              <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
+                {reviewSkipped.map(rule => (
+                  <div key={rule.code} className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm opacity-75">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
+                          <span className="font-mono text-xs font-bold text-gray-500">{rule.code}</span>
+                          {rule.is_ai_generated && (
+                            <span className="text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded font-medium">AI</span>
+                          )}
+                        </div>
+                        <p className="text-xs text-gray-500 truncate">{rule.name}</p>
+                        {rule.reason && (
+                          <p className="text-xs text-gray-400 mt-0.5 truncate" title={rule.reason}>
+                            {rule.reason}
+                          </p>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => activateRule(rule.code)}
+                        className="flex-shrink-0 text-xs px-1.5 py-1 text-green-600 border border-green-200 rounded hover:bg-green-50"
+                        title="Activate this rule"
+                      >
+                        Activate
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {reviewSkipped.length === 0 && (
+                  <p className="text-xs text-gray-400 text-center py-4">No skipped rules.</p>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -588,17 +875,30 @@ export default function AgentWorkflow() {
                 🔧 Pipeline complete — fix the findings
               </h3>
               <p className="text-sm text-primary-800">
-                <strong>{activeRun.findings_count}</strong> findings detected
-                {activeRun.ai_rules_count > 0 && (
-                  <> · <strong>{activeRun.ai_rules_count}</strong> AI rules generated</>
+                {liveResolved !== null ? (
+                  <>
+                    <strong className="text-green-700">{liveResolved} resolved</strong>
+                    {' · '}
+                    <strong>{liveRemaining} remaining</strong>
+                    {' of '}
+                    {liveTotal} total
+                  </>
+                ) : (
+                  <>
+                    <strong>{activeRun.findings_count}</strong> findings detected
+                    {activeRun.ai_rules_count > 0 && (
+                      <> · <strong>{activeRun.ai_rules_count}</strong> AI rules</>
+                    )}
+                  </>
                 )}.
-                Open the Findings page, select issues, get AI SQL fixes, then verify.
+                Open Findings, select issues, get AI SQL fixes, then verify.
               </p>
             </div>
             <div className="flex flex-col gap-2 flex-shrink-0">
-              <button onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}`)}
+              <button onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}&status=detected`)}
                 className="flex items-center gap-1.5 px-4 py-2 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700 transition-colors">
-                <Wrench className="w-4 h-4" />Fix Issues
+                <Wrench className="w-4 h-4" />
+                {liveRemaining > 0 ? `Fix ${liveRemaining} Remaining` : 'View Findings'}
               </button>
               <button onClick={() => verifyMutation.mutate(activeRunId!)}
                 disabled={verifyMutation.isPending}
@@ -615,10 +915,11 @@ export default function AgentWorkflow() {
 
       {/* Verification result banner */}
       {(isAwaiting || isCompleted) && verifyDone && verifyOutput && (() => {
-        const resolved  = verifyOutput.resolved  ?? 0
-        const total     = verifyOutput.total_findings ?? 0
-        const remaining = verifyOutput.remaining ?? 0
-        const pct       = verifyOutput.resolution_pct ?? 0
+        // Prefer live counts over stale verify snapshot
+        const resolved  = liveResolved  ?? verifyOutput.resolved  ?? 0
+        const total     = (liveTotal || verifyOutput.total_findings) ?? 0
+        const remaining = liveRemaining ?? verifyOutput.remaining ?? 0
+        const pct       = total > 0 ? Math.round(resolved / total * 100) : 0
         const newAuto   = verifyOutput.newly_auto_resolved ?? 0
         const allDone   = remaining === 0
         return (
@@ -645,7 +946,7 @@ export default function AgentWorkflow() {
               </div>
               {!allDone && (
                 <div className="flex flex-col gap-2 flex-shrink-0">
-                  <button onClick={() => navigate(`/findings?scan_id=${activeRun?.scan_id}`)}
+                  <button onClick={() => navigate(`/findings?scan_id=${activeRun?.scan_id}&status=detected`)}
                     className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
                     <Wrench className="w-3.5 h-3.5" />Fix Remaining
                   </button>
@@ -662,32 +963,55 @@ export default function AgentWorkflow() {
         )
       })()}
 
-      {/* Recent runs */}
-      {!activeRunId && recentRuns && recentRuns.runs.length > 0 && (
+      {/* Recent runs — always visible so user can switch between runs */}
+      {recentRuns && recentRuns.runs.length > 0 && (
         <div className="bg-white rounded-xl shadow p-6">
           <h2 className="text-base font-semibold text-gray-900 mb-4">Recent Runs</h2>
           <div className="space-y-2">
-            {recentRuns.runs.slice(0, 5).map(run => (
-              <button key={run.id} onClick={() => setActiveRunId(run.id)}
-                className="w-full flex items-center justify-between p-3 rounded-lg border border-gray-200 hover:bg-gray-50 text-left transition-colors">
-                <div>
-                  <p className="text-sm font-medium text-gray-900">
-                    {run.database}.{run.schema_name}.{run.table}
-                  </p>
-                  <p className="text-xs text-gray-400 mt-0.5">{new Date(run.created_at).toLocaleString()}</p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-xs text-gray-500">{run.findings_count} findings</span>
-                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                    run.status === 'completed'      ? 'bg-green-100 text-green-700' :
-                    run.status === 'failed'         ? 'bg-red-100 text-red-700' :
-                    run.status === 'running'        ? 'bg-blue-100 text-blue-700' :
-                    run.status === 'awaiting_fixes' ? 'bg-primary-100 text-primary-700' :
-                    'bg-gray-100 text-gray-600'
-                  }`}>{run.status.replace(/_/g, ' ')}</span>
-                </div>
-              </button>
-            ))}
+            {recentRuns.runs.slice(0, 8).map(run => {
+              const isSelected = run.id === activeRunId
+              return (
+                <button key={run.id}
+                  onClick={() => {
+                    if (isSelected) {
+                      setCollapsed(c => !c)  // toggle collapse if clicking active run
+                    } else {
+                      setActiveRunId(run.id)
+                      setCollapsed(false)    // expand when switching to a different run
+                    }
+                  }}
+                  className={`w-full flex items-center justify-between p-3 rounded-lg border text-left transition-colors ${
+                    isSelected
+                      ? 'border-primary-300 bg-primary-50'
+                      : 'border-gray-200 hover:bg-gray-50'
+                  }`}>
+                  <div className="flex items-center gap-2 min-w-0">
+                    {isSelected && (
+                      collapsed
+                        ? <ChevronRight className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
+                        : <ChevronDown  className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
+                    )}
+                    <div className="min-w-0">
+                      <p className={`text-sm font-medium truncate ${isSelected ? 'text-primary-900' : 'text-gray-900'}`}>
+                        {run.database}.{run.schema_name}.{run.table}
+                      </p>
+                      <p className="text-xs text-gray-400 mt-0.5">{new Date(run.created_at).toLocaleString()}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 flex-shrink-0">
+                    <span className="text-xs text-gray-500">{run.findings_count} findings</span>
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                      run.status === 'completed'           ? 'bg-green-100 text-green-700' :
+                      run.status === 'failed'              ? 'bg-red-100 text-red-700' :
+                      run.status === 'running'             ? 'bg-blue-100 text-blue-700' :
+                      run.status === 'awaiting_rule_review'? 'bg-purple-100 text-purple-700' :
+                      run.status === 'awaiting_fixes'      ? 'bg-primary-100 text-primary-700' :
+                      'bg-gray-100 text-gray-600'
+                    }`}>{run.status.replace(/_/g, ' ')}</span>
+                  </div>
+                </button>
+              )
+            })}
           </div>
         </div>
       )}

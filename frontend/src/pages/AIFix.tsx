@@ -12,6 +12,9 @@ export default function AIFix() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const findingIds = searchParams.get('findings')?.split(',') || []
+  const returnTo = searchParams.get('return_to')
+    ? decodeURIComponent(searchParams.get('return_to')!)
+    : '/findings'
 
   const [selectedWarehouse, setSelectedWarehouse] = useState('')
   const [selectedRole, setSelectedRole] = useState('')
@@ -85,8 +88,8 @@ export default function AIFix() {
 
   const handleReject = (findingId: string) => {
     const remaining = findingIds.filter(id => id !== findingId)
-    if (remaining.length === 0) navigate('/findings')
-    else navigate(`/ai-fix?findings=${remaining.join(',')}`)
+    if (remaining.length === 0) navigate(returnTo)
+    else navigate(`/ai-fix?findings=${remaining.join(',')}&return_to=${encodeURIComponent(returnTo)}`)
   }
 
   const canExecute = !!effectiveWarehouse && !!effectiveRole
@@ -121,7 +124,7 @@ export default function AIFix() {
       <div className="flex items-start justify-between gap-6">
         {/* Left: title */}
         <div>
-          <button onClick={() => navigate('/findings')}
+          <button onClick={() => navigate(returnTo)}
             className="flex items-center text-gray-500 hover:text-gray-900 text-sm mb-3">
             <ArrowLeft className="w-4 h-4 mr-1" /> Back to Findings
           </button>

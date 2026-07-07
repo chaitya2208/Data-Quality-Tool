@@ -36,12 +36,34 @@ class AgentRunResponse(BaseModel):
     completed_at: Optional[datetime] = None
     findings_count: int = 0
     ai_rules_count: int = 0
+    rule_review_state: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
     created_at: datetime
     tasks: List[AgentTaskResponse] = []
 
     class Config:
         from_attributes = True
+
+
+class RuleReviewEntry(BaseModel):
+    """A single rule entry in the review state (active or skipped)."""
+    code: str
+    name: str
+    description: str
+    severity: str
+    original_severity: str = ""
+    reason: str = ""
+    is_ai_generated: bool = False
+    category: str = "data_quality"
+    applies_to: List[str] = []
+    violated: bool = False
+    ai_violation_evidence: str = ""
+
+
+class RuleReviewRequest(BaseModel):
+    """Payload for POST /runs/{id}/review-rules."""
+    active: List[RuleReviewEntry]
+    skipped: List[RuleReviewEntry]
 
 
 class AgentRunListResponse(BaseModel):

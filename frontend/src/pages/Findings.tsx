@@ -141,8 +141,11 @@ export default function Findings() {
       prev.includes(id) ? prev.filter(fid => fid !== id) : [...prev, id]
     )
 
-  const handleGetAIFixes = () =>
-    navigate(`/ai-fix?findings=${selectedFindings.join(',')}`)
+  const handleGetAIFixes = () => {
+    // Encode current URL so AIFix "Back" button returns here with all filters intact
+    const returnTo = encodeURIComponent(window.location.pathname + window.location.search)
+    navigate(`/ai-fix?findings=${selectedFindings.join(',')}&return_to=${returnTo}`)
+  }
 
   const clearAll = () => {
     setSeverityFilter(''); setStatusFilter(''); setTableFilter(''); setRuleFilter(''); setScanIdFilter('')

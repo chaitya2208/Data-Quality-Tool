@@ -13,7 +13,7 @@ from app.models.finding import Finding
 from app.models.rule import Rule, RuleStatus
 from app.schemas.agent_run import (
     AgentRunCreateRequest, AgentRunResponse, AgentRunListResponse,
-    AgentRuleSuggestion, AgentTaskResponse,
+    AgentRuleSuggestion, AgentTaskResponse, RuleReviewRequest,
 )
 from app.services.agents.coordinator import WorkflowCoordinator, DB_AGENT_ORDER
 import logging
@@ -54,6 +54,7 @@ def _build_run_response(run: AgentRun) -> AgentRunResponse:
         completed_at=run.completed_at,
         findings_count=run.findings_count,
         ai_rules_count=getattr(run, "ai_rules_count", 0) or 0,
+        rule_review_state=getattr(run, "rule_review_state", None),
         error_message=run.error_message,
         created_at=run.created_at,
         tasks=[_build_task_response(t) for t in run.tasks],
@@ -109,6 +110,69 @@ def get_run(run_id: str, db: Session = Depends(get_db)):
     if not run:
         raise HTTPException(status_code=404, detail="Agent run not found")
     return _build_run_response(run)
+
+
+@router.post("/runs/{run_id}/review-rules", response_model=AgentRunResponse)
+def save_rule_review(
+    run_id: str,
+    request: RuleReviewRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Save the user's rule review decisions (active/skipped lists with edits).
+    Does not trigger pipeline — call /run-pipeline after this.
+    """
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if run.status != AgentRunStatus.AWAITING_RULE_REVIEW:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'"
+        )
+
+    run.rule_review_state = {
+        "active":  [e.model_dump() for e in request.active],
+        "skipped": [e.model_dump() for e in request.skipped],
+    }
+    db.commit()
+    db.refresh(run)
+    logger.info(f"[API] Saved rule review for run {run_id}: {len(request.active)} active, {len(request.skipped)} skipped")
+    return _build_run_response(run)
+
+
+@router.post("/runs/{run_id}/run-pipeline", status_code=202)
+def run_pipeline(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Trigger FindingsAgent using the approved rule set from rule_review_state.
+    Persists approved AI rules permanently to the rules library.
+    """
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if run.status != AgentRunStatus.AWAITING_RULE_REVIEW:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'"
+        )
+    if not run.rule_review_state:
+        raise HTTPException(status_code=400, detail="No rule review state found. Call /review-rules first.")
+
+    # Get current Snowflake user for rule ownership
+    from app.services.snowflake_session import session as sf_session
+    ctx = sf_session.get_cached_context()
+    snowflake_user = (ctx or {}).get("user", "data-governance-team")
+
+    background_tasks.add_task(
+        WorkflowCoordinator(run_id=run_id).run_pipeline_after_review,
+        snowflake_user,
+    )
+    logger.info(f"[API] Running pipeline for run {run_id} as {snowflake_user}")
+    return {"message": "Pipeline started", "run_id": run_id}
 
 
 @router.post("/runs/{run_id}/continue", status_code=202)
@@ -191,6 +255,15 @@ def trigger_verification(
             detail="Run must be in awaiting_fixes or completed state before verification"
         )
 
+    from app.services.agents.auto_verify_scheduler import (
+        cancel as cancel_auto_verify,
+        schedule as schedule_auto_verify,
+        AUTO_VERIFY_INTERVAL_SECONDS,
+    )
+
+    # Cancel any pending auto-verify so it doesn't race with the manual one
+    cancel_auto_verify(run_id)
+
     def _run_verification():
         db2 = SessionLocal()
         try:
@@ -218,9 +291,13 @@ def trigger_verification(
             if result.get("fully_resolved"):
                 run2.status = AgentRunStatus.COMPLETED
                 run2.completed_at = datetime.utcnow()
+                db2.commit()
+                # No need to re-schedule — workflow is done
             else:
                 run2.status = AgentRunStatus.AWAITING_FIXES
-            db2.commit()
+                db2.commit()
+                # Reschedule auto-verify for next cycle
+                schedule_auto_verify(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
 
         except Exception as e:
             logger.error(f"Verification failed: {e}")
@@ -237,6 +314,8 @@ def trigger_verification(
                     db3.commit()
             finally:
                 db3.close()
+            # Reschedule even after failure
+            schedule_auto_verify(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
             return
         finally:
             db2.close()

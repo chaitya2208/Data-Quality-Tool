@@ -200,7 +200,7 @@ export const aiApi = {
 
 // ── Agent Workflow Types ──────────────────────────────────────────────────────
 
-export type AgentRunStatus = 'pending' | 'running' | 'awaiting_fixes' | 'completed' | 'failed';
+export type AgentRunStatus = 'pending' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes' | 'completed' | 'failed';
 export type AgentTaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
 
 export interface AgentTask {
@@ -215,6 +215,20 @@ export interface AgentTask {
   duration_seconds: number | null;
 }
 
+export interface RuleReviewEntry {
+  code: string;
+  name: string;
+  description: string;
+  severity: string;
+  original_severity: string;
+  reason: string;
+  is_ai_generated: boolean;
+  category: string;
+  applies_to: string[];
+  violated: boolean;
+  ai_violation_evidence: string;
+}
+
 export interface AgentRun {
   id: string;
   database: string;
@@ -226,6 +240,7 @@ export interface AgentRun {
   completed_at: string | null;
   findings_count: number;
   ai_rules_count: number;
+  rule_review_state: { active: RuleReviewEntry[]; skipped: RuleReviewEntry[] } | null;
   error_message: string | null;
   created_at: string;
   tasks: AgentTask[];
@@ -252,6 +267,10 @@ export const agentRunsApi = {
     api.get<AgentRun>(`/agent/runs/${id}`),
   list: () =>
     api.get<{ total: number; runs: AgentRun[] }>('/agent/runs'),
+  reviewRules: (id: string, data: { active: RuleReviewEntry[]; skipped: RuleReviewEntry[] }) =>
+    api.post<AgentRun>(`/agent/runs/${id}/review-rules`, data),
+  runPipeline: (id: string) =>
+    api.post(`/agent/runs/${id}/run-pipeline`),
   verify: (id: string) =>
     api.post(`/agent/runs/${id}/verify`),
 };

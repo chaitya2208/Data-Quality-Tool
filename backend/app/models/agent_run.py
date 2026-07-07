@@ -7,11 +7,12 @@ from app.core.database import Base
 
 
 class AgentRunStatus(str, enum.Enum):
-    PENDING        = "pending"
-    RUNNING        = "running"
-    AWAITING_FIXES = "awaiting_fixes"   # pipeline complete, developer fixing issues
-    COMPLETED      = "completed"
-    FAILED         = "failed"
+    PENDING              = "pending"
+    RUNNING              = "running"
+    AWAITING_RULE_REVIEW = "awaiting_rule_review"  # paused for user to review/edit rules
+    AWAITING_FIXES       = "awaiting_fixes"         # pipeline complete, developer fixing issues
+    COMPLETED            = "completed"
+    FAILED               = "failed"
 
 
 class AgentTaskStatus(str, enum.Enum):
@@ -35,6 +36,7 @@ class AgentRun(Base):
     completed_at          = Column(DateTime(timezone=True), nullable=True)
     findings_count        = Column(Integer, default=0)
     ai_rules_count        = Column(Integer, default=0)   # AI-generated rules from Rule Intelligence
+    rule_review_state     = Column(JSON, nullable=True)  # {active: [...], skipped: [...]} — user's review decisions
     error_message         = Column(String(1024), nullable=True)
     created_at            = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

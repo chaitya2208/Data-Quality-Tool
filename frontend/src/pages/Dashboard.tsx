@@ -125,11 +125,17 @@ export default function Dashboard() {
     }
   }
 
-  const StatCard = ({ title, value, icon: Icon, color }: any) => (
-    <div className="bg-white rounded-lg shadow p-6 flex items-center justify-between">
+  const StatCard = ({ title, value, icon: Icon, color, href }: any) => (
+    <div
+      onClick={() => href && navigate(href)}
+      className={`bg-white rounded-lg shadow p-6 flex items-center justify-between ${
+        href ? 'cursor-pointer hover:shadow-md hover:bg-gray-50 transition-all' : ''
+      }`}
+    >
       <div>
         <p className="text-sm font-medium text-gray-500">{title}</p>
         <p className="mt-1 text-3xl font-bold text-gray-900">{value}</p>
+        {href && <p className="text-xs text-primary-600 mt-1">Click to view →</p>}
       </div>
       <div className={`p-3 rounded-full ${color}`}>
         <Icon className="w-6 h-6 text-white" />
@@ -147,10 +153,10 @@ export default function Dashboard() {
 
       {/* Stat cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        <StatCard title="Total Findings"   value={stats?.total ?? 0}                    icon={AlertCircle} color="bg-red-500"    />
-        <StatCard title="Assets Scanned"   value={assetsData?.total ?? 0}               icon={Database}    color="bg-blue-500"   />
-        <StatCard title="Scans Completed"  value={scansData?.total ?? 0}                icon={CheckCircle} color="bg-green-500"  />
-        <StatCard title="Pending Issues"   value={stats?.by_status?.detected ?? 0}      icon={Clock}       color="bg-yellow-500" />
+        <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           />
+        <StatCard title="Assets Scanned"   value={assetsData?.total ?? 0}          icon={Database}    color="bg-blue-500"   href="/assets"             />
+        <StatCard title="Scans Completed"  value={scansData?.total ?? 0}           icon={CheckCircle} color="bg-green-500"  href="/workflow"           />
+        <StatCard title="Pending Issues"   value={stats?.by_status?.detected ?? 0} icon={Clock}       color="bg-yellow-500" href="/findings?status=detected" />
       </div>
 
       {/* ── Database / Table issues chart ── */}

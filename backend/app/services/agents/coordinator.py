@@ -260,18 +260,244 @@ class WorkflowCoordinator:
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent(db)
 
+        # ── PAUSE: build initial rule_review_state and wait for user review ─────
+        classification     = intel_result["classification"]
+        ai_rules           = intel_result["ai_rules"]
+        ai_violations      = intel_result["ai_violations"]
+        existing_rules_raw = classification.get("existing_rules", {})
+
+        # Build initial review state from Claude's decisions
+        active_rules = []
+        skipped_rules = []
+
+        # Existing rules
+        for rule in existing_rules:
+            decision = existing_rules_raw.get(rule.code, {})
+            entry = {
+                "code":             rule.code,
+                "name":             rule.name,
+                "description":      rule.description,
+                "severity":         decision.get("severity_override") or (
+                    rule.severity.value if hasattr(rule.severity, "value") else str(rule.severity)
+                ),
+                "original_severity": rule.severity.value if hasattr(rule.severity, "value") else str(rule.severity),
+                "reason":           decision.get("reason", ""),
+                "is_ai_generated":  False,
+                "category":         rule.category.value if hasattr(rule.category, "value") else str(rule.category),
+                "applies_to":       rule.applies_to or [],
+            }
+            if decision.get("run", True):
+                active_rules.append(entry)
+            else:
+                skipped_rules.append(entry)
+
+        # AI-generated rules (all start in active by default)
+        for ai_rule in ai_rules:
+            violated = any(
+                v.get("context", {}).get("rule_code") == ai_rule.code
+                for v in ai_violations
+            )
+            active_rules.append({
+                "code":             ai_rule.code,
+                "name":             ai_rule.name,
+                "description":      ai_rule.description,
+                "severity":         ai_rule.severity.value if hasattr(ai_rule.severity, "value") else str(ai_rule.severity),
+                "original_severity": ai_rule.severity.value if hasattr(ai_rule.severity, "value") else str(ai_rule.severity),
+                "reason":           "AI-generated rule for this table type",
+                "is_ai_generated":  True,
+                "category":         ai_rule.category.value if hasattr(ai_rule.category, "value") else str(ai_rule.category),
+                "applies_to":       ai_rule.applies_to or [],
+                "violated":         violated,
+                "ai_violation_evidence": next(
+                    (v.get("evidence", {}).get("ai_evidence", "") for v in ai_violations
+                     if v.get("context", {}).get("rule_code") == ai_rule.code),
+                    ""
+                ),
+            })
+
+        run.rule_review_state = {"active": active_rules, "skipped": skipped_rules}
+        run.status = AgentRunStatus.AWAITING_RULE_REVIEW
+        db.commit()
+        logger.info(
+            f"[Coordinator] Run {self.run_id} paused for rule review — "
+            f"{len(active_rules)} active, {len(skipped_rules)} skipped."
+        )
+
+    # ── Phase 2: triggered by POST /runs/{id}/run-pipeline ───────────────────
+
+    def run_pipeline_after_review(self, snowflake_user: str = "data-governance-team") -> None:
+        """Run FindingsAgent using the user-approved rule set from rule_review_state."""
+        db = SessionLocal()
+        try:
+            self._run_findings(db, snowflake_user)
+        except Exception as e:
+            logger.error(f"[Coordinator] run_pipeline error in run {self.run_id}: {e}")
+            db2 = SessionLocal()
+            try:
+                self._mark_run_failed(db2, str(e))
+            finally:
+                db2.close()
+        finally:
+            db.close()
+
+    def _run_findings(self, db: Session, snowflake_user: str) -> None:
+        run = db.query(AgentRun).filter(AgentRun.id == self.run_id).first()
+        if not run:
+            raise ValueError(f"AgentRun {self.run_id} not found")
+
+        run.status = AgentRunStatus.RUNNING
+        db.commit()
+
+        review_state = run.rule_review_state or {"active": [], "skipped": []}
+        active_entries = review_state.get("active", [])
+
+        # ── Persist approved AI rules to the permanent rules library ─────────
+        from app.models.rule import Rule, RuleStatus, RuleCategory, RuleSeverity
+        ai_rules_persisted = []
+        for entry in active_entries:
+            if not entry.get("is_ai_generated"):
+                continue
+            code = entry["code"]
+            existing = db.query(Rule).filter(Rule.code == code).first()
+            if existing:
+                # Update name/description/severity with user's edits
+                existing.name        = entry["name"]
+                existing.description = entry["description"]
+                try:
+                    existing.severity = RuleSeverity(entry["severity"])
+                except ValueError:
+                    pass
+                existing.is_active = True
+                existing.status    = RuleStatus.ACTIVE
+                existing.owner     = snowflake_user
+                db.flush()
+                ai_rules_persisted.append(existing)
+            else:
+                # New AI rule — create permanently
+                try:
+                    category = RuleCategory(entry.get("category", "data_quality"))
+                except ValueError:
+                    category = RuleCategory.DATA_QUALITY
+                try:
+                    severity = RuleSeverity(entry["severity"])
+                except ValueError:
+                    severity = RuleSeverity.MEDIUM
+
+                new_rule = Rule(
+                    code=code,
+                    name=entry["name"],
+                    description=entry["description"],
+                    category=category,
+                    severity=severity,
+                    applies_to=entry.get("applies_to") or ["table"],
+                    rule_config={"source_run_id": run.id, "ai_generated": True},
+                    is_active=True,
+                    status=RuleStatus.ACTIVE,
+                    owner=snowflake_user,
+                    created_by="rule_intelligence_agent",
+                    version=1,
+                )
+                db.add(new_rule)
+                db.flush()
+                ai_rules_persisted.append(new_rule)
+
+        db.commit()
+        run.ai_rules_count = len(ai_rules_persisted)
+        db.commit()
+
+        # ── Re-fetch assets in this session ──────────────────────────────────
+        from app.models.asset import Asset
+        from app.models.scan import Scan
+
+        scan = db.query(Scan).filter(Scan.id == run.scan_id).first()
+        if not scan:
+            raise ValueError(f"Scan {run.scan_id} not found")
+
+        table_asset = db.query(Asset).filter(
+            Asset.database_name == run.database,
+            Asset.schema_name   == run.schema_name,
+            Asset.table_name    == run.table,
+            Asset.asset_type    == "table",
+        ).first()
+        if not table_asset:
+            raise ValueError(f"Table asset not found for {run.database}.{run.schema_name}.{run.table}")
+
+        column_assets = db.query(Asset).filter(
+            Asset.database_name == run.database,
+            Asset.schema_name   == run.schema_name,
+            Asset.table_name    == run.table,
+            Asset.asset_type    == "column",
+        ).all()
+
+        # ── Build approved set for FindingsAgent ─────────────────────────────
+        approved_codes = {e["code"] for e in active_entries}
+
+        # Build a classification dict from approved entries for severity overrides
+        existing_rules_overrides = {}
+        for entry in active_entries:
+            if not entry.get("is_ai_generated"):
+                existing_rules_overrides[entry["code"]] = {
+                    "run": True,
+                    "severity_override": (
+                        entry["severity"]
+                        if entry["severity"] != entry.get("original_severity")
+                        else None
+                    ),
+                    "reason": entry.get("reason", ""),
+                }
+
+        classification = {
+            "table_type":      (run.rule_review_state or {}).get("table_type", "unknown"),
+            "existing_rules":  existing_rules_overrides,
+        }
+
+        # AI violations from active AI rules only
+        ai_violations = []
+        for entry in active_entries:
+            if entry.get("is_ai_generated") and entry.get("violated"):
+                rule_obj = db.query(Rule).filter(Rule.code == entry["code"]).first()
+                if rule_obj and table_asset:
+                    col_name = ""
+                    if "column" in (entry.get("applies_to") or []):
+                        col_name = entry.get("column_name", "")
+                    asset = table_asset
+                    if col_name:
+                        col_fqn = f"{table_asset.fqn}.{col_name}"
+                        asset = db.query(Asset).filter(Asset.fqn == col_fqn).first() or table_asset
+
+                    ai_violations.append({
+                        "asset_id":    asset.id,
+                        "scan_id":     None,
+                        "rule_id":     rule_obj.id,
+                        "title":       f"{entry['name']} violated",
+                        "description": entry.get("ai_violation_evidence") or entry["description"],
+                        "severity":    entry["severity"],
+                        "status":      "detected",
+                        "context": {
+                            "rule_code":     entry["code"],
+                            "fqn":           table_asset.fqn,
+                            "table_name":    run.table,
+                            "schema_name":   run.schema_name,
+                            "database_name": run.database,
+                            "column_name":   col_name,
+                            "ai_generated":  True,
+                        },
+                        "evidence": {"ai_evidence": entry.get("ai_violation_evidence", "")},
+                    })
+
         # ── Findings Agent ────────────────────────────────────────────────────
+        from app.models.finding import FindingStatus
         findings_task = self._get_task(db, "findings_agent")
         self._start_task(db, findings_task)
         try:
             from app.services.agents.findings_agent import FindingsAgent
-            from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent as _RIA
-            _agent = agent if intel_result else _RIA(db)
+            from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
+
+            _ria = RuleIntelligenceAgent(db)
             findings = FindingsAgent(db).run(
                 scan, table_asset, column_assets,
-                intel_result["classification"],
-                intel_result["ai_violations"],
-                _agent,
+                classification, ai_violations, _ria,
+                allowed_codes=approved_codes,
             )
             run.findings_count = len(findings)
             db.commit()
@@ -281,10 +507,11 @@ class WorkflowCoordinator:
                 sev_breakdown[f.severity] = sev_breakdown.get(f.severity, 0) + 1
 
             self._complete_task(db, findings_task, output={
-                "findings_count":    len(findings),
-                "ai_rule_findings":  len(intel_result["ai_violations"]),
+                "findings_count":     len(findings),
+                "ai_rule_findings":   len(ai_violations),
                 "severity_breakdown": sev_breakdown,
-                "scan_id":           scan.id,
+                "scan_id":            scan.id,
+                "ai_rules_persisted": len(ai_rules_persisted),
             })
         except Exception as e:
             self._fail_task(db, findings_task, str(e))
@@ -292,14 +519,16 @@ class WorkflowCoordinator:
             self._mark_run_failed(db, str(e))
             return
 
-        # Pipeline complete — awaiting developer to fix issues
         run.status = AgentRunStatus.AWAITING_FIXES
         db.commit()
         logger.info(
             f"[Coordinator] Run {self.run_id} — pipeline complete. "
-            f"{run.findings_count} findings, {run.ai_rules_count} AI rules. "
-            f"Awaiting fixes."
+            f"{run.findings_count} findings, {run.ai_rules_count} AI rules persisted."
         )
+
+        # Start background auto-verification (every 5 min while awaiting fixes)
+        from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
+        schedule_verify(run.id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
