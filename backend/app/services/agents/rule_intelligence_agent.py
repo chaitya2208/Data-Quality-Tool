@@ -84,8 +84,12 @@ Respond with this JSON:
   ]
 }}
 
-Generate 3-8 AI rules. Focus on business-logic violations you can actually detect from the schema and sample data.
-Include ALL {rule_count} existing rules in the existing_rules object."""
+IMPORTANT REQUIREMENTS:
+- You MUST include an "ai_rules" array in your response. It must never be omitted or empty.
+- Generate 3-8 AI rules. Every table has business-logic rules worth capturing.
+- If the table seems well-structured, suggest rules for data freshness, value constraints, uniqueness, or referential patterns.
+- Include ALL {rule_count} existing rules in the existing_rules object.
+- Your ENTIRE response must be a single valid JSON object starting with {{ and ending with }}."""
 
 
 class RuleIntelligenceAgent:
@@ -132,6 +136,16 @@ class RuleIntelligenceAgent:
         if not parsed:
             logger.warning("[RuleIntelligence] Empty JSON from Claude — using defaults")
             parsed = {}
+        else:
+            ai_rules_raw = parsed.get("ai_rules", [])
+            if not ai_rules_raw:
+                logger.warning(
+                    f"[RuleIntelligence] Claude returned 0 ai_rules. "
+                    f"Keys in response: {list(parsed.keys())}. "
+                    f"This may be a model refusal or prompt issue."
+                )
+            else:
+                logger.info(f"[RuleIntelligence] Claude returned {len(ai_rules_raw)} ai_rules candidates")
 
         # Build classification result
         classification = {
@@ -356,16 +370,28 @@ class RuleIntelligenceAgent:
 
     @staticmethod
     def _extract_json(text: str) -> dict:
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        # Try fenced code block first — use GREEDY match to get the full object
+        match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(1))
+                result = json.loads(match.group(1))
+                if "ai_rules" in result or "table_type" in result:
+                    return result
             except Exception:
                 pass
+        # Fallback: find outermost { ... } — greedy, gets the full JSON
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(0))
+                result = json.loads(match.group(0))
+                if "ai_rules" in result or "table_type" in result:
+                    return result
             except Exception:
                 pass
+        # Last resort: try parsing the whole text directly
+        try:
+            return json.loads(text.strip())
+        except Exception:
+            pass
+        logger.warning(f"[RuleIntelligence] Could not extract JSON. Raw response (first 500 chars): {text[:500]}")
         return {}

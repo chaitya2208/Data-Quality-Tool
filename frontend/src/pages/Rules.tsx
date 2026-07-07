@@ -1,11 +1,12 @@
 import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { rulesApi } from '../api/client'
-import type { Rule, RuleCreatePayload } from '../api/client'
+import type { Rule, RuleCreatePayload, GeneratedRule } from '../api/client'
 import {
   ShieldCheck, FileText, Database, Tag, Filter,
   ToggleLeft, ToggleRight, Plus, Search, X, User,
-  GitBranch, Clock, CheckCircle, XCircle, Ticket, ExternalLink
+  GitBranch, Clock, CheckCircle, XCircle, Ticket, ExternalLink,
+  Sparkles, Loader2, ArrowRight, Edit3, RefreshCw
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 
@@ -73,6 +74,11 @@ export default function Rules() {
   const [showModal,      setShowModal]       = useState(false)
   const [form,           setForm]            = useState<RuleCreatePayload>(emptyForm())
   const [formError,      setFormError]       = useState('')
+  // AI generation state
+  const [aiPrompt,       setAiPrompt]        = useState('')
+  const [aiOwner,        setAiOwner]         = useState('')
+  const [generated,      setGenerated]       = useState<GeneratedRule | null>(null)
+  const [aiStep,         setAiStep]          = useState<'prompt' | 'preview'>('prompt')
   const [rejectingId,    setRejectingId]     = useState<string|null>(null)
   const [rejectReason,   setRejectReason]    = useState('')
   const queryClient = useQueryClient()
@@ -108,8 +114,39 @@ export default function Rules() {
   })
   const createMutation  = useMutation({
     mutationFn: (payload: RuleCreatePayload) => rulesApi.create(payload),
-    onSuccess: () => { invalidate(); setShowModal(false); setForm(emptyForm()); setFormError('') },
+    onSuccess: () => {
+      invalidate()
+      setShowModal(false)
+      setForm(emptyForm())
+      setFormError('')
+      setGenerated(null)
+      setAiPrompt('')
+      setAiOwner('')
+      setAiStep('prompt')
+    },
     onError: (err: any) => setFormError(err?.response?.data?.detail || 'Failed to create rule'),
+  })
+
+  const generateMutation = useMutation({
+    mutationFn: () => rulesApi.generate(aiPrompt, aiOwner).then(r => r.data),
+    onSuccess: (result) => {
+      setGenerated(result)
+      setAiStep('preview')
+      // Pre-fill the form with generated values so user can still edit
+      setForm({
+        code:        result.code,
+        name:        result.name,
+        description: result.description,
+        category:    result.category,
+        severity:    result.severity,
+        applies_to:  result.applies_to,
+        owner:       aiOwner,
+        created_by:  '',
+        jira_ticket: '',
+        rule_config: {},
+        is_active:   false,
+      })
+    },
   })
 
   // ── Client-side filter + search ───────────────────────────────────────────
@@ -429,136 +466,246 @@ export default function Rules() {
         ))
       )}
 
-      {/* ── Add Rule Modal ─────────────────────────────────────────────────── */}
+      {/* ── Add Rule Modal (AI-powered) ────────────────────────────────────── */}
       {showModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden">
-            <div className="flex items-center justify-between px-6 py-4 border-b">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden">
+
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b bg-gradient-to-r from-primary-50 to-purple-50">
               <div>
-                <h2 className="text-lg font-semibold text-gray-900">Add New Rule</h2>
-                <p className="text-xs text-gray-500 mt-0.5">Rule will be submitted for approval before running on scans</p>
+                <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                  <Sparkles className="w-5 h-5 text-purple-500" />
+                  {aiStep === 'prompt' ? 'Add Rule with AI' : 'Review AI-Generated Rule'}
+                </h2>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {aiStep === 'prompt'
+                    ? 'Describe what you want in plain English — Claude will create the rule structure'
+                    : 'Edit any field, then submit for approval'}
+                </p>
               </div>
-              <button onClick={() => { setShowModal(false); setForm(emptyForm()); setFormError('') }}
-                className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5" /></button>
+              <button
+                onClick={() => {
+                  setShowModal(false); setForm(emptyForm()); setFormError('')
+                  setGenerated(null); setAiPrompt(''); setAiOwner(''); setAiStep('prompt')
+                }}
+                className="text-gray-400 hover:text-gray-600 p-1 rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
-            <div className="px-6 py-5 space-y-4 max-h-[70vh] overflow-y-auto">
-              {formError && (
-                <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">{formError}</div>
+            <div className="px-6 py-5 space-y-4 max-h-[75vh] overflow-y-auto">
+
+              {/* ── Step 1: Prompt ── */}
+              {aiStep === 'prompt' && (
+                <>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Describe the rule you want
+                    </label>
+                    <textarea
+                      rows={4}
+                      value={aiPrompt}
+                      onChange={e => setAiPrompt(e.target.value)}
+                      placeholder={
+                        "Examples:\n" +
+                        "• Customer ID should never be null in the orders table\n" +
+                        "• Status column should only have values: PENDING, ACTIVE, CLOSED\n" +
+                        "• Every fact table should have a created_date column"
+                      }
+                      className="w-full px-3 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none"
+                    />
+                    <p className="text-xs text-gray-400 mt-1">
+                      Be as specific as you like — column names, allowed values, business context all help.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Your name / team <span className="text-gray-400 text-xs font-normal">(owner of this rule)</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={aiOwner}
+                      onChange={e => setAiOwner(e.target.value)}
+                      placeholder="e.g. data-governance-team or your name"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                    />
+                  </div>
+
+                  {generateMutation.isError && (
+                    <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">
+                      {(generateMutation.error as any)?.response?.data?.detail || 'AI generation failed. Try again.'}
+                    </div>
+                  )}
+                </>
               )}
 
-              {/* Code */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Rule Code <span className="text-red-500">*</span>
-                  <span className="ml-1 text-xs text-gray-400 font-normal">(auto UPPER_SNAKE_CASE)</span>
-                </label>
-                <input type="text" placeholder="e.g. MISSING_PARTITION_KEY"
-                  value={form.code} onChange={e => setForm(f => ({ ...f, code: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-primary-500 font-mono" />
-              </div>
+              {/* ── Step 2: Preview + edit ── */}
+              {aiStep === 'preview' && generated && (
+                <>
+                  {/* AI rationale banner */}
+                  <div className="bg-purple-50 border border-purple-100 rounded-lg px-4 py-3">
+                    <p className="text-xs text-purple-800">
+                      <span className="font-semibold">AI Rationale: </span>{generated.rationale}
+                    </p>
+                  </div>
 
-              {/* Name */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Rule Name <span className="text-red-500">*</span>
-                </label>
-                <input type="text" placeholder="e.g. Missing Partition Key"
-                  value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-primary-500" />
-              </div>
+                  {formError && (
+                    <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">{formError}</div>
+                  )}
 
-              {/* Description */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Description <span className="text-red-500">*</span>
-                </label>
-                <textarea rows={3} placeholder="Explain what this rule checks and why it matters…"
-                  value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-primary-500 resize-none" />
-              </div>
+                  {/* Code */}
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                      Rule Code
+                    </label>
+                    <input type="text"
+                      value={form.code}
+                      onChange={e => setForm(f => ({ ...f, code: e.target.value.toUpperCase().replace(/\s+/g, '_') }))}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
+                    />
+                  </div>
 
-              {/* Category + Severity */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Category</label>
-                  <select value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-primary-500">
-                    {CATEGORIES.map(c => <option key={c} value={c}>{cap(c)}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Severity</label>
-                  <select value={form.severity} onChange={e => setForm(f => ({ ...f, severity: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-primary-500">
-                    {SEVERITY_ORDER.map(s => <option key={s} value={s}>{cap(s)}</option>)}
-                  </select>
-                </div>
-              </div>
+                  {/* Name */}
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                      Name
+                    </label>
+                    <input type="text"
+                      value={form.name}
+                      onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                    />
+                  </div>
 
-              {/* Applies to */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Applies To <span className="text-red-500">*</span>
-                </label>
-                <div className="flex flex-wrap gap-2">
-                  {ASSET_TYPES.map(t => (
-                    <button key={t} type="button" onClick={() => toggleAppliesTo(t)}
-                      className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
-                        form.applies_to.includes(t)
-                          ? 'bg-primary-600 text-white border-primary-600'
-                          : 'bg-white text-gray-600 border-gray-300 hover:border-primary-400'
-                      }`}>{t}</button>
-                  ))}
-                </div>
-              </div>
+                  {/* Description */}
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                      Description
+                    </label>
+                    <textarea rows={3}
+                      value={form.description}
+                      onChange={e => setForm(f => ({ ...f, description: e.target.value }))}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary-500"
+                    />
+                  </div>
 
-              {/* Owner — REQUIRED */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Owner <span className="text-red-500">*</span>
-                  <span className="ml-1 text-xs text-gray-400 font-normal">team or person accountable for this rule</span>
-                </label>
-                <input type="text" placeholder="e.g. data-governance-team or john.doe@company.com"
-                  value={form.owner ?? ''} onChange={e => setForm(f => ({ ...f, owner: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-primary-500" />
-              </div>
+                  {/* Category + Severity */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Category</label>
+                      <select value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500">
+                        {CATEGORIES.map(c => <option key={c} value={c}>{cap(c)}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Severity</label>
+                      <select value={form.severity} onChange={e => setForm(f => ({ ...f, severity: e.target.value }))}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500">
+                        {SEVERITY_ORDER.map(s => <option key={s} value={s}>{cap(s)}</option>)}
+                      </select>
+                    </div>
+                  </div>
 
-              {/* Created by */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Your Name / ID <span className="text-gray-400 text-xs font-normal">(who is submitting this)</span>
-                </label>
-                <input type="text" placeholder="e.g. cshah or cshah@company.com"
-                  value={form.created_by ?? ''} onChange={e => setForm(f => ({ ...f, created_by: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-primary-500" />
-              </div>
+                  {/* Applies to */}
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Applies To</label>
+                    <div className="flex gap-2">
+                      {ASSET_TYPES.map(t => (
+                        <button key={t} type="button" onClick={() => toggleAppliesTo(t)}
+                          className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
+                            form.applies_to.includes(t)
+                              ? 'bg-primary-600 text-white border-primary-600'
+                              : 'bg-white text-gray-600 border-gray-300 hover:border-primary-400'
+                          }`}>{t}</button>
+                      ))}
+                    </div>
+                  </div>
 
-              {/* Jira ticket */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Jira Ticket <span className="text-gray-400 text-xs font-normal">(reference only — no integration yet)</span>
-                </label>
-                <input type="text" placeholder="e.g. DQ-123"
-                  value={form.jira_ticket ?? ''} onChange={e => setForm(f => ({ ...f, jira_ticket: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:border-primary-500 font-mono" />
-              </div>
+                  {/* Owner + Jira */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                        Owner <span className="text-red-500">*</span>
+                      </label>
+                      <input type="text" placeholder="team or person"
+                        value={form.owner ?? ''}
+                        onChange={e => setForm(f => ({ ...f, owner: e.target.value }))}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                        Jira Ticket
+                      </label>
+                      <input type="text" placeholder="e.g. DQ-123"
+                        value={form.jira_ticket ?? ''}
+                        onChange={e => setForm(f => ({ ...f, jira_ticket: e.target.value }))}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
 
+            {/* Footer */}
             <div className="flex items-center justify-between px-6 py-4 border-t bg-gray-50">
-              <p className="text-xs text-gray-500 flex items-center gap-1">
-                <Clock className="w-3.5 h-3.5" /> Will be submitted for approval
-              </p>
-              <div className="flex gap-3">
-                <button onClick={() => { setShowModal(false); setForm(emptyForm()); setFormError('') }}
-                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">
-                  Cancel
-                </button>
-                <button onClick={handleCreate} disabled={createMutation.isPending}
-                  className="px-5 py-2 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 disabled:opacity-50">
-                  {createMutation.isPending ? 'Submitting…' : 'Submit for Approval'}
-                </button>
-              </div>
+              {aiStep === 'prompt' ? (
+                <>
+                  <p className="text-xs text-gray-400 flex items-center gap-1">
+                    <Sparkles className="w-3.5 h-3.5 text-purple-400" /> Powered by Claude
+                  </p>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => { setShowModal(false); setAiPrompt(''); setAiOwner(''); setAiStep('prompt') }}
+                      className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => generateMutation.mutate()}
+                      disabled={!aiPrompt.trim() || generateMutation.isPending}
+                      className="flex items-center gap-2 px-5 py-2 text-sm font-medium text-white bg-purple-600 rounded-lg hover:bg-purple-700 disabled:opacity-50"
+                    >
+                      {generateMutation.isPending
+                        ? <><Loader2 className="w-4 h-4 animate-spin" />Generating...</>
+                        : <><Sparkles className="w-4 h-4" />Generate Rule</>
+                      }
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={() => { setAiStep('prompt'); setGenerated(null); setFormError('') }}
+                    className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-800"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" /> Regenerate
+                  </button>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => { setShowModal(false); setForm(emptyForm()); setFormError(''); setGenerated(null); setAiPrompt(''); setAiOwner(''); setAiStep('prompt') }}
+                      className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleCreate}
+                      disabled={createMutation.isPending}
+                      className="flex items-center gap-2 px-5 py-2 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 disabled:opacity-50"
+                    >
+                      {createMutation.isPending
+                        ? <><Loader2 className="w-4 h-4 animate-spin" />Submitting...</>
+                        : <><CheckCircle className="w-4 h-4" />Submit for Approval</>
+                      }
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>

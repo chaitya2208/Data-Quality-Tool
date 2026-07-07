@@ -105,6 +105,16 @@ export const healthApi = {
 };
 
 // Rules API
+export interface GeneratedRule {
+  code: string;
+  name: string;
+  description: string;
+  category: string;
+  severity: string;
+  applies_to: string[];
+  rationale: string;
+}
+
 export const rulesApi = {
   list: (params?: { is_active?: boolean; category?: string; severity?: string; status?: string }) =>
     api.get<{ total: number; rules: Rule[] }>('/rules', { params }),
@@ -119,6 +129,8 @@ export const rulesApi = {
     api.post<Rule>(`/rules/${id}/approve`),
   reject: (id: string, reason: string) =>
     api.post<Rule>(`/rules/${id}/reject`, { reason }),
+  generate: (prompt: string, owner?: string) =>
+    api.post<GeneratedRule>('/rules/generate', { prompt, owner }),
 };
 
 // API functions

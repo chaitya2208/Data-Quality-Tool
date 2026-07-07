@@ -1,13 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from collections import defaultdict
 from datetime import datetime
+import json, re, logging
 from app.core.database import get_db
 from app.models.rule import Rule, RuleCategory, RuleSeverity, RuleStatus
 from app.schemas.rule import RuleCreate, RuleUpdate, RuleResponse, RuleListResponse
 from app.services.rule_engine import initialize_default_rules
+from app.services.claude_client import ask_claude
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -178,6 +182,105 @@ def reject_rule(rule_id: str, body: RejectRequest, db: Session = Depends(get_db)
     db.commit()
     db.refresh(rule)
     return rule
+
+
+# ── Generate rule from natural language prompt ───────────────────────────────
+
+class GenerateRuleRequest(BaseModel):
+    prompt: str
+    owner: str = ""
+
+
+class GeneratedRule(BaseModel):
+    code: str
+    name: str
+    description: str
+    category: str
+    severity: str
+    applies_to: List[str]
+    rationale: str
+
+
+_GENERATE_SYSTEM = """You are a Snowflake data quality expert.
+Convert a user's plain-English requirement into a precisely structured data quality rule.
+
+Respond with valid JSON only — no markdown, no prose outside the JSON.
+Use this exact schema:
+{
+  "code": "UPPER_SNAKE_CASE unique identifier (max 50 chars)",
+  "name": "Short human-readable name (max 60 chars)",
+  "description": "Clear description of what this rule checks and why it matters (1-3 sentences)",
+  "category": "one of: data_quality | schema | naming | security | ownership | documentation | performance",
+  "severity": "one of: critical | high | medium | low | info",
+  "applies_to": ["table"] or ["column"] or ["table", "column"],
+  "rationale": "Why this rule matters for data quality (1-2 sentences)"
+}
+
+Rules for code generation:
+- Use UPPER_SNAKE_CASE (e.g. NO_NULL_CUSTOMER_ID, STATUS_VALID_VALUES)
+- Make it specific and descriptive, not generic
+- Avoid duplicating common rules like MISSING_TABLE_COMMENT, MISSING_TABLE_OWNER
+"""
+
+
+@router.post("/generate", response_model=GeneratedRule)
+def generate_rule_from_prompt(
+    request: GenerateRuleRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Convert a plain-English requirement into a structured rule definition using Claude.
+    The returned rule is NOT saved — client edits it and calls POST / to create.
+    """
+    if not request.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    # Include a sample of existing rule codes so Claude avoids duplicates
+    existing_codes = [
+        r.code for r in db.query(Rule.code).limit(100).all()
+    ]
+    existing_sample = ", ".join(existing_codes[:30])
+
+    user_prompt = f"""User requirement: {request.prompt}
+
+Existing rule codes to avoid duplicating: {existing_sample}
+{f'Owner: {request.owner}' if request.owner else ''}
+
+Convert this requirement into a data quality rule. Respond with JSON only."""
+
+    try:
+        raw = ask_claude(user_prompt, system=_GENERATE_SYSTEM, max_tokens=1024)
+    except Exception as e:
+        logger.error(f"[RuleGenerate] Claude call failed: {e}")
+        raise HTTPException(status_code=503, detail=f"AI generation failed: {str(e)}")
+
+    # Extract JSON
+    parsed = None
+    for pattern in [r"```(?:json)?\s*(\{.*?\})\s*```", r"\{.*\}"]:
+        match = re.search(pattern, raw, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(1) if "```" in pattern else match.group(0))
+                break
+            except Exception:
+                continue
+
+    if not parsed or not parsed.get("code") or not parsed.get("name"):
+        logger.error(f"[RuleGenerate] Bad response from Claude: {raw[:300]}")
+        raise HTTPException(status_code=500, detail="AI returned an invalid rule structure. Try rephrasing your requirement.")
+
+    # Normalise
+    parsed["code"] = re.sub(r"[^A-Z0-9_]", "_", parsed.get("code", "").upper().strip())[:50]
+    valid_cats = {c.value for c in RuleCategory}
+    valid_sevs = {s.value for s in RuleSeverity}
+    if parsed.get("category") not in valid_cats:
+        parsed["category"] = "data_quality"
+    if parsed.get("severity") not in valid_sevs:
+        parsed["severity"] = "medium"
+    if not isinstance(parsed.get("applies_to"), list):
+        parsed["applies_to"] = ["table"]
+
+    return GeneratedRule(**parsed)
 
 
 # ── Initialize defaults ───────────────────────────────────────────────────────
