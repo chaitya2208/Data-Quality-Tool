@@ -113,6 +113,7 @@ export interface GeneratedRule {
   severity: string;
   applies_to: string[];
   rationale: string;
+  duplicate_of: { code: string; name: string } | null;
 }
 
 export const rulesApi = {
@@ -259,18 +260,6 @@ export interface AgentRun {
 }
 
 
-
-export interface AgentRuleSuggestion {
-  rule_id: string;
-  code: string;
-  name: string;
-  description: string;
-  category: string;
-  severity: string;
-  applies_to: string[];
-  rationale: string;
-  rule_status: string; // pending | active | rejected | disabled
-}
 
 export const agentRunsApi = {
   start: (data: { database: string; schema_name: string; table: string }) =>

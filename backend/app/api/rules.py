@@ -199,6 +199,7 @@ class GeneratedRule(BaseModel):
     severity: str
     applies_to: List[str]
     rationale: str
+    duplicate_of: Optional[Dict[str, str]] = None  # {code, name} if similar rule detected
 
 
 _GENERATE_SYSTEM = """You are a Snowflake data quality expert.
@@ -219,8 +220,46 @@ Use this exact schema:
 Rules for code generation:
 - Use UPPER_SNAKE_CASE (e.g. NO_NULL_CUSTOMER_ID, STATUS_VALID_VALUES)
 - Make it specific and descriptive, not generic
-- Avoid duplicating common rules like MISSING_TABLE_COMMENT, MISSING_TABLE_OWNER
+- The existing_rules list below shows rules that ALREADY EXIST — do NOT generate a rule
+  that checks the same thing even if described differently or in another language
 """
+
+
+def _word_overlap_score(text1: str, text2: str) -> float:
+    """
+    Simple word-overlap similarity between two strings (0.0 – 1.0).
+    Used to catch semantic duplicates regardless of language/phrasing.
+    """
+    stop = {"a","an","the","is","are","was","were","be","been","being","have",
+            "has","had","do","does","did","will","would","could","should","may",
+            "might","must","shall","can","need","dare","ought","used","to","of",
+            "in","for","on","with","at","by","from","as","into","through","this",
+            "that","these","those","it","its","and","or","but","if","than","when",
+            "where","which","who","how","all","each","every","both","rule","check",
+            "column","table","snowflake","data","quality","should","not","no","any"}
+    def words(t: str) -> set:
+        return {w.lower() for w in re.findall(r"\w+", t) if w.lower() not in stop and len(w) > 2}
+    w1, w2 = words(text1), words(text2)
+    if not w1 or not w2:
+        return 0.0
+    return len(w1 & w2) / min(len(w1), len(w2))
+
+
+def _find_similar_rule(db: Session, name: str, description: str, threshold: float = 0.55) -> Optional[Rule]:
+    """
+    Return the most similar existing rule if overlap score ≥ threshold.
+    Checks against all existing rule names and descriptions.
+    """
+    combined = f"{name} {description}"
+    best_score = 0.0
+    best_rule = None
+    for rule in db.query(Rule).all():
+        rule_text = f"{rule.name} {rule.description or ''}"
+        score = _word_overlap_score(combined, rule_text)
+        if score > best_score:
+            best_score = score
+            best_rule = rule
+    return best_rule if best_score >= threshold else None
 
 
 @router.post("/generate", response_model=GeneratedRule)
@@ -230,21 +269,29 @@ def generate_rule_from_prompt(
 ):
     """
     Convert a plain-English requirement into a structured rule definition using Claude.
+    Returns duplicate_of if a semantically similar rule already exists.
     The returned rule is NOT saved — client edits it and calls POST / to create.
     """
     if not request.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
-    # Include a sample of existing rule codes so Claude avoids duplicates
-    existing_codes = [
-        r.code for r in db.query(Rule.code).limit(100).all()
-    ]
-    existing_sample = ", ".join(existing_codes[:30])
+    # Give Claude the full name + description of all existing rules so it can
+    # detect semantic duplicates regardless of language/phrasing
+    existing_rules = db.query(Rule).all()
+    existing_details = "\n".join(
+        f"  - {r.code}: {r.name} — {(r.description or '')[:100]}"
+        for r in existing_rules
+    )
 
     user_prompt = f"""User requirement: {request.prompt}
 
-Existing rule codes to avoid duplicating: {existing_sample}
+EXISTING RULES (already implemented — do NOT duplicate these):
+{existing_details or '  (none yet)'}
+
 {f'Owner: {request.owner}' if request.owner else ''}
+
+The user may have described this requirement in any language. Carefully check whether
+the requirement is already covered by any existing rule above before generating a new one.
 
 Convert this requirement into a data quality rule. Respond with JSON only."""
 
@@ -256,12 +303,13 @@ Convert this requirement into a data quality rule. Respond with JSON only."""
 
     # Extract JSON
     parsed = None
-    for pattern in [r"```(?:json)?\s*(\{.*?\})\s*```", r"\{.*\}"]:
+    for pattern in [r"```(?:json)?\s*(\{.*\})\s*```", r"\{.*\}"]:
         match = re.search(pattern, raw, re.DOTALL)
         if match:
             try:
                 parsed = json.loads(match.group(1) if "```" in pattern else match.group(0))
-                break
+                if parsed.get("code") or parsed.get("name"):
+                    break
             except Exception:
                 continue
 
@@ -279,6 +327,24 @@ Convert this requirement into a data quality rule. Respond with JSON only."""
         parsed["severity"] = "medium"
     if not isinstance(parsed.get("applies_to"), list):
         parsed["applies_to"] = ["table"]
+
+    # ── Similarity check: catch semantic duplicates Claude may have missed ────
+    parsed["duplicate_of"] = None
+
+    # 1. Exact code match
+    exact = db.query(Rule).filter(Rule.code == parsed["code"]).first()
+    if exact:
+        parsed["duplicate_of"] = {"code": exact.code, "name": exact.name}
+        logger.info(f"[RuleGenerate] Exact code duplicate detected: {exact.code}")
+    else:
+        # 2. Word-overlap similarity check
+        similar = _find_similar_rule(db, parsed["name"], parsed["description"])
+        if similar:
+            parsed["duplicate_of"] = {"code": similar.code, "name": similar.name}
+            logger.info(
+                f"[RuleGenerate] Semantic duplicate detected: '{parsed['name']}' "
+                f"≈ existing '{similar.name}' ({similar.code})"
+            )
 
     return GeneratedRule(**parsed)
 

@@ -175,29 +175,6 @@ def run_pipeline(
     return {"message": "Pipeline started", "run_id": run_id}
 
 
-@router.post("/runs/{run_id}/continue", status_code=202)
-def continue_workflow(
-    run_id: str,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-):
-    """
-    Called after user has reviewed rule proposals.
-    Triggers Phase 2: apply approved rules → signal ready for fixes.
-    """
-    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
-    if not run:
-        raise HTTPException(status_code=404, detail="Agent run not found")
-    if run.status != AgentRunStatus.AWAITING_RULE_APPROVAL:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_approval'"
-        )
-
-    background_tasks.add_task(WorkflowCoordinator(run_id=run_id).continue_after_approval)
-    logger.info(f"[API] Continuing run {run_id} after rule approval")
-    return {"message": "Phase 2 started", "run_id": run_id}
-
 
 @router.get("/runs/{run_id}/rule-suggestions", response_model=List[AgentRuleSuggestion])
 def get_rule_suggestions(run_id: str, db: Session = Depends(get_db)):

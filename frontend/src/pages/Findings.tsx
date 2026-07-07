@@ -39,6 +39,7 @@ export default function Findings() {
       severity: severityFilter || undefined,
       status:   statusFilter   || undefined,
       scan_id:  scanIdFilter   || undefined,
+      limit:    5000,
     }).then(r => r.data),
   })
 

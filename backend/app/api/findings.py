@@ -18,7 +18,7 @@ def list_findings(
     status: Optional[FindingStatus] = None,
     severity: Optional[str] = None,
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 5000,
     db: Session = Depends(get_db)
 ):
     """List all findings with optional filters"""

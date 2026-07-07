@@ -545,6 +545,23 @@ export default function Rules() {
               {/* ── Step 2: Preview + edit ── */}
               {aiStep === 'preview' && generated && (
                 <>
+                  {/* Duplicate warning — shown when AI or similarity check finds a match */}
+                  {generated.duplicate_of && (
+                    <div className="bg-amber-50 border border-amber-300 rounded-lg px-4 py-3 flex items-start gap-2">
+                      <span className="text-amber-500 text-base flex-shrink-0">⚠️</span>
+                      <div>
+                        <p className="text-sm font-semibold text-amber-900">Similar rule already exists</p>
+                        <p className="text-xs text-amber-800 mt-0.5">
+                          <span className="font-mono font-bold">{generated.duplicate_of.code}</span>
+                          {' — '}{generated.duplicate_of.name}
+                        </p>
+                        <p className="text-xs text-amber-700 mt-1">
+                          Review the existing rule before submitting. If your requirement is genuinely different, edit the fields below and proceed.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
                   {/* AI rationale banner */}
                   <div className="bg-purple-50 border border-purple-100 rounded-lg px-4 py-3">
                     <p className="text-xs text-purple-800">
