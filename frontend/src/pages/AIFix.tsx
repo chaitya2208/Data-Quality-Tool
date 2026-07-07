@@ -120,71 +120,71 @@ export default function AIFix() {
   return (
     <div className="max-w-6xl mx-auto space-y-6">
 
-      {/* ── Header with inline dropdowns top-right ── */}
-      <div className="flex items-start justify-between gap-6">
-        {/* Left: title */}
-        <div>
-          <button onClick={() => navigate(returnTo)}
-            className="flex items-center text-gray-500 hover:text-gray-900 text-sm mb-3">
-            <ArrowLeft className="w-4 h-4 mr-1" /> Back to Findings
-          </button>
-          <h1 className="text-3xl font-bold text-gray-900">AI-Powered Fixes</h1>
-          <p className="mt-1 text-gray-500">
-            {findingsData.length} finding{findingsData.length !== 1 ? 's' : ''} selected for review
-          </p>
-        </div>
-
-        {/* Right: two compact dropdowns */}
-        <div className="flex items-center gap-3 mt-8 flex-shrink-0">
-          {/* Role dropdown */}
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-gray-500 flex items-center gap-1">
-              <ShieldCheck className="w-3 h-3 text-purple-500" /> Role
-            </label>
-            <div className="relative">
-              {loadingRoles ? (
-                <div className="flex items-center gap-2 px-3 py-2 border border-gray-200 rounded-lg bg-white text-sm text-gray-400 w-52">
-                  <Loader2 className="w-4 h-4 animate-spin" /> Loading roles...
-                </div>
-              ) : (
-                <select
-                  value={effectiveRole}
-                  onChange={e => setSelectedRole(e.target.value)}
-                  className="appearance-none w-52 pl-3 pr-8 py-2 border-2 border-purple-200 rounded-lg bg-white text-sm font-medium text-gray-900 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 cursor-pointer"
-                >
-                  {roles?.map(role => (
-                    <option key={role.name} value={role.name}>
-                      {role.name}{role.is_current ? ' ★' : ''}
-                    </option>
-                  ))}
-                </select>
-              )}
-              <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
-            </div>
+      {/* ── Header ── */}
+      <div>
+        <button onClick={() => navigate(returnTo)}
+          className="flex items-center text-gray-500 hover:text-gray-900 text-sm mb-3">
+          <ArrowLeft className="w-4 h-4 mr-1" /> Back to Findings
+        </button>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">AI-Powered Fixes</h1>
+            <p className="mt-1 text-gray-500">
+              {findingsData.length} finding{findingsData.length !== 1 ? 's' : ''} selected for review
+            </p>
           </div>
 
-          {/* Warehouse dropdown */}
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-gray-500 flex items-center gap-1">
-              <Server className="w-3 h-3 text-primary-500" /> Warehouse
-            </label>
-            <div className="relative">
-              {loadingWarehouses ? (
-                <div className="flex items-center gap-2 px-3 py-2 border border-gray-200 rounded-lg bg-white text-sm text-gray-400 w-56">
-                  <Loader2 className="w-4 h-4 animate-spin" /> Loading...
-                </div>
-              ) : (
-                <select
-                  value={effectiveWarehouse}
-                  onChange={e => setSelectedWarehouse(e.target.value)}
-                  className="appearance-none w-56 pl-3 pr-8 py-2 border-2 border-primary-200 rounded-lg bg-white text-sm font-medium text-gray-900 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 cursor-pointer"
-                >
-                  {warehouses?.map(wh => (
-                    <option key={wh.name} value={wh.name}>
-                      {wh.name} {wh.state === 'STARTED' ? '●' : '○'}
-                    </option>
-                  ))}
-                </select>
+          {/* Role + Warehouse dropdowns */}
+          <div className="flex flex-wrap items-end gap-3">
+            {/* Role dropdown */}
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-gray-500 flex items-center gap-1">
+                <ShieldCheck className="w-3 h-3 text-purple-500" /> Role
+              </label>
+              <div className="relative">
+                {loadingRoles ? (
+                  <div className="flex items-center gap-2 px-3 py-2 border border-gray-200 rounded-lg bg-white text-sm text-gray-400 w-40">
+                    <Loader2 className="w-4 h-4 animate-spin" /> Loading...
+                  </div>
+                ) : (
+                  <select
+                    value={effectiveRole}
+                    onChange={e => setSelectedRole(e.target.value)}
+                    className="appearance-none w-40 sm:w-52 pl-3 pr-8 py-2 border-2 border-purple-200 rounded-lg bg-white text-sm font-medium text-gray-900 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 cursor-pointer"
+                  >
+                    {roles?.map(role => (
+                      <option key={role.name} value={role.name}>
+                        {role.name}{role.is_current ? ' ★' : ''}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+              </div>
+            </div>
+
+            {/* Warehouse dropdown */}
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-gray-500 flex items-center gap-1">
+                <Server className="w-3 h-3 text-primary-500" /> Warehouse
+              </label>
+              <div className="relative">
+                {loadingWarehouses ? (
+                  <div className="flex items-center gap-2 px-3 py-2 border border-gray-200 rounded-lg bg-white text-sm text-gray-400 w-40">
+                    <Loader2 className="w-4 h-4 animate-spin" /> Loading...
+                  </div>
+                ) : (
+                  <select
+                    value={effectiveWarehouse}
+                    onChange={e => setSelectedWarehouse(e.target.value)}
+                    className="appearance-none w-40 sm:w-56 pl-3 pr-8 py-2 border-2 border-primary-200 rounded-lg bg-white text-sm font-medium text-gray-900 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 cursor-pointer"
+                  >
+                    {warehouses?.map(wh => (
+                      <option key={wh.name} value={wh.name}>
+                        {wh.name} {wh.state === 'STARTED' ? '●' : '○'}
+                      </option>
+                    ))}
+                  </select>
               )}
               <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
             </div>
@@ -194,7 +194,7 @@ export default function AIFix() {
 
       {/* Active context pill */}
       {canExecute && (
-        <div className="flex items-center gap-3 text-xs">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
           <span className="flex items-center gap-1.5 bg-purple-50 border border-purple-200 text-purple-800 px-3 py-1.5 rounded-full font-medium">
             <ShieldCheck className="w-3.5 h-3.5" /> {effectiveRole}
           </span>
@@ -205,7 +205,7 @@ export default function AIFix() {
               <span className="text-yellow-600 ml-1">(will resume)</span>
             )}
           </span>
-          <span className="text-gray-400 italic">— all fixes will run with this context</span>
+          <span className="text-gray-400 italic hidden sm:inline">— all fixes will run with this context</span>
         </div>
       )}
 

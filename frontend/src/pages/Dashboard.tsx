@@ -152,7 +152,7 @@ export default function Dashboard() {
       </div>
 
       {/* Stat cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-6">
         <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           />
         <StatCard title="Assets Scanned"   value={assetsData?.total ?? 0}          icon={Database}    color="bg-blue-500"   href="/assets"             />
         <StatCard title="Scans Completed"  value={scansData?.total ?? 0}           icon={CheckCircle} color="bg-green-500"  href="/workflow"           />
@@ -162,8 +162,8 @@ export default function Dashboard() {
       {/* ── Database / Table issues chart ── */}
       <div className="bg-white rounded-xl shadow p-6">
         {/* Chart header with breadcrumb */}
-        <div className="flex items-center justify-between mb-5">
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
+          <div className="flex items-center gap-2 min-w-0">
             {selectedDb ? (
               <>
                 <button
@@ -188,8 +188,8 @@ export default function Dashboard() {
             )}
           </div>
 
-          {/* Legend */}
-          <div className="flex items-center gap-4 text-xs">
+          {/* Legend — hidden on very small screens */}
+          <div className="hidden sm:flex items-center gap-3 text-xs flex-wrap">
             {Object.entries(SEVERITY_COLORS).map(([key, color]) => (
               <span key={key} className="flex items-center gap-1">
                 <span className="w-2.5 h-2.5 rounded-sm inline-block" style={{ background: color }} />
@@ -222,10 +222,10 @@ export default function Dashboard() {
               <YAxis
                 type="category"
                 dataKey="name"
-                width={200}
-                tick={{ fontSize: 12 }}
+                width={140}
+                tick={{ fontSize: 11 }}
                 tickFormatter={(v: string) =>
-                  v.length > 28 ? v.slice(0, 26) + '…' : v
+                  v.length > 20 ? v.slice(0, 18) + '…' : v
                 }
               />
               <Tooltip content={<CustomTooltip />} cursor={{ fill: '#f3f4f6' }} />
@@ -369,7 +369,7 @@ export default function Dashboard() {
         </div>
 
         {ruleStats ? (
-          <div className="grid grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
             {/* By Category */}
             <div>
               <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-2">By Category</p>

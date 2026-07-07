@@ -173,9 +173,9 @@ export default function Findings() {
     <div className="space-y-6">
 
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">Findings</h1>
+          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Findings</h1>
           <p className="mt-2 text-gray-600">
             {anyFilter ? (
               <>Showing <span className="font-semibold text-gray-900">{data?.findings.length ?? 0}</span> of{' '}
@@ -210,7 +210,7 @@ export default function Findings() {
           )}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
 
           {/* Table */}
           <div>

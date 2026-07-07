@@ -432,7 +432,7 @@ export default function AgentWorkflow() {
       {/* Target selector */}
       <div className="bg-white rounded-xl shadow p-6">
         <h2 className="text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wide">Select Target Table</h2>
-        <div className="grid grid-cols-3 gap-4 mb-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-1">Database</label>
             <select value={selectedDatabase}
@@ -554,7 +554,7 @@ export default function AgentWorkflow() {
                 <AgentNode agentDef={AGENTS[6]} task={getTask('verification_agent')}
                   isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
               </div>
-              <div className="mt-5 pt-4 border-t border-gray-100 grid grid-cols-4 gap-4">
+              <div className="mt-5 pt-4 border-t border-gray-100 grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <div className="text-center">
                   <p className="text-2xl font-bold text-gray-900">{activeRun.findings_count}</p>
                   <p className="text-xs text-gray-500">Findings</p>
@@ -629,7 +629,7 @@ export default function AgentWorkflow() {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 divide-x divide-gray-100">
+          <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100">
             {/* Active Rules column */}
             <div className="p-5">
               <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
