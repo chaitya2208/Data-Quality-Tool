@@ -240,32 +240,53 @@ function ParallelGroup({ children }: { children: React.ReactNode }) {
   )
 }
 
+// ── Batch progress strip ──────────────────────────────────────────────────────
+
+function batchRunTone(status: RunStatus) {
+  switch (status) {
+    case 'completed':            return 'border-green-300 bg-green-50 text-green-800'
+    case 'failed':               return 'border-red-300 bg-red-50 text-red-700'
+    case 'running':              return 'border-blue-300 bg-blue-50 text-blue-800'
+    case 'awaiting_rule_review': return 'border-purple-300 bg-purple-50 text-purple-800'
+    case 'awaiting_fixes':       return 'border-primary-300 bg-primary-50 text-primary-800'
+    default:                     return 'border-gray-200 bg-gray-50 text-gray-500'
+  }
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
-const STORAGE_KEY = 'dq_active_run_id'
-
-function usePersistedRunId() {
-  const [runId, setRunId] = useState<string | null>(() => {
-    try { return localStorage.getItem(STORAGE_KEY) } catch { return null }
+function usePersistedId(storageKey: string) {
+  const [id, setId] = useState<string | null>(() => {
+    try { return localStorage.getItem(storageKey) } catch { return null }
   })
-  const set = (id: string | null) => {
-    setRunId(id)
+  const set = (v: string | null) => {
+    setId(v)
     try {
-      if (id) localStorage.setItem(STORAGE_KEY, id)
-      else localStorage.removeItem(STORAGE_KEY)
+      if (v) localStorage.setItem(storageKey, v)
+      else localStorage.removeItem(storageKey)
     } catch {}
   }
-  return [runId, set] as const
+  return [id, set] as const
 }
+
+type WorkflowScope = 'table' | 'schema' | 'database'
+
+const SCOPE_OPTIONS: { value: WorkflowScope; label: string; hint: string }[] = [
+  { value: 'table',    label: 'Single Table', hint: 'One table' },
+  { value: 'schema',   label: 'Whole Schema', hint: 'All tables in a schema' },
+  { value: 'database', label: 'Whole Database', hint: 'Every table, all schemas' },
+]
 
 export default function AgentWorkflow() {
   const navigate    = useNavigate()
   const queryClient = useQueryClient()
 
+  const [scope,            setScope]            = useState<WorkflowScope>('table')
   const [selectedDatabase, setSelectedDatabase] = useState('')
   const [selectedSchema,   setSelectedSchema]   = useState('')
   const [selectedTable,    setSelectedTable]     = useState('')
-  const [activeRunId,      setActiveRunId]       = usePersistedRunId()
+  const [activeRunId,      setActiveRunId]       = usePersistedId('dq_active_run_id')
+  const [activeBatchId,    setActiveBatchId]     = usePersistedId('dq_active_batch_id')
   const [collapsed,        setCollapsed]         = useState(false)
   // Local editable copy of rule review state — initialized from server on pause
   const [reviewActive,  setReviewActive]  = useState<RuleReviewEntry[]>([])
@@ -301,6 +322,19 @@ export default function AgentWorkflow() {
     },
   })
 
+  // Batch progress — polls while any run in the batch is still working
+  const { data: activeBatch } = useQuery({
+    queryKey: ['agent-batch', activeBatchId],
+    queryFn: () => agentRunsApi.getBatch(activeBatchId!).then(r => r.data),
+    enabled: !!activeBatchId,
+    refetchInterval: (query) => {
+      const runs = query.state.data?.runs ?? []
+      const anyActive = runs.some(r => r.status === 'pending' || r.status === 'running')
+      return anyActive ? 3000 : false
+    },
+  })
+  const isBatch = !!activeBatch && activeBatch.total > 1
+
   const runStatus    = (activeRun?.status ?? 'pending') as RunStatus
   const isRunning    = runStatus === 'running'
   const isReviewing  = runStatus === 'awaiting_rule_review'
@@ -315,10 +349,13 @@ export default function AgentWorkflow() {
   })
 
   const startMutation = useMutation({
-    mutationFn: (data: { database: string; schema_name: string; table: string }) =>
-      agentRunsApi.start(data).then(r => r.data),
-    onSuccess: (run) => {
-      setActiveRunId(run.id)
+    mutationFn: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string }) =>
+      agentRunsApi.startBatch(data).then(r => r.data),
+    onSuccess: (batch) => {
+      // Focus the first run; track the batch when it spans multiple tables
+      setActiveRunId(batch.runs[0]?.id ?? null)
+      setActiveBatchId(batch.total > 1 ? batch.batch_id : null)
+      setCollapsed(false)
       queryClient.invalidateQueries({ queryKey: ['agent-runs'] })
     },
   })
@@ -431,7 +468,27 @@ export default function AgentWorkflow() {
 
       {/* Target selector */}
       <div className="bg-white rounded-xl shadow p-6">
-        <h2 className="text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wide">Select Target Table</h2>
+        <h2 className="text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wide">Select Scan Scope</h2>
+
+        {/* Scope selector */}
+        <div className="grid grid-cols-3 gap-2 mb-4">
+          {SCOPE_OPTIONS.map(opt => {
+            const selected = scope === opt.value
+            return (
+              <button key={opt.value}
+                type="button"
+                onClick={() => { setScope(opt.value); setSelectedTable('') }}
+                disabled={isRunning}
+                className={`text-left rounded-lg border-2 px-3 py-2.5 transition-all disabled:opacity-50 ${
+                  selected ? 'border-primary-500 bg-primary-50' : 'border-gray-200 hover:border-gray-300 bg-white'
+                }`}>
+                <p className={`text-sm font-semibold ${selected ? 'text-primary-800' : 'text-gray-800'}`}>{opt.label}</p>
+                <p className="text-xs text-gray-500 mt-0.5">{opt.hint}</p>
+              </button>
+            )
+          })}
+        </div>
+
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-1">Database</label>
@@ -444,35 +501,125 @@ export default function AgentWorkflow() {
             </select>
           </div>
           <div>
-            <label className="block text-xs font-medium text-gray-500 mb-1">Schema</label>
+            <label className="block text-xs font-medium text-gray-500 mb-1">
+              Schema {scope === 'database' && <span className="text-gray-400 font-normal">(all)</span>}
+            </label>
             <select value={selectedSchema}
               onChange={e => { setSelectedSchema(e.target.value); setSelectedTable('') }}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500"
-              disabled={!selectedDatabase || isRunning}>
-              <option value="">Choose schema...</option>
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 disabled:bg-gray-50"
+              disabled={!selectedDatabase || isRunning || scope === 'database'}>
+              <option value="">{scope === 'database' ? 'All schemas' : 'Choose schema...'}</option>
               {schemas?.schemas.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-xs font-medium text-gray-500 mb-1">Table</label>
+            <label className="block text-xs font-medium text-gray-500 mb-1">
+              Table {scope !== 'table' && <span className="text-gray-400 font-normal">(all)</span>}
+            </label>
             <select value={selectedTable}
               onChange={e => setSelectedTable(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500"
-              disabled={!selectedSchema || isRunning}>
-              <option value="">Choose table...</option>
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 disabled:bg-gray-50"
+              disabled={!selectedSchema || isRunning || scope !== 'table'}>
+              <option value="">{scope !== 'table' ? 'All tables' : 'Choose table...'}</option>
               {tables?.tables.map(t => <option key={t} value={t}>{t}</option>)}
             </select>
           </div>
         </div>
-        <button onClick={() => startMutation.mutate({ database: selectedDatabase, schema_name: selectedSchema, table: selectedTable })}
-          disabled={!selectedTable || isRunning}
-          className="flex items-center gap-2 px-5 py-2.5 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm">
-          {isRunning
-            ? <><Loader2 className="w-4 h-4 animate-spin" />Running...</>
-            : <><Play className="w-4 h-4" />Run Workflow</>
-          }
-        </button>
+
+        {(() => {
+          const canRun =
+            !isRunning && !!selectedDatabase &&
+            (scope === 'database' ||
+             (scope === 'schema' && !!selectedSchema) ||
+             (scope === 'table' && !!selectedSchema && !!selectedTable))
+          const scopeLabel =
+            scope === 'table'    ? `${selectedSchema || '…'}.${selectedTable || '…'}` :
+            scope === 'schema'   ? `all tables in ${selectedDatabase || '…'}.${selectedSchema || '…'}` :
+                                   `all tables in ${selectedDatabase || '…'} (every schema)`
+          return (
+            <div className="flex items-center gap-3 flex-wrap">
+              <button onClick={() => startMutation.mutate({
+                  scope,
+                  database: selectedDatabase,
+                  schema_name: scope === 'database' ? undefined : selectedSchema,
+                  table: scope === 'table' ? selectedTable : undefined,
+                })}
+                disabled={!canRun || startMutation.isPending}
+                className="flex items-center gap-2 px-5 py-2.5 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm">
+                {isRunning || startMutation.isPending
+                  ? <><Loader2 className="w-4 h-4 animate-spin" />Running...</>
+                  : <><Play className="w-4 h-4" />Run Workflow</>
+                }
+              </button>
+              {canRun && (
+                <span className="text-xs text-gray-500">
+                  Will scan <span className="font-medium text-gray-700">{scopeLabel}</span>
+                  {scope !== 'table' && ' — one table at a time, review rules for each'}
+                </span>
+              )}
+            </div>
+          )
+        })()}
       </div>
+
+      {/* Batch progress — shown for schema/database scans */}
+      {isBatch && activeBatch && (() => {
+        const runs = activeBatch.runs
+        const done      = runs.filter(r => r.status === 'completed').length
+        const failed    = runs.filter(r => r.status === 'failed').length
+        const inProgress= runs.filter(r => ['running', 'awaiting_rule_review', 'awaiting_fixes'].includes(r.status)).length
+        const pct = Math.round(((done + failed) / runs.length) * 100)
+        return (
+          <div className="bg-white rounded-xl shadow p-6">
+            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div>
+                <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide flex items-center gap-2">
+                  <GitBranch className="w-4 h-4 text-primary-500" />
+                  Batch Scan — {activeBatch.scope === 'database'
+                    ? activeBatch.database
+                    : `${activeBatch.database}.${activeBatch.schema_name}`}
+                </h2>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {done} done · {inProgress} in progress · {failed > 0 && <span className="text-red-600">{failed} failed · </span>}{runs.length} tables total
+                </p>
+              </div>
+              <button onClick={() => { setActiveBatchId(null); setActiveRunId(null) }}
+                className="text-xs text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 transition-colors">
+                Close batch ✕
+              </button>
+            </div>
+            <div className="w-full h-1.5 bg-gray-100 rounded-full overflow-hidden mb-4">
+              <div className="h-full bg-primary-500 transition-all" style={{ width: `${pct}%` }} />
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {runs.map(r => {
+                const isActive = r.id === activeRunId
+                return (
+                  <button key={r.id}
+                    onClick={() => { setActiveRunId(r.id); setCollapsed(false) }}
+                    title={`${r.schema_name}.${r.table} — ${r.status.replace(/_/g, ' ')}`}
+                    className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-all ${batchRunTone(r.status)} ${
+                      isActive ? 'ring-2 ring-primary-400 ring-offset-1' : 'hover:shadow-sm'
+                    }`}>
+                    {r.status === 'running' && <Loader2 className="w-3 h-3 animate-spin" />}
+                    {r.status === 'completed' && <CheckCircle2 className="w-3 h-3" />}
+                    {r.status === 'failed' && <AlertTriangle className="w-3 h-3" />}
+                    {r.status === 'awaiting_rule_review' && <BrainCircuit className="w-3 h-3" />}
+                    {r.status === 'awaiting_fixes' && <Wrench className="w-3 h-3" />}
+                    <span className="max-w-[10rem] truncate">{r.table}</span>
+                    {r.findings_count > 0 && (
+                      <span className="opacity-70">({r.findings_count})</span>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+            <p className="text-xs text-gray-400 mt-3">
+              Tables are processed one at a time. Review rules for the active table below — the next table starts automatically.
+            </p>
+          </div>
+        )
+      })()}
 
       {/* Pipeline visualization */}
       {activeRunId && activeRun && (
@@ -977,6 +1124,7 @@ export default function AgentWorkflow() {
                       setCollapsed(c => !c)  // toggle collapse if clicking active run
                     } else {
                       setActiveRunId(run.id)
+                      setActiveBatchId(run.batch_id ?? null)  // restore batch strip if part of one
                       setCollapsed(false)    // expand when switching to a different run
                     }
                   }}

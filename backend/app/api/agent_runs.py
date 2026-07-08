@@ -14,8 +14,10 @@ from app.models.rule import Rule, RuleStatus
 from app.schemas.agent_run import (
     AgentRunCreateRequest, AgentRunResponse, AgentRunListResponse,
     AgentRuleSuggestion, AgentTaskResponse, RuleReviewRequest,
+    AgentBatchCreateRequest, AgentBatchResponse,
 )
 from app.services.agents.coordinator import WorkflowCoordinator, DB_AGENT_ORDER
+from app.services.snowflake_session import session as sf_session
 import logging
 
 router = APIRouter()
@@ -45,6 +47,8 @@ def _build_task_response(task: AgentTask) -> AgentTaskResponse:
 def _build_run_response(run: AgentRun) -> AgentRunResponse:
     return AgentRunResponse(
         id=run.id,
+        batch_id=getattr(run, "batch_id", None),
+        batch_index=getattr(run, "batch_index", 0) or 0,
         database=run.database,
         schema_name=run.schema_name,
         table=run.table,
@@ -91,6 +95,133 @@ def start_workflow(
     background_tasks.add_task(WorkflowCoordinator(run_id=run.id).run)
     logger.info(f"[API] Started run {run.id} for {request.database}.{request.schema_name}.{request.table}")
     return _build_run_response(run)
+
+
+def _list_tables(database: str, schema: str) -> List[str]:
+    rows = sf_session.query(f"SHOW TABLES IN {database}.{schema}")
+    return [r.get("name") or r.get("NAME") for r in rows if r.get("name") or r.get("NAME")]
+
+
+def _list_schemas(database: str) -> List[str]:
+    rows = sf_session.query(f"SHOW SCHEMAS IN DATABASE {database}")
+    names = [r.get("name") or r.get("NAME") for r in rows if r.get("name") or r.get("NAME")]
+    # INFORMATION_SCHEMA has no user tables — skip it
+    return [n for n in names if n.upper() != "INFORMATION_SCHEMA"]
+
+
+def _expand_scope(req: AgentBatchCreateRequest) -> List[tuple[str, str, str]]:
+    """Resolve a scope request into an ordered list of (database, schema, table)."""
+    scope = (req.scope or "table").lower()
+
+    if scope == "table":
+        if not (req.schema_name and req.table):
+            raise HTTPException(status_code=400, detail="scope=table requires schema_name and table")
+        return [(req.database, req.schema_name, req.table)]
+
+    if scope == "schema":
+        if not req.schema_name:
+            raise HTTPException(status_code=400, detail="scope=schema requires schema_name")
+        tables = _list_tables(req.database, req.schema_name)
+        return [(req.database, req.schema_name, t) for t in tables]
+
+    if scope == "database":
+        targets: List[tuple[str, str, str]] = []
+        for sch in _list_schemas(req.database):
+            for t in _list_tables(req.database, sch):
+                targets.append((req.database, sch, t))
+        return targets
+
+    raise HTTPException(status_code=400, detail=f"Unknown scope '{req.scope}'")
+
+
+@router.post("/runs/batch", response_model=AgentBatchResponse, status_code=202)
+def start_batch(
+    request: AgentBatchCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Start a workflow over a table / schema / database scope.
+    Creates one AgentRun per table sharing a batch_id, processed sequentially:
+    the first run starts immediately; each subsequent run auto-starts once the
+    previous one reaches rule review / awaiting fixes.
+    """
+    try:
+        targets = _expand_scope(request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to enumerate scope: {e}")
+
+    if not targets:
+        raise HTTPException(status_code=404, detail="No tables found for the selected scope")
+
+    batch_id = str(uuid.uuid4())
+    runs: List[AgentRun] = []
+    for idx, (database, schema_name, table) in enumerate(targets):
+        run = AgentRun(
+            id=str(uuid.uuid4()),
+            batch_id=batch_id,
+            batch_index=idx,
+            database=database,
+            schema_name=schema_name,
+            table=table,
+            status=AgentRunStatus.PENDING,
+        )
+        db.add(run)
+        db.flush()
+        for agent_name in DB_AGENT_ORDER:
+            db.add(AgentTask(
+                run_id=run.id,
+                agent_name=agent_name,
+                status=AgentTaskStatus.PENDING,
+            ))
+        runs.append(run)
+
+    db.commit()
+    for r in runs:
+        db.refresh(r)
+
+    # Kick off only the first table — the coordinator advances the rest sequentially
+    first = runs[0]
+    import threading
+    threading.Thread(target=WorkflowCoordinator(run_id=first.id).run, daemon=True).start()
+
+    logger.info(
+        f"[API] Started batch {batch_id} scope={request.scope} — {len(runs)} tables, "
+        f"first={first.database}.{first.schema_name}.{first.table}"
+    )
+    return AgentBatchResponse(
+        batch_id=batch_id,
+        scope=request.scope,
+        database=request.database,
+        schema_name=request.schema_name,
+        total=len(runs),
+        runs=[_build_run_response(r) for r in runs],
+    )
+
+
+@router.get("/runs/batch/{batch_id}", response_model=AgentBatchResponse)
+def get_batch(batch_id: str, db: Session = Depends(get_db)):
+    runs = (
+        db.query(AgentRun)
+        .filter(AgentRun.batch_id == batch_id)
+        .order_by(AgentRun.batch_index.asc())
+        .all()
+    )
+    if not runs:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    first = runs[0]
+    scope = "database" if len({r.schema_name for r in runs}) > 1 else (
+        "schema" if len(runs) > 1 else "table"
+    )
+    return AgentBatchResponse(
+        batch_id=batch_id,
+        scope=scope,
+        database=first.database,
+        schema_name=first.schema_name if scope != "database" else None,
+        total=len(runs),
+        runs=[_build_run_response(r) for r in runs],
+    )
 
 
 @router.get("/runs", response_model=AgentRunListResponse)

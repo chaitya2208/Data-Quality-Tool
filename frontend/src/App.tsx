@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Loader2, CheckCircle, ShieldCheck, Menu, X } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Loader2, CheckCircle, XCircle, ShieldCheck, Menu, X } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
-import { aiApi } from './api/client'
+import { aiApi, healthApi } from './api/client'
 import Dashboard from './pages/Dashboard'
 import Assets from './pages/Assets'
 import Findings from './pages/Findings'
@@ -21,6 +21,17 @@ function App() {
     retryDelay: 2000,
     staleTime: Infinity,
   })
+
+  // Live Snowflake connection status — polled so the sidebar badge reflects the
+  // real session state, not just whether the app finished loading once.
+  const { data: sfHealth } = useQuery({
+    queryKey: ['sf-health'],
+    queryFn: () => healthApi.checkSnowflake().then(res => res.data),
+    refetchInterval: 30_000,           // re-check every 30s
+    refetchOnWindowFocus: true,        // and when the user returns to the tab
+    retry: false,                      // a failed poll = disconnected, don't mask it
+  })
+  const sfConnected = sfHealth?.status === 'connected'
 
   const navigation = [
     { name: 'Dashboard', href: '/',         icon: Home        },
@@ -76,13 +87,24 @@ function App() {
         })}
       </nav>
 
-      {/* Footer */}
+      {/* Footer — live Snowflake connection status */}
       <div className="p-4 border-t border-gray-200 flex-shrink-0">
-        <div className="flex items-center text-xs text-gray-500 mb-1">
-          <CheckCircle className="w-3 h-3 text-green-500 mr-1 flex-shrink-0" />
-          <span>Snowflake Connected</span>
+        <div className="flex items-center text-xs mb-1">
+          {sfConnected ? (
+            <>
+              <CheckCircle className="w-3 h-3 text-green-500 mr-1 flex-shrink-0" />
+              <span className="text-gray-500">Snowflake Connected</span>
+            </>
+          ) : (
+            <>
+              <XCircle className="w-3 h-3 text-red-500 mr-1 flex-shrink-0" />
+              <span className="text-red-600">Snowflake Disconnected</span>
+            </>
+          )}
         </div>
-        <p className="text-xs text-gray-400 truncate">{sfContext?.user}</p>
+        <p className="text-xs text-gray-400 truncate">
+          {sfHealth?.user ?? sfContext?.user}
+        </p>
       </div>
     </div>
   )

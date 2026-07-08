@@ -6,14 +6,13 @@ import {
   ShieldCheck, FileText, Database, Tag, Filter,
   ToggleLeft, ToggleRight, Plus, Search, X, User,
   GitBranch, Clock, CheckCircle, XCircle, Ticket, ExternalLink,
-  Sparkles, Loader2, ArrowRight, Edit3, RefreshCw
+  Sparkles, Loader2, RefreshCw
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const CATEGORIES  = ['documentation','ownership','schema','naming','data_quality','security','performance']
-const SEVERITIES  = ['critical','high','medium','low','info']
 const ASSET_TYPES = ['table','column','schema','database']
 
 const CATEGORY_COLORS: Record<string,string> = {

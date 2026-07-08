@@ -10,6 +10,20 @@ class AgentRunCreateRequest(BaseModel):
     table: str
 
 
+class AgentBatchCreateRequest(BaseModel):
+    """
+    Start a workflow over a scope. Expands into per-table AgentRuns processed
+    sequentially (each pauses for rule review, then auto-advances to the next).
+      - scope="table"    : requires database, schema_name, table
+      - scope="schema"   : requires database, schema_name  (all tables in schema)
+      - scope="database" : requires database               (all tables, all schemas)
+    """
+    scope: str  # "table" | "schema" | "database"
+    database: str
+    schema_name: Optional[str] = None
+    table: Optional[str] = None
+
+
 class AgentTaskResponse(BaseModel):
     id: str
     run_id: str
@@ -27,6 +41,8 @@ class AgentTaskResponse(BaseModel):
 
 class AgentRunResponse(BaseModel):
     id: str
+    batch_id: Optional[str] = None
+    batch_index: int = 0
     database: str
     schema_name: str
     table: str
@@ -67,6 +83,16 @@ class RuleReviewRequest(BaseModel):
 
 
 class AgentRunListResponse(BaseModel):
+    total: int
+    runs: List[AgentRunResponse]
+
+
+class AgentBatchResponse(BaseModel):
+    """All runs belonging to a batch, in order."""
+    batch_id: str
+    scope: str
+    database: str
+    schema_name: Optional[str] = None
     total: int
     runs: List[AgentRunResponse]
 

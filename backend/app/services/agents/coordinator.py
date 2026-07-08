@@ -323,6 +323,10 @@ class WorkflowCoordinator:
             f"{len(active_rules)} active, {len(skipped_rules)} skipped."
         )
 
+        # Rules are ready — advance the batch now so the next table computes its
+        # rules while the user reviews this one at their own pace.
+        self._advance_batch(db)
+
     # ── Phase 2: triggered by POST /runs/{id}/run-pipeline ───────────────────
 
     def run_pipeline_after_review(self, snowflake_user: str = "data-governance-team") -> None:
@@ -334,7 +338,7 @@ class WorkflowCoordinator:
             logger.error(f"[Coordinator] run_pipeline error in run {self.run_id}: {e}")
             db2 = SessionLocal()
             try:
-                self._mark_run_failed(db2, str(e))
+                self._mark_run_failed(db2, str(e), advance=False)  # already advanced at review
             finally:
                 db2.close()
         finally:
@@ -516,7 +520,7 @@ class WorkflowCoordinator:
         except Exception as e:
             self._fail_task(db, findings_task, str(e))
             self._skip_tasks(db, ["verification_agent"])
-            self._mark_run_failed(db, str(e))
+            self._mark_run_failed(db, str(e), advance=False)  # already advanced at review
             return
 
         run.status = AgentRunStatus.AWAITING_FIXES
@@ -529,6 +533,8 @@ class WorkflowCoordinator:
         # Start background auto-verification (every 5 min while awaiting fixes)
         from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
         schedule_verify(run.id)
+        # Note: batch already advanced when this run reached rule review — do not
+        # advance again here, or a table could be skipped.
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -582,13 +588,51 @@ class WorkflowCoordinator:
             t.error_message = error[:1024]
             dbt.commit()
 
-    def _mark_run_failed(self, db: Session, error: str) -> None:
+    def _mark_run_failed(self, db: Session, error: str, advance: bool = True) -> None:
         run = db.query(AgentRun).filter(AgentRun.id == self.run_id).first()
         if run:
             run.status = AgentRunStatus.FAILED
             run.completed_at = datetime.utcnow()
             run.error_message = error[:1024]
             db.commit()
+            # Don't let one bad table stall the rest of the batch. Only advance for
+            # pre-review failures — post-review failures already advanced at the
+            # rule-review point, so advancing again would skip a table.
+            if advance:
+                self._advance_batch(db)
+
+    def _advance_batch(self, db: Session) -> None:
+        """
+        Sequential batch processing: once this run has reached rule review /
+        awaiting fixes / failed, kick off the next pending run in the same batch.
+        No-op for single-table runs (batch_id is None or only one member).
+        """
+        run = db.query(AgentRun).filter(AgentRun.id == self.run_id).first()
+        if not run or not run.batch_id:
+            return
+
+        next_run = (
+            db.query(AgentRun)
+            .filter(
+                AgentRun.batch_id == run.batch_id,
+                AgentRun.status == AgentRunStatus.PENDING,
+            )
+            .order_by(AgentRun.batch_index.asc())
+            .first()
+        )
+        if not next_run:
+            logger.info(f"[Coordinator] Batch {run.batch_id} — no more pending tables.")
+            return
+
+        next_id = next_run.id
+        logger.info(
+            f"[Coordinator] Batch {run.batch_id} — advancing to "
+            f"{next_run.database}.{next_run.schema_name}.{next_run.table} (run {next_id})"
+        )
+        # Run in a fresh daemon thread so we don't block the current request/thread
+        threading.Thread(
+            target=WorkflowCoordinator(run_id=next_id).run, daemon=True
+        ).start()
 
 
 def _severity_counts(findings) -> dict:

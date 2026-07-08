@@ -27,6 +27,8 @@ class AgentRun(Base):
     __tablename__ = "agent_runs"
 
     id                    = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    batch_id              = Column(String(36), nullable=True, index=True)  # groups multi-table runs (schema/db scope)
+    batch_index           = Column(Integer, default=0)   # position within the batch (for ordered sequential review)
     database              = Column(String(255), nullable=False)
     schema_name           = Column(String(255), nullable=False)
     table                 = Column(String(255), nullable=False)

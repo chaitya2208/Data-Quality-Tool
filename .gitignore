@@ -52,3 +52,7 @@ logs/
 
 # Docker
 *.env.docker
+
+# Project context / session notes (not for version control)
+CONTEXT.md
+CLAUDE.md

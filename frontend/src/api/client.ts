@@ -98,10 +98,20 @@ export interface RuleStats {
   by_severity: Record<string, number>;
 }
 
-// Health API
+// Health API — health routes are mounted at the server root (NOT under /api/v1),
+// so use an absolute URL rather than the /api/v1 `api` instance.
+const SERVER_ROOT = API_BASE_URL.replace(/\/api\/v1$/, '');
+
+export interface SnowflakeHealth {
+  status: 'connected' | 'disconnected';
+  user: string | null;
+  role: string | null;
+  detail?: string;
+}
+
 export const healthApi = {
-  check: () => api.get('/health'),
-  checkSnowflake: () => api.get('/health/snowflake'),
+  check: () => axios.get(`${SERVER_ROOT}/health`),
+  checkSnowflake: () => axios.get<SnowflakeHealth>(`${SERVER_ROOT}/health/snowflake`),
 };
 
 // Rules API
@@ -244,6 +254,8 @@ export interface RuleReviewEntry {
 
 export interface AgentRun {
   id: string;
+  batch_id: string | null;
+  batch_index: number;
   database: string;
   schema_name: string;
   table: string;
@@ -261,9 +273,24 @@ export interface AgentRun {
 
 
 
+export type WorkflowScope = 'table' | 'schema' | 'database';
+
+export interface AgentBatch {
+  batch_id: string;
+  scope: WorkflowScope;
+  database: string;
+  schema_name: string | null;
+  total: number;
+  runs: AgentRun[];
+}
+
 export const agentRunsApi = {
   start: (data: { database: string; schema_name: string; table: string }) =>
     api.post<AgentRun>('/agent/runs', data),
+  startBatch: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string }) =>
+    api.post<AgentBatch>('/agent/runs/batch', data),
+  getBatch: (batchId: string) =>
+    api.get<AgentBatch>(`/agent/runs/batch/${batchId}`),
   get: (id: string) =>
     api.get<AgentRun>(`/agent/runs/${id}`),
   list: () =>
