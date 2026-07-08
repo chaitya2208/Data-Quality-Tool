@@ -104,6 +104,32 @@ export const healthApi = {
   checkSnowflake: () => api.get('/health/snowflake'),
 };
 
+// Validate API (Phase 4 — Shift-Left DDL Validation)
+export interface DDLFinding {
+  rule_code: string;
+  rule_name: string;
+  severity: string;
+  title: string;
+  description: string;
+  column_name: string | null;
+}
+
+export interface DDLValidateResponse {
+  passed: boolean;
+  table_name: string;
+  columns_parsed: number;
+  rules_checked: number;
+  findings_count: number;
+  blocked_by: number;
+  fail_on: string[];
+  findings: DDLFinding[];
+}
+
+export const validateApi = {
+  ddl: (sql: string, failOn: string[] = ['critical']) =>
+    api.post<DDLValidateResponse>('/validate/ddl', { sql, fail_on: failOn }),
+};
+
 // Rules API
 export interface GeneratedRule {
   code: string;

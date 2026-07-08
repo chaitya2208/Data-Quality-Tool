@@ -1,12 +1,13 @@
 import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { rulesApi } from '../api/client'
-import type { Rule, RuleCreatePayload, GeneratedRule } from '../api/client'
+import { rulesApi, validateApi } from '../api/client'
+import type { Rule, RuleCreatePayload, GeneratedRule, DDLFinding } from '../api/client'
 import {
   ShieldCheck, FileText, Database, Tag, Filter,
   ToggleLeft, ToggleRight, Plus, Search, X, User,
   GitBranch, Clock, CheckCircle, XCircle, Ticket, ExternalLink,
-  Sparkles, Loader2, ArrowRight, Edit3, RefreshCw
+  Sparkles, Loader2, ArrowRight, Edit3, RefreshCw,
+  Code, ChevronDown, ChevronUp, AlertTriangle
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 
@@ -79,6 +80,10 @@ export default function Rules() {
   const [aiOwner,        setAiOwner]         = useState('')
   const [generated,      setGenerated]       = useState<GeneratedRule | null>(null)
   const [aiStep,         setAiStep]          = useState<'prompt' | 'preview'>('prompt')
+  // DDL validation state
+  const [showDDLPanel,   setShowDDLPanel]    = useState(false)
+  const [ddlSql,         setDdlSql]          = useState('')
+  const [ddlFailOn,      setDdlFailOn]       = useState<string[]>(['critical'])
   const [rejectingId,    setRejectingId]     = useState<string|null>(null)
   const [rejectReason,   setRejectReason]    = useState('')
   const queryClient = useQueryClient()
@@ -147,6 +152,10 @@ export default function Rules() {
         is_active:   false,
       })
     },
+  })
+
+  const validateMutation = useMutation({
+    mutationFn: () => validateApi.ddl(ddlSql, ddlFailOn).then(r => r.data),
   })
 
   // ── Client-side filter + search ───────────────────────────────────────────
@@ -465,6 +474,149 @@ export default function Rules() {
           </div>
         ))
       )}
+
+      {/* ── Test DDL Panel ─────────────────────────────────────────────────── */}
+      <div className="bg-white rounded-xl shadow overflow-hidden">
+        <button
+          onClick={() => setShowDDLPanel(p => !p)}
+          className="w-full flex items-center justify-between px-6 py-4 hover:bg-gray-50 transition-colors"
+        >
+          <div className="flex items-center gap-2">
+            <Code className="w-5 h-5 text-primary-600" />
+            <div className="text-left">
+              <span className="font-semibold text-gray-900 text-sm">Test DDL Before Deploying</span>
+              <p className="text-xs text-gray-500 mt-0.5">Validate a CREATE TABLE statement against all active rules — no Snowflake connection needed</p>
+            </div>
+          </div>
+          {showDDLPanel
+            ? <ChevronUp className="w-4 h-4 text-gray-400" />
+            : <ChevronDown className="w-4 h-4 text-gray-400" />
+          }
+        </button>
+
+        {showDDLPanel && (
+          <div className="px-6 pb-6 border-t border-gray-100 pt-4 space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1.5">
+                CREATE TABLE statement
+              </label>
+              <textarea
+                rows={8}
+                value={ddlSql}
+                onChange={e => { setDdlSql(e.target.value); validateMutation.reset() }}
+                placeholder={`CREATE TABLE MY_DB.SILVER.ORDERS (\n    ORDER_ID    NUMBER        NOT NULL,\n    CUSTOMER_ID NUMBER,\n    STATUS      VARCHAR(20),\n    AMOUNT      NUMBER(18,2),\n    ORDER_DATE  TIMESTAMP_NTZ\n);`}
+                className="w-full px-3 py-2.5 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500 resize-y"
+              />
+            </div>
+
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-medium text-gray-600">Fail on:</span>
+                {(['critical', 'high', 'medium'] as const).map(sev => (
+                  <label key={sev} className="flex items-center gap-1 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={ddlFailOn.includes(sev)}
+                      onChange={e => setDdlFailOn(prev =>
+                        e.target.checked ? [...prev, sev] : prev.filter(s => s !== sev)
+                      )}
+                      className="w-3.5 h-3.5 text-primary-600"
+                    />
+                    <span className={`text-xs font-medium ${
+                      sev === 'critical' ? 'text-red-700' :
+                      sev === 'high'     ? 'text-orange-700' : 'text-yellow-700'
+                    }`}>{sev}</span>
+                  </label>
+                ))}
+              </div>
+              <button
+                onClick={() => validateMutation.mutate()}
+                disabled={!ddlSql.trim() || validateMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 disabled:opacity-50 transition-colors"
+              >
+                {validateMutation.isPending
+                  ? <><Loader2 className="w-4 h-4 animate-spin" />Validating...</>
+                  : <><ShieldCheck className="w-4 h-4" />Validate DDL</>
+                }
+              </button>
+            </div>
+
+            {/* Result */}
+            {validateMutation.isError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">
+                {(validateMutation.error as any)?.response?.data?.detail || 'Validation failed. Check the SQL syntax.'}
+              </div>
+            )}
+
+            {validateMutation.data && (() => {
+              const r = validateMutation.data
+              const sevColor: Record<string,string> = {
+                critical: 'bg-red-100 text-red-800 border-red-200',
+                high:     'bg-orange-100 text-orange-800 border-orange-200',
+                medium:   'bg-yellow-100 text-yellow-800 border-yellow-200',
+                low:      'bg-blue-100 text-blue-800 border-blue-200',
+                info:     'bg-gray-100 text-gray-600 border-gray-200',
+              }
+              return (
+                <div className={`rounded-xl border-2 p-4 space-y-3 ${r.passed ? 'border-green-300 bg-green-50' : 'border-red-300 bg-red-50'}`}>
+                  {/* Summary */}
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      {r.passed
+                        ? <><CheckCircle className="w-5 h-5 text-green-600" /><span className="font-semibold text-green-900">Validation passed</span></>
+                        : <><AlertTriangle className="w-5 h-5 text-red-600" /><span className="font-semibold text-red-900">Validation failed — {r.blocked_by} blocking finding{r.blocked_by !== 1 ? 's' : ''}</span></>
+                      }
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-gray-600">
+                      <span>Table: <strong>{r.table_name}</strong></span>
+                      <span>{r.columns_parsed} columns</span>
+                      <span>{r.rules_checked} rules checked</span>
+                      <span>{r.findings_count} finding{r.findings_count !== 1 ? 's' : ''}</span>
+                    </div>
+                  </div>
+
+                  {/* Findings table */}
+                  {r.findings.length > 0 && (
+                    <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                      {r.findings.map((f: DDLFinding, i: number) => {
+                        const blocking = r.fail_on.includes(f.severity)
+                        return (
+                          <div key={i} className={`flex items-start gap-3 p-2.5 rounded-lg border bg-white ${blocking ? 'border-red-200' : 'border-gray-200'}`}>
+                            <span className={`text-xs px-1.5 py-0.5 rounded border font-medium flex-shrink-0 mt-0.5 ${sevColor[f.severity] || sevColor.info}`}>
+                              {f.severity.toUpperCase()}
+                            </span>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-xs font-mono font-bold text-gray-700">{f.rule_code}</span>
+                                {f.column_name && (
+                                  <span className="text-xs text-gray-500">→ {f.column_name}</span>
+                                )}
+                                {blocking && <span className="text-xs text-red-600 font-medium">blocks build</span>}
+                              </div>
+                              <p className="text-xs text-gray-600 mt-0.5">{f.title}</p>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
+
+            {/* CI/CD hint */}
+            <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-3">
+              <p className="text-xs font-semibold text-gray-700 mb-1 flex items-center gap-1">
+                <Code className="w-3.5 h-3.5" /> Use in CI/CD pipeline
+              </p>
+              <pre className="text-xs text-gray-600 font-mono whitespace-pre-wrap">
+{`# Run from your repo root
+python ci/validate_ddl.py --sql migrations/latest.sql --url http://your-dq-server:8000`}
+              </pre>
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* ── Add Rule Modal (AI-powered) ────────────────────────────────────── */}
       {showModal && (

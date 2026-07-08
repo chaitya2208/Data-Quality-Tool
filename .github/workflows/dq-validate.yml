@@ -1,0 +1,140 @@
+# Data Quality Shift-Left Validation
+#
+# Runs BEFORE Liquibase applies changelogs to Snowflake.
+# Validates every CREATE TABLE statement against all active data quality rules.
+# Posts a detailed report as a PR comment.
+# Blocks the merge (or warns in soft-gate mode) if blocking violations are found.
+#
+# Prerequisites:
+#   1. DQ_URL secret — URL of your Data Quality Platform backend
+#      (e.g. https://dq-platform.internal:8000 or http://your-runner-ip:8000)
+#   2. GITHUB_TOKEN — auto-provided by GitHub Actions
+#
+# Usage:
+#   This workflow triggers on every PR that changes Liquibase changelog files.
+#   Your existing Liquibase workflow should depend on this job:
+#
+#     jobs:
+#       liquibase-deploy:
+#         needs: dq-validate          # ← wait for DQ gate
+#         if: needs.dq-validate.outputs.passed == 'true'
+
+name: Data Quality — DDL Validation
+
+on:
+  pull_request:
+    paths:
+      # Trigger when changelog files change — adjust patterns to match your repo
+      - 'changelogs/**'
+      - 'liquibase/**'
+      - 'db/migrations/**'
+      - '**/*.changelog.xml'
+      - '**/*.changelog.sql'
+      - '**/changelog*.xml'
+      - '**/changelog*.sql'
+
+# Cancel in-progress runs when a new push arrives
+concurrency:
+  group: dq-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dq-validate:
+    name: Data Quality Gate
+    runs-on: ubuntu-latest   # or self-hosted if DQ Platform is on-prem
+
+    # Output so downstream jobs can gate on the result
+    outputs:
+      passed: ${{ steps.validate.outputs.passed }}
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Python setup (stdlib only — no pip install needed) ────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── Find changed changelog files ──────────────────────────────────────
+      - name: Find changed changelogs
+        id: changed
+        run: |
+          # Get list of changed changelog files in this PR
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep -E '\.(xml|sql)$' \
+            | grep -iE '(changelog|migration|liquibase)' \
+            || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No changelog files changed."
+            echo "files=" >> $GITHUB_OUTPUT
+          else
+            echo "Changed changelogs:"
+            echo "$CHANGED"
+            # Join with space for the validate step
+            echo "files=$(echo $CHANGED | tr '\n' ' ')" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Data Quality Validation ───────────────────────────────────────────
+      - name: Validate DDL against data quality rules
+        id: validate
+        if: steps.changed.outputs.files != ''
+        env:
+          DQ_URL:            ${{ secrets.DQ_URL || 'http://localhost:8000' }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number }}
+        run: |
+          EXIT_CODE=0
+
+          for CHANGELOG in ${{ steps.changed.outputs.files }}; do
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Validating: $CHANGELOG"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            python ci/liquibase_validate.py \
+              --changelog "$CHANGELOG" \
+              --url "$DQ_URL" \
+              --fail-on critical high \
+              || EXIT_CODE=$?
+          done
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+          fi
+
+          exit $EXIT_CODE
+
+      # ── Skip message when no changelogs changed ───────────────────────────
+      - name: No changelogs changed
+        if: steps.changed.outputs.files == ''
+        run: |
+          echo "No Liquibase changelog files changed in this PR."
+          echo "Data Quality validation skipped."
+
+
+# ── Example: gate your Liquibase deploy on DQ validation ─────────────────────
+#
+# In your existing Liquibase workflow file, add:
+#
+#   jobs:
+#     dq-validate:
+#       uses: ./.github/workflows/dq-validate.yml
+#       secrets: inherit
+#
+#     liquibase-deploy:
+#       needs: dq-validate
+#       if: needs.dq-validate.outputs.passed == 'true'
+#       runs-on: ubuntu-latest
+#       steps:
+#         - name: Run Liquibase update
+#           run: |
+#             liquibase --url=$SNOWFLAKE_URL \
+#                       --username=$SNOWFLAKE_USER \
+#                       --password=$SNOWFLAKE_PASSWORD \
+#                       update

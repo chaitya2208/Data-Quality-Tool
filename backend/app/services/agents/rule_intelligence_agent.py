@@ -79,7 +79,19 @@ Respond with this JSON:
       "column_name": "COLUMN_NAME_IF_COLUMN_RULE or null",
       "violation_detected": true/false,
       "violation_evidence": "what specifically is wrong, or null if not violated",
-      "rationale": "why this rule matters for this specific table"
+      "rationale": "why this rule matters for this specific table",
+      "check_type": "one of: not_null | allowed_values | min_value | max_value | positive | non_negative | regex | not_empty | column_exists | columns_exist | comparison | custom_sql",
+      "check_config": {{
+        "column": "COLUMN_NAME (for column-level checks)",
+        "allowed_values": ["VAL1", "VAL2"] ,
+        "min_value": 0,
+        "max_value": null,
+        "regex_pattern": null,
+        "compare_columns": ["COL_A", "COL_B"],
+        "compare_operator": "< | > | <= | >= | !=",
+        "required_columns": ["COL1", "COL2"],
+        "custom_sql_where": "AMOUNT < 0"
+      }}
     }}
   ]
 }}
@@ -89,7 +101,17 @@ IMPORTANT REQUIREMENTS:
 - Generate 3-8 AI rules. Every table has business-logic rules worth capturing.
 - If the table seems well-structured, suggest rules for data freshness, value constraints, uniqueness, or referential patterns.
 - Include ALL {rule_count} existing rules in the existing_rules object.
-- Your ENTIRE response must be a single valid JSON object starting with {{ and ending with }}."""
+- Your ENTIRE response must be a single valid JSON object starting with {{ and ending with }}.
+- For EVERY ai_rule you MUST include check_type and check_config so the rule can be executed automatically.
+  * not_null: check_config.column = column to check
+  * allowed_values: check_config.column + check_config.allowed_values = ["VAL1","VAL2"]
+  * min_value/max_value/positive/non_negative: check_config.column + numeric bound
+  * regex: check_config.column + check_config.regex_pattern
+  * not_empty: check_config.column (string not null and not empty)
+  * column_exists: check_config.required_columns = ["COL_NAME"]
+  * columns_exist: check_config.required_columns = ["COL_A","COL_B",...]
+  * comparison: check two columns check_config.compare_columns + check_config.compare_operator
+  * custom_sql: check_config.custom_sql_where = WHERE clause that should return 0 rows if OK"""
 
 
 class RuleIntelligenceAgent:
@@ -256,6 +278,16 @@ class RuleIntelligenceAgent:
             rationale = data.get("rationale", "")
             full_desc = f"{description}\n\n[AI Rationale] {rationale}" if rationale else description
 
+            # Store check_type + check_config so the rule engine can execute it
+            check_type   = data.get("check_type") or ""
+            check_config = data.get("check_config") or {}
+            rule_config  = {
+                "source_run_id": run_id,
+                "ai_generated":  True,
+                "check_type":    check_type,
+                "check_config":  check_config,
+            }
+
             rule = Rule(
                 code=code,
                 name=name,
@@ -263,8 +295,8 @@ class RuleIntelligenceAgent:
                 category=category,
                 severity=severity,
                 applies_to=applies_to if isinstance(applies_to, list) else ["table"],
-                rule_config={"source_run_id": run_id, "ai_generated": True},
-                is_active=True,       # runs immediately — no approval needed
+                rule_config=rule_config,
+                is_active=True,
                 status=RuleStatus.ACTIVE,
                 owner="rule-intelligence-agent",
                 created_by="rule_intelligence_agent",
@@ -274,7 +306,16 @@ class RuleIntelligenceAgent:
             self.db.flush()
             target_rule = rule
         else:
+            # Backfill check_type/check_config on existing rule if Claude now provides them
             target_rule = existing
+            check_type   = data.get("check_type") or ""
+            check_config = data.get("check_config") or {}
+            if check_type and not (existing.rule_config or {}).get("check_type"):
+                current_config = dict(existing.rule_config or {})
+                current_config["check_type"]   = check_type
+                current_config["check_config"] = check_config
+                existing.rule_config = current_config
+                self.db.flush()
 
         # If Claude detected a violation, create a finding
         violation_finding = None

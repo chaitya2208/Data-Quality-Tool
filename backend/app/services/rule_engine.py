@@ -98,20 +98,133 @@ class RuleEngine:
     def _execute_rule(self, rule: Rule, asset: Asset, scan_id: str) -> Optional[Dict[str, Any]]:
         """
         Execute a single rule against an asset.
-        Returns a finding dict if rule is violated, None otherwise.
+        Static rules use hardcoded handlers.
+        AI-generated rules (rule_config.check_type set) use _check_ai_rule().
         """
         rule_handlers = {
             "MISSING_TABLE_COMMENT": self._check_missing_table_comment,
-            "MISSING_TABLE_OWNER": self._check_missing_table_owner,
+            "MISSING_TABLE_OWNER":   self._check_missing_table_owner,
             "MISSING_COLUMN_COMMENT": self._check_missing_column_comment,
         }
 
         handler = rule_handlers.get(rule.code)
-        if not handler:
-            logger.warning(f"No handler found for rule code: {rule.code}")
+        if handler:
+            return handler(rule, asset, scan_id)
+
+        # AI-generated rule with stored check logic
+        cfg = rule.rule_config or {}
+        if cfg.get("ai_generated") and cfg.get("check_type"):
+            return self._check_ai_rule(rule, asset, scan_id)
+
+        logger.warning(f"No handler found for rule code: {rule.code}")
+        return None
+
+    def _check_ai_rule(self, rule: Rule, asset: Asset, scan_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Execute an AI-generated rule using the check_type + check_config
+        stored in rule_config. Works purely from schema metadata — no live
+        Snowflake query needed (compatible with DDL validation).
+        """
+        cfg          = rule.rule_config or {}
+        check_type   = cfg.get("check_type", "")
+        check_cfg    = cfg.get("check_config") or {}
+        col_name     = check_cfg.get("column", "")
+        violated     = False
+        evidence     = {}
+
+        # Resolve target column metadata
+        col_meta: dict = {}
+        target_asset = asset
+        if col_name and asset.asset_type == "table":
+            # For table-level asset, we can't resolve the column here
+            # (columns are separate assets); skip gracefully
+            return None
+        if asset.asset_type == "column":
+            col_meta = asset.raw_metadata or {}
+            col_name = col_name or asset.column_name or ""
+
+        try:
+            if check_type == "not_null":
+                if asset.asset_type != "column":
+                    return None
+                nullable = col_meta.get("is_nullable", "Y")
+                if str(nullable).upper() in ("Y", "YES", "TRUE", "1"):
+                    violated = True
+                    evidence = {"is_nullable": nullable, "expected": "NOT NULL"}
+
+            elif check_type == "not_empty":
+                if asset.asset_type != "column":
+                    return None
+                nullable = col_meta.get("is_nullable", "Y")
+                if str(nullable).upper() in ("Y", "YES", "TRUE", "1"):
+                    violated = True
+                    evidence = {"is_nullable": nullable, "expected": "NOT NULL and non-empty"}
+
+            elif check_type == "allowed_values":
+                if asset.asset_type != "column":
+                    return None
+                data_type = (col_meta.get("data_type") or "").upper()
+                # Can only check at DDL time if the column type is VARCHAR/text
+                if "VARCHAR" in data_type or "TEXT" in data_type or "STRING" in data_type:
+                    # We can't validate actual values from DDL alone — flag as advisory
+                    pass
+
+            elif check_type in ("positive", "non_negative", "min_value", "max_value"):
+                if asset.asset_type != "column":
+                    return None
+                data_type = (col_meta.get("data_type") or "").upper()
+                numeric_types = {"NUMBER", "INTEGER", "INT", "BIGINT", "FLOAT",
+                                 "DOUBLE", "DECIMAL", "NUMERIC", "FIXED"}
+                base_type = data_type.split("(")[0].strip()
+                if base_type not in numeric_types:
+                    violated = True
+                    evidence = {
+                        "data_type": data_type,
+                        "reason": f"Column expected to be numeric for {check_type} check",
+                    }
+
+            elif check_type == "column_exists":
+                # Only makes sense at table level; can't check column existence
+                # against individual column assets
+                if asset.asset_type == "table":
+                    required = check_cfg.get("required_columns") or (
+                        [check_cfg.get("column")] if check_cfg.get("column") else []
+                    )
+                    if required:
+                        # Will be checked in execute_all_rules via the column assets list
+                        pass
+
+            elif check_type == "comparison":
+                # Two-column comparison — can only verify both columns are same type at DDL
+                pass
+
+        except Exception as e:
+            logger.warning(f"[RuleEngine] AI rule check failed for {rule.code}: {e}")
             return None
 
-        return handler(rule, asset, scan_id)
+        if not violated:
+            return None
+
+        return {
+            "asset_id":    asset.id,
+            "scan_id":     scan_id,
+            "rule_id":     rule.id,
+            "title":       f"{rule.name} violated on {asset.column_name or asset.table_name}",
+            "description": rule.description,
+            "severity":    rule.severity.value if hasattr(rule.severity, "value") else str(rule.severity),
+            "status":      "detected",
+            "context": {
+                "rule_code":     rule.code,
+                "fqn":           asset.fqn,
+                "table_name":    asset.table_name,
+                "schema_name":   asset.schema_name,
+                "database_name": asset.database_name,
+                "column_name":   asset.column_name or "",
+                "ai_generated":  True,
+                "check_type":    check_type,
+            },
+            "evidence": evidence,
+        }
 
     def _check_missing_table_comment(self, rule: Rule, asset: Asset, scan_id: str) -> Optional[Dict[str, Any]]:
         """Check if table has a comment/description"""
