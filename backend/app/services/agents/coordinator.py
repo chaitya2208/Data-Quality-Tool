@@ -27,6 +27,7 @@ AGENT_ORDER = [
     "coordinator",
     "metadata_agent",
     "rules_fetch_agent",
+    "profiling_agent",
     "rule_intelligence_agent",
     "findings_agent",
     "fix_issues",          # UI-only node
@@ -37,6 +38,7 @@ DB_AGENT_ORDER = [
     "coordinator",
     "metadata_agent",
     "rules_fetch_agent",
+    "profiling_agent",
     "rule_intelligence_agent",
     "findings_agent",
     "verification_agent",
@@ -101,16 +103,20 @@ class WorkflowCoordinator:
             self._mark_run_failed(db, str(e))
             return
 
-        # ── Parallel: Metadata Agent + Rules Fetch Agent ──────────────────────
-        meta_task   = self._get_task(db, "metadata_agent")
-        rules_task  = self._get_task(db, "rules_fetch_agent")
+        # ── Parallel: Metadata Agent + Rules Fetch Agent + Profiling Agent ─────
+        meta_task    = self._get_task(db, "metadata_agent")
+        rules_task   = self._get_task(db, "rules_fetch_agent")
+        profile_task = self._get_task(db, "profiling_agent")
         self._start_task(db, meta_task)
         self._start_task(db, rules_task)
+        if profile_task:
+            self._start_task(db, profile_task)
 
         # Threads store only IDs — never ORM objects — to avoid detached-instance errors.
         # The main session re-fetches everything after threads complete.
-        meta_result  = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
-        rules_result = {"rule_codes": None, "error": None}
+        meta_result    = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
+        rules_result   = {"rule_codes": None, "error": None}
+        profile_result = {"profile": None, "error": None}
 
         def _run_metadata():
             dbt = SessionLocal()
@@ -157,10 +163,35 @@ class WorkflowCoordinator:
             finally:
                 dbt.close()
 
+        def _run_profiling():
+            # Profiling is best-effort: if it fails, the pipeline still runs
+            # rules on metadata alone — we just lose the data-informed boost.
+            if not profile_task:
+                return
+            dbt = SessionLocal()
+            try:
+                from app.services.agents.profiling_agent import ProfilingAgent
+                prof = ProfilingAgent(dbt).run(run.database, run.schema_name, run.table)
+                profile_result["profile"] = prof
+                anomalies = prof.get("anomalies", [])
+                self._complete_task_in(dbt, profile_task.id, output={
+                    "columns_profiled": len(prof.get("columns", [])),
+                    "anomalies_found":  len(anomalies),
+                    "anomalies":        anomalies[:20],
+                    "row_count":        prof.get("table", {}).get("row_count"),
+                    "sampled":          prof.get("table", {}).get("is_sampled", False),
+                })
+            except Exception as e:
+                profile_result["error"] = str(e)
+                self._fail_task_in(dbt, profile_task.id, str(e))
+            finally:
+                dbt.close()
+
         t1 = threading.Thread(target=_run_metadata,    daemon=True)
         t2 = threading.Thread(target=_run_rules_fetch, daemon=True)
-        t1.start(); t2.start()
-        t1.join();  t2.join()
+        t3 = threading.Thread(target=_run_profiling,   daemon=True)
+        t1.start(); t2.start(); t3.start()
+        t1.join();  t2.join();  t3.join()
 
         # Reload run so main session sees scan_id written by the metadata thread
         db.expire_all()
@@ -201,7 +232,10 @@ class WorkflowCoordinator:
         try:
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent(db)
-            intel_result = agent.run(table_asset, column_assets, existing_rules, run.id)
+            intel_result = agent.run(
+                table_asset, column_assets, existing_rules, run.id,
+                profile=profile_result.get("profile"),
+            )
 
             classification = intel_result["classification"]
             ai_rules       = intel_result["ai_rules"]
@@ -216,6 +250,7 @@ class WorkflowCoordinator:
             existing_rules_raw = classification.get("existing_rules", {})
 
             self._complete_task(db, intel_task, output={
+                "parse_warning":         classification.get("parse_warning"),
                 "table_type":            classification["table_type"],
                 "table_type_confidence": classification["table_type_confidence"],
                 "table_type_reason":     classification["table_type_reason"],
@@ -507,8 +542,31 @@ class WorkflowCoordinator:
             db.commit()
 
             sev_breakdown = {}
+            fired_codes = set()  # rules that produced at least one finding
             for f in findings:
                 sev_breakdown[f.severity] = sev_breakdown.get(f.severity, 0) + 1
+                code = (f.context or {}).get("rule_code")
+                if code:
+                    fired_codes.add(code)
+
+            # Split the executed (approved) rule set into "used" (produced a finding)
+            # vs "unused" (ran clean) — mirrors the active/skipped panel from Rule
+            # Intelligence, so the user can see what fired and what came back clean.
+            name_by_code = {e["code"]: e.get("name", e["code"]) for e in active_entries}
+            findings_by_code = {}
+            for f in findings:
+                c = (f.context or {}).get("rule_code")
+                if c:
+                    findings_by_code[c] = findings_by_code.get(c, 0) + 1
+
+            rules_used = [
+                {"code": c, "name": name_by_code.get(c, c), "findings": findings_by_code.get(c, 0)}
+                for c in sorted(approved_codes) if c in fired_codes
+            ]
+            rules_unused = [
+                {"code": c, "name": name_by_code.get(c, c)}
+                for c in sorted(approved_codes) if c not in fired_codes
+            ]
 
             self._complete_task(db, findings_task, output={
                 "findings_count":     len(findings),
@@ -516,6 +574,11 @@ class WorkflowCoordinator:
                 "severity_breakdown": sev_breakdown,
                 "scan_id":            scan.id,
                 "ai_rules_persisted": len(ai_rules_persisted),
+                "rules_executed":     len(approved_codes),
+                "rules_used_count":   len(rules_used),
+                "rules_unused_count": len(rules_unused),
+                "rules_used":         rules_used,
+                "rules_unused":       rules_unused,
             })
         except Exception as e:
             self._fail_task(db, findings_task, str(e))

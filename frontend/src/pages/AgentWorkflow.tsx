@@ -7,7 +7,7 @@ import {
   GitBranch, Database, BrainCircuit, Shield, AlertCircle,
   Wrench, CheckCircle2, Loader2, ChevronDown, ChevronRight,
   AlertTriangle, ArrowRight, Clock, Play, ExternalLink,
-  RefreshCw, Sparkles,
+  RefreshCw, Sparkles, BarChart3,
 } from 'lucide-react'
 
 // ── Pipeline definition ───────────────────────────────────────────────────────
@@ -33,6 +33,14 @@ const AGENTS = [
     label: 'Rules Fetch',
     icon: Shield,
     desc: 'Loads all active quality rules',
+    parallel: true,
+    parallelGroup: 'A',
+  },
+  {
+    name: 'profiling_agent',
+    label: 'Profiling',
+    icon: BarChart3,
+    desc: 'Profiles data — stats & anomalies for smarter rules',
     parallel: true,
     parallelGroup: 'A',
   },
@@ -456,7 +464,7 @@ export default function AgentWorkflow() {
   const findingsOutput = getTask('findings_agent')?.output
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="space-y-6">
 
       {/* Header */}
       <div>
@@ -691,14 +699,16 @@ export default function AgentWorkflow() {
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                   <AgentNode agentDef={AGENTS[2]} task={getTask('rules_fetch_agent')}
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                  <AgentNode agentDef={AGENTS[3]} task={getTask('profiling_agent')}
+                    isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 </ParallelGroup>
-                <AgentNode agentDef={AGENTS[3]} task={getTask('rule_intelligence_agent')}
+                <AgentNode agentDef={AGENTS[4]} task={getTask('rule_intelligence_agent')}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-                <AgentNode agentDef={AGENTS[4]} task={getTask('findings_agent')}
+                <AgentNode agentDef={AGENTS[5]} task={getTask('findings_agent')}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-                <AgentNode agentDef={AGENTS[5]} task={undefined}
+                <AgentNode agentDef={AGENTS[6]} task={undefined}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-                <AgentNode agentDef={AGENTS[6]} task={getTask('verification_agent')}
+                <AgentNode agentDef={AGENTS[7]} task={getTask('verification_agent')}
                   isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
               </div>
               <div className="mt-5 pt-4 border-t border-gray-100 grid grid-cols-2 sm:grid-cols-4 gap-4">
@@ -1010,6 +1020,77 @@ export default function AgentWorkflow() {
               </p>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Findings Report — rules that fired vs rules that ran clean (mirrors
+          the active/skipped split, but after findings ran) */}
+      {findingsOutput && getTask('findings_agent')?.status === 'completed' &&
+       Array.isArray(findingsOutput.rules_used) && (
+        <div className="bg-white rounded-xl shadow overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-100">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-5 h-5 text-primary-600" />
+              <h2 className="text-base font-semibold text-gray-900">Findings Report</h2>
+            </div>
+            <p className="text-xs text-gray-500 mt-0.5">
+              {findingsOutput.rules_executed} rules executed ·{' '}
+              <span className="text-orange-700 font-medium">{findingsOutput.rules_used_count} fired</span> ·{' '}
+              <span className="text-green-700 font-medium">{findingsOutput.rules_unused_count} clean</span>
+              {findingsOutput.findings_count != null && <> · {findingsOutput.findings_count} findings</>}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100">
+            {/* Rules that fired */}
+            <div className="p-5">
+              <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-orange-500 inline-block" />
+                Rules Used ({findingsOutput.rules_used_count})
+              </h3>
+              <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
+                {findingsOutput.rules_used.map((r: any) => (
+                  <div key={r.code} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 bg-orange-50/40 p-2.5">
+                    <div className="min-w-0">
+                      <span className="font-mono text-xs font-bold text-gray-700">{r.code}</span>
+                      <p className="text-xs text-gray-600 truncate">{r.name}</p>
+                    </div>
+                    {activeRun?.scan_id && (
+                      <button
+                        onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}&rule_code=${encodeURIComponent(r.code)}`)}
+                        className="flex-shrink-0 text-xs px-1.5 py-1 text-orange-700 border border-orange-300 rounded hover:bg-orange-100 font-medium"
+                        title="View these findings"
+                      >
+                        {r.findings} finding{r.findings !== 1 ? 's' : ''}
+                      </button>
+                    )}
+                  </div>
+                ))}
+                {findingsOutput.rules_used_count === 0 && (
+                  <p className="text-xs text-gray-400 text-center py-4">No rules fired — the data is clean.</p>
+                )}
+              </div>
+            </div>
+
+            {/* Rules that ran clean */}
+            <div className="p-5">
+              <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
+                Rules Clean ({findingsOutput.rules_unused_count})
+              </h3>
+              <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
+                {(findingsOutput.rules_unused || []).map((r: any) => (
+                  <div key={r.code} className="rounded-lg border border-gray-200 bg-gray-50 p-2.5 text-sm">
+                    <span className="font-mono text-xs font-bold text-gray-500">{r.code}</span>
+                    <p className="text-xs text-gray-500 truncate">{r.name}</p>
+                  </div>
+                ))}
+                {findingsOutput.rules_unused_count === 0 && (
+                  <p className="text-xs text-gray-400 text-center py-4">Every executed rule found at least one issue.</p>
+                )}
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

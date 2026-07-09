@@ -29,10 +29,17 @@ def get_claude_client() -> AnthropicBedrock:
     )
 
 
-def ask_claude(prompt: str, system: str = None, max_tokens: int = 4096) -> str:
+def ask_claude(prompt: str, system: str = None, max_tokens: int = 32000) -> str:
     """
-    Simple one-shot call to Claude. Returns the text response.
+    One-shot call to Claude via Bedrock. Returns the concatenated text response.
     Raises on API errors.
+
+    Streams internally: the Anthropic SDK refuses / times out non-streaming
+    requests with large max_tokens (idle-connection drop), so we always use
+    the streaming helper and reassemble the final message. This keeps a single
+    string return type for callers regardless of response size. Default
+    max_tokens is 32000 — large enough for responses that must enumerate many
+    items (e.g. classifying 100+ rules) without truncating mid-JSON.
     """
     client = get_claude_client()
     kwargs = {
@@ -43,5 +50,10 @@ def ask_claude(prompt: str, system: str = None, max_tokens: int = 4096) -> str:
     if system:
         kwargs["system"] = system
 
-    response = client.messages.create(**kwargs)
-    return response.content[0].text
+    with client.messages.stream(**kwargs) as stream:
+        message = stream.get_final_message()
+
+    # Concatenate all text blocks (thinking/tool blocks, if any, are skipped).
+    return "".join(
+        block.text for block in message.content if getattr(block, "type", None) == "text"
+    )

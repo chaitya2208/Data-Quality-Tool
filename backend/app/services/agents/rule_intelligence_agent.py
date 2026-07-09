@@ -25,18 +25,18 @@ from sqlalchemy.orm import Session
 from app.models.asset import Asset
 from app.models.rule import Rule, RuleStatus, RuleCategory, RuleSeverity
 from app.models.finding import Finding, FindingStatus
-from app.services.snowflake_session import session as sf_session
 from app.services.claude_client import ask_claude
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a senior Snowflake data quality architect.
 
-Given a table schema and sample data, you will:
+Given a table schema and a full-dataset data profile (per-column statistics
+computed over every row), you will:
 1. Classify the table type (fact/dimension/staging/config/audit/reference)
 2. For each existing rule, decide if it applies to this table type
 3. Generate NEW data quality rules specific to this table's apparent business purpose
-4. For each new rule, check if the current schema already violates it
+4. For each new rule, check if the profile shows the data already violates it
 
 Respond with valid JSON only — no markdown, no prose outside the JSON.
 Be thorough: AI rules should catch business logic issues that static rules miss.
@@ -50,8 +50,8 @@ Owner: {owner}
 === SCHEMA ===
 {columns}
 
-=== SAMPLE DATA (first 3 rows) ===
-{sample_data}
+=== DATA PROFILE (full-dataset per-column statistics from a live scan) ===
+{data_profile}
 
 === EXISTING RULES TO EVALUATE ===
 {existing_rules}
@@ -87,6 +87,14 @@ Respond with this JSON:
 IMPORTANT REQUIREMENTS:
 - You MUST include an "ai_rules" array in your response. It must never be omitted or empty.
 - Generate 3-8 AI rules. Every table has business-logic rules worth capturing.
+- USE THE DATA PROFILE: base rules on the observed statistics, not guesses. If a
+  numeric column's max is a statistical outlier (e.g. AGE max = 999), propose a
+  bounded-range rule and mark violation_detected=true. If an ID-like column has
+  duplicates, propose a uniqueness rule. If a date column is stale, propose a
+  freshness rule. If an email/phone column has low pattern-match %, propose a
+  format rule. Ground every threshold in the profile's min/max/avg/stddev/distinct.
+- The profile's "ANOMALIES" list flags concrete issues already detected in the
+  data — prefer generating rules that would catch each of those.
 - If the table seems well-structured, suggest rules for data freshness, value constraints, uniqueness, or referential patterns.
 - Include ALL {rule_count} existing rules in the existing_rules object.
 - Your ENTIRE response must be a single valid JSON object starting with {{ and ending with }}."""
@@ -107,25 +115,30 @@ class RuleIntelligenceAgent:
         column_assets: List[Asset],
         existing_rules: List[Rule],
         run_id: str,
+        profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Returns a result dict with:
           - classification: table type + selected/skipped rules
           - ai_rules: list of generated Rule objects (already persisted)
           - ai_violations: list of finding dicts for violated AI rules
+
+        When `profile` (from ProfilingAgent) is provided, its per-column
+        statistics and anomaly signals are added to the prompt so Claude
+        generates rules grounded in the actual data distribution.
         """
         logger.info(f"[RuleIntelligence] Analyzing {table_asset.fqn}")
 
-        sample_data = self._fetch_sample(table_asset)
         columns_text = self._format_columns(column_assets)
         rules_text = self._format_existing_rules(existing_rules)
+        profile_text = self._format_profile(profile)
 
         prompt = USER_PROMPT_TEMPLATE.format(
             fqn=table_asset.fqn,
             row_count=table_asset.row_count or "unknown",
             owner=table_asset.owner or "unknown",
             columns=columns_text,
-            sample_data=sample_data,
+            data_profile=profile_text,
             existing_rules=rules_text,
             rule_count=len(existing_rules),
         )
@@ -133,9 +146,23 @@ class RuleIntelligenceAgent:
         raw = self._call_model(prompt)
         parsed = self._extract_json(raw)
 
+        # parse_warning surfaces to the UI (via the coordinator) so a truncated /
+        # unparseable response is visible instead of silently degrading to
+        # "0 AI rules, all rules kept active".
+        parse_warning = None
         if not parsed:
-            logger.warning("[RuleIntelligence] Empty JSON from Claude — using defaults")
+            parse_warning = (
+                f"LLM response unparseable ({len(raw or '')} chars) — kept all rules "
+                f"active, generated no AI rules. Likely a truncated or refused response."
+            )
+            logger.error(f"[RuleIntelligence] {parse_warning}")
             parsed = {}
+        elif "existing_rules" not in parsed and "ai_rules" not in parsed:
+            parse_warning = (
+                f"LLM response missing 'existing_rules'/'ai_rules' (keys: "
+                f"{list(parsed.keys())}) — using defaults."
+            )
+            logger.error(f"[RuleIntelligence] {parse_warning}")
         else:
             ai_rules_raw = parsed.get("ai_rules", [])
             if not ai_rules_raw:
@@ -153,6 +180,7 @@ class RuleIntelligenceAgent:
             "table_type_confidence": parsed.get("table_type_confidence", 50),
             "table_type_reason":     parsed.get("table_type_reason", ""),
             "existing_rules":        parsed.get("existing_rules", {}),
+            "parse_warning":         parse_warning,
         }
 
         # Normalize: fill missing rule decisions with default (run=True)
@@ -314,26 +342,6 @@ class RuleIntelligenceAgent:
 
         return target_rule, violation_finding
 
-    def _fetch_sample(self, table_asset: Asset) -> str:
-        """Fetch first 3 rows of actual data for Claude to inspect."""
-        try:
-            fqn = table_asset.fqn
-            rows = sf_session.query(f"SELECT * FROM {fqn} LIMIT 3")
-            if not rows:
-                return "(no data)"
-            # Format as compact table
-            if rows:
-                headers = list(rows[0].keys())[:10]  # cap columns shown
-                lines = [" | ".join(headers)]
-                lines.append("-" * 60)
-                for row in rows:
-                    vals = [str(row.get(h, ""))[:20] for h in headers]
-                    lines.append(" | ".join(vals))
-                return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] Could not fetch sample data: {e}")
-        return "(sample data unavailable)"
-
     def _format_columns(self, column_assets: List[Asset]) -> str:
         lines = []
         for col in column_assets:
@@ -348,6 +356,61 @@ class RuleIntelligenceAgent:
             )
         return "\n".join(lines) if lines else "  (no columns)"
 
+    def _format_profile(self, profile: Optional[Dict[str, Any]]) -> str:
+        """
+        Render the FULL data profile for the prompt — every stat the profiling
+        agent computed over the complete dataset, one block per column, plus the
+        distilled anomaly list. This is the primary data signal for rule
+        generation, so nothing computed is dropped: null%, distinct count + %,
+        duplicates, min/max, avg/stddev, freshness, pattern-match, and the actual
+        most-frequent values (top_values) — the latter is what lets Claude write
+        precise allowed-values rules for status/categorical columns.
+        """
+        if not profile or not profile.get("columns"):
+            return "(no data profile available — base rules on schema only)"
+
+        tbl = profile.get("table", {})
+        lines = [f"Rows profiled (full dataset): {tbl.get('row_count', '?')}", ""]
+
+        for c in profile["columns"]:
+            name = c.get("column_name")
+            parts = [f"null={c.get('null_percentage')}%"]
+            if c.get("distinct_count") is not None:
+                dpct = f" ({c['distinct_pct']}%)" if c.get("distinct_pct") is not None else ""
+                parts.append(f"distinct={c['distinct_count']}{dpct}")
+            if c.get("duplicate_count") is not None:
+                parts.append(f"dup_values={c['duplicate_count']}")
+            if c.get("min_value") is not None or c.get("max_value") is not None:
+                parts.append(f"range={c.get('min_value')}..{c.get('max_value')}")
+            if c.get("avg_value") is not None:
+                parts.append(f"avg={c['avg_value']}")
+            if c.get("stddev") is not None:
+                parts.append(f"stddev={c['stddev']}")
+            if c.get("freshness_days") is not None:
+                parts.append(f"freshness={c['freshness_days']}d")
+            if c.get("pattern_match_pct") is not None:
+                parts.append(f"pattern_match={c['pattern_match_pct']}%")
+            if c.get("outlier_hint"):
+                parts.append("OUTLIER!")
+
+            lines.append(f"  {name} [{c.get('category')}]: " + ", ".join(parts))
+
+            # Actual most-frequent values — critical for allowed-values rules.
+            tv = c.get("top_values") or []
+            if tv:
+                rendered = ", ".join(
+                    f"{t.get('value')!r} (x{t.get('count')})" for t in tv[:8]
+                )
+                lines.append(f"      top values: {rendered}")
+
+        anomalies = profile.get("anomalies", [])
+        if anomalies:
+            lines.append("")
+            lines.append("ANOMALIES DETECTED IN DATA:")
+            for a in anomalies:
+                lines.append(f"  - [{a.get('type')}] {a.get('column')}: {a.get('detail')}")
+        return "\n".join(lines)
+
     def _format_existing_rules(self, rules: List[Rule]) -> str:
         lines = []
         for rule in rules:
@@ -361,12 +424,13 @@ class RuleIntelligenceAgent:
         return "\n".join(lines)
 
     def _call_model(self, prompt: str) -> str:
-        # Try Cortex first
-        try:
-            return sf_session.ask_cortex(prompt, model="claude-opus-4-8")
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] Cortex failed ({e}), using Claude/Bedrock")
-        return ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=4096)
+        # Call Bedrock (Opus 4.8) directly. We deliberately do NOT route through
+        # Snowflake Cortex here: the 2-arg CORTEX.COMPLETE has a low, unraisable
+        # output cap that truncates the large rule-classification response, and
+        # its single-quote-only escaping breaks on the prompt's JSON braces.
+        # ask_claude streams internally with a 32k ceiling, so the full response
+        # for 100+ rules comes back intact.
+        return ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=32000)
 
     @staticmethod
     def _extract_json(text: str) -> dict:

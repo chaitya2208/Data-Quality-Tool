@@ -180,6 +180,82 @@ export const assetsApi = {
     api.get<{ tables: string[]; count: number }>(`/assets/discover/tables/${database}/${schema}`),
 };
 
+// ── Data Explorer / Profiling ─────────────────────────────────────────────────
+
+export interface ColumnMeta {
+  column_name: string;
+  data_type: string;
+  is_nullable: boolean;
+  primary_key: boolean;
+  unique_key: boolean;
+  comment: string | null;
+}
+
+export interface TopValue {
+  value: string | number | null;
+  count: number;
+}
+
+export type ColumnCategory =
+  | 'id' | 'date' | 'amount' | 'measure' | 'status' | 'categorical' | 'email' | 'phone' | 'text';
+
+export interface ColumnProfile {
+  column_name: string;
+  data_type: string;
+  category: ColumnCategory;
+  relevant_stats: string[];
+  null_count: number | null;
+  null_percentage: number | null;
+  distinct_count: number | null;
+  distinct_pct: number | null;
+  duplicate_count: number | null;
+  min_value: string | number | null;
+  max_value: string | number | null;
+  avg_value: string | number | null;
+  stddev: string | number | null;
+  freshness_days: number | null;
+  pattern_match_pct: number | null;
+  outlier_hint: boolean | null;
+  top_values: TopValue[];
+  is_sampled: boolean;
+  error?: string;
+}
+
+export interface TableInfo {
+  name: string;
+  row_count: number | null;
+  bytes: number | null;
+  kind: string | null;
+  owner: string | null;
+  comment: string | null;
+}
+
+export interface TableProfile {
+  table: {
+    row_count: number;
+    column_count: number;
+    is_sampled: boolean;
+    sample_size: number | null;
+    bytes: number | null;
+    kind: string | null;
+    owner: string | null;
+    comment: string | null;
+  };
+  columns: ColumnProfile[];
+  categories: ColumnCategory[];
+  category_labels: Record<string, string>;
+  category_stats: Record<string, string[]>;
+}
+
+export const profilingApi = {
+  tableInfo: (database: string, schema: string, table: string) =>
+    api.get<TableInfo>(`/profiling/table-info/${database}/${schema}/${table}`),
+  columns: (database: string, schema: string, table: string) =>
+    api.get<{ columns: ColumnMeta[] }>(`/profiling/columns/${database}/${schema}/${table}`),
+  profile: (database: string, schema: string, table: string) =>
+    api.post<TableProfile>(`/profiling/profile/${database}/${schema}/${table}`),
+};
+
 // AI API
 export interface AIRecommendation {
   finding_id: string;

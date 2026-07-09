@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Loader2, CheckCircle, XCircle, ShieldCheck, Menu, X } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Loader2, CheckCircle, XCircle, ShieldCheck, Menu, X, Compass } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { aiApi, healthApi } from './api/client'
 import Dashboard from './pages/Dashboard'
@@ -9,6 +9,7 @@ import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
 import AIFix from './pages/AIFix'
 import Rules from './pages/Rules'
+import DataExplorer from './pages/DataExplorer'
 
 function App() {
   const location = useLocation()
@@ -34,11 +35,12 @@ function App() {
   const sfConnected = sfHealth?.status === 'connected'
 
   const navigation = [
-    { name: 'Dashboard', href: '/',         icon: Home        },
-    { name: 'Assets',    href: '/assets',   icon: Database    },
-    { name: 'Findings',  href: '/findings', icon: AlertCircle },
-    { name: 'Rules',     href: '/rules',    icon: ShieldCheck },
-    { name: 'Workflow',  href: '/workflow', icon: GitBranch   },
+    { name: 'Dashboard',     href: '/',         icon: Home        },
+    { name: 'Data Explorer', href: '/explorer', icon: Compass     },
+    { name: 'Assets',        href: '/assets',   icon: Database    },
+    { name: 'Findings',      href: '/findings', icon: AlertCircle },
+    { name: 'Rules',         href: '/rules',    icon: ShieldCheck },
+    { name: 'Workflow',      href: '/workflow', icon: GitBranch   },
   ]
 
   if (connectingSnowflake) {
@@ -158,6 +160,7 @@ function App() {
         <main className="flex-1 p-4 sm:p-6 lg:p-8">
           <Routes>
             <Route path="/"         element={<Dashboard />}     />
+            <Route path="/explorer" element={<DataExplorer />}  />
             <Route path="/assets"   element={<Assets />}        />
             <Route path="/findings" element={<Findings />}      />
             <Route path="/workflow" element={<AgentWorkflow />} />
