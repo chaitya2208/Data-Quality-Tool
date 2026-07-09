@@ -13,13 +13,10 @@ On subsequent encounters:
 
 Placeholder set: {{fqn}}, {{table_name}}, {{column_name}}, {{schema_name}}, {{database_name}}, {{data_type}}
 """
-import json
-import re
 import logging
 from typing import Optional
-from sqlalchemy.orm import Session
 
-from app.models.recommendation_cache import RecommendationCache
+from app.services import storage
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +35,13 @@ def build_cache_key(rule_code: str, data_type: str) -> str:
     return f"{rule_code}::{(data_type or '').upper()}"
 
 
-def get_cached(db: Session, cache_key: str, context: dict) -> Optional[dict]:
+def get_cached(cache_key: str, context: dict) -> Optional[dict]:
     """
     Look up cache key. If found, substitute placeholders with context values
     and increment hit_count. Returns dict with explanation/sql_query/confidence/impact,
     or None if no cache entry exists.
     """
-    entry = db.query(RecommendationCache).filter(
-        RecommendationCache.cache_key == cache_key
-    ).first()
+    entry = storage.get_cache_entry(cache_key)
 
     if not entry:
         return None
@@ -56,10 +51,9 @@ def get_cached(db: Session, cache_key: str, context: dict) -> Optional[dict]:
     sql_query = _substitute(entry.sql_template, context)
 
     # Track usage
-    entry.hit_count = (entry.hit_count or 0) + 1
-    db.commit()
+    storage.increment_cache_hit(cache_key)
 
-    logger.info(f"[RecCache] Cache hit for {cache_key} (hit #{entry.hit_count})")
+    logger.info(f"[RecCache] Cache hit for {cache_key} (hit #{(entry.hit_count or 0) + 1})")
     return {
         "explanation": explanation,
         "sql_query": sql_query,
@@ -70,7 +64,6 @@ def get_cached(db: Session, cache_key: str, context: dict) -> Optional[dict]:
 
 
 def store(
-    db: Session,
     cache_key: str,
     rule_code: str,
     data_type: str,
@@ -85,31 +78,24 @@ def store(
     and persist to DB. Safe to call even if the key already exists (no-op if duplicate).
     """
     # Check for existing entry first (another request may have stored it concurrently)
-    existing = db.query(RecommendationCache).filter(
-        RecommendationCache.cache_key == cache_key
-    ).first()
-    if existing:
+    if storage.get_cache_entry(cache_key):
         return
 
     explanation_tmpl = _templatize(explanation, context)
     sql_tmpl = _templatize(sql_query, context)
 
-    entry = RecommendationCache(
-        cache_key=cache_key,
-        rule_code=rule_code,
-        data_type=data_type or "",
-        explanation_template=explanation_tmpl,
-        sql_template=sql_tmpl,
-        confidence=confidence,
-        impact=impact,
-        hit_count=0,
-    )
-    db.add(entry)
     try:
-        db.commit()
+        storage.create_cache_entry(
+            cache_key=cache_key,
+            rule_code=rule_code,
+            data_type=data_type or "",
+            explanation_template=explanation_tmpl,
+            sql_template=sql_tmpl,
+            confidence=confidence,
+            impact=impact,
+        )
         logger.info(f"[RecCache] Stored new cache entry for {cache_key}")
     except Exception as e:
-        db.rollback()
         logger.warning(f"[RecCache] Failed to store cache entry for {cache_key}: {e}")
 
 

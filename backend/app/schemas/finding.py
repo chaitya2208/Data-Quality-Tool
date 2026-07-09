@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-from app.models.finding import FindingStatus
+from app.core.enums import FindingStatus
 
 
 class FindingBase(BaseModel):

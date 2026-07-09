@@ -28,11 +28,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy.orm import Session
-
-from app.models.asset import Asset
-from app.models.finding import FindingStatus
-from app.models.rule import Rule, RuleCategory, RuleSeverity
+from app.services import storage
 
 import logging
 
@@ -153,46 +149,22 @@ def _normalise_type(raw_type: str) -> str:
 
 
 def _ensure_rule(
-    db: Session,
     code: str,
     name: str,
     description: str,
-    category: RuleCategory,
-    severity: RuleSeverity,
+    category: str,
+    severity: str,
     applies_to: List[str],
-) -> Rule:
-    """
-    Return the Rule for `code`, creating it in the DB if it doesn't exist.
-    Uses flush() so the ID is available without a full commit.
-    """
-    rule = db.query(Rule).filter(Rule.code == code).first()
-    if rule:
-        return rule
-
-    rule = Rule(
-        code=code,
-        name=name,
-        description=description,
-        category=category,
-        severity=severity,
-        applies_to=applies_to,
-        rule_config={},
-        is_active=True,
-        status="ACTIVE",
-        owner="data-governance-team",
-        created_by="system",
-        version=1,
-    )
-    db.add(rule)
-    db.flush()
-    logger.info(f"[DynamicRules] Auto-registered new rule: {code}")
+) -> Any:
+    """Return the rule for `code`, auto-creating it (as system/active) if missing."""
+    rule = storage.ensure_rule(code, name, description, category, severity, applies_to)
     return rule
 
 
 def _finding(
     asset_id: str,
     scan_id: str,
-    rule: Rule,
+    rule: Any,
     title: str,
     description: str,
     context: Dict[str, Any],
@@ -204,14 +176,14 @@ def _finding(
         "rule_id": rule.id,
         "title": title,
         "description": description,
-        "severity": rule.severity.value,
-        "status": FindingStatus.DETECTED,
+        "severity": rule.severity,
+        "status": "detected",
         "context": context,
         "evidence": evidence,
     }
 
 
-def _base_ctx(asset: Asset) -> Dict[str, Any]:
+def _base_ctx(asset: Any) -> Dict[str, Any]:
     return {
         "database_name": asset.database_name,
         "schema_name": asset.schema_name,
@@ -225,7 +197,7 @@ def _base_ctx(asset: Asset) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_no_primary_key(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables that have no obvious primary key column."""
     upper_cols = {c.upper() for c in column_names}
@@ -239,7 +211,6 @@ def check_no_primary_key(
         return None
 
     rule = _ensure_rule(
-        db,
         code="NO_PRIMARY_KEY_HINT",
         name="Table May Be Missing a Primary Key",
         description=(
@@ -247,8 +218,8 @@ def check_no_primary_key(
             "*_PK, *_KEY, *_SEQ) was found. Tables without a primary key risk duplicate "
             "rows and make joins, deduplication, and CDC harder."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.MEDIUM,
+        category='schema',
+        severity='medium',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -266,7 +237,7 @@ def check_no_primary_key(
 
 
 def check_missing_created_at(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables missing a row-creation timestamp column."""
     upper_cols = {c.upper() for c in column_names}
@@ -274,7 +245,6 @@ def check_missing_created_at(
         return None
 
     rule = _ensure_rule(
-        db,
         code="MISSING_CREATED_AT",
         name="Missing Row Creation Timestamp",
         description=(
@@ -282,8 +252,8 @@ def check_missing_created_at(
             "such as CREATED_AT, CREATE_DATE, or INSERT_TS. This enables auditing, "
             "incremental loads, and change tracking."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.MEDIUM,
+        category='schema',
+        severity='medium',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -301,7 +271,7 @@ def check_missing_created_at(
 
 
 def check_missing_updated_at(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables missing a last-updated timestamp column."""
     upper_cols = {c.upper() for c in column_names}
@@ -309,15 +279,14 @@ def check_missing_updated_at(
         return None
 
     rule = _ensure_rule(
-        db,
         code="MISSING_UPDATED_AT",
         name="Missing Row Updated Timestamp",
         description=(
             "Mutable tables should track the last modification time via UPDATED_AT, "
             "MODIFIED_DATE, or equivalent. Required for CDC, incremental ETL, and auditing."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.LOW,
+        category='schema',
+        severity='low',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -334,7 +303,7 @@ def check_missing_updated_at(
 
 
 def check_too_many_columns(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables that exceed the maximum column count."""
     count = len(column_names)
@@ -342,7 +311,6 @@ def check_too_many_columns(
         return None
 
     rule = _ensure_rule(
-        db,
         code="TOO_MANY_COLUMNS",
         name="Table Has Too Many Columns",
         description=(
@@ -350,8 +318,8 @@ def check_too_many_columns(
             "normalisation, merged business entities, or accumulated technical debt. "
             "Consider decomposing into focused, related tables."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.LOW,
+        category='schema',
+        severity='low',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -369,7 +337,7 @@ def check_too_many_columns(
 
 
 def check_inconsistent_naming(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables where column names mix multiple casing styles."""
     if len(column_names) < 3:
@@ -385,7 +353,6 @@ def check_inconsistent_naming(
         return None
 
     rule = _ensure_rule(
-        db,
         code="INCONSISTENT_COLUMN_NAMING",
         name="Inconsistent Column Naming Style",
         description=(
@@ -393,8 +360,8 @@ def check_inconsistent_naming(
             "(e.g. all UPPER_SNAKE_CASE). Mixing styles makes queries harder to write "
             "and datasets harder to join."
         ),
-        category=RuleCategory.NAMING,
-        severity=RuleSeverity.LOW,
+        category='naming',
+        severity='low',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -417,7 +384,7 @@ def check_inconsistent_naming(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_pii_column(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str
 ) -> Optional[Dict]:
     """Flag columns whose names suggest PII without a masking indicator."""
     col_upper = (col_asset.column_name or "").upper()
@@ -436,7 +403,6 @@ def check_pii_column(
         return None
 
     rule = _ensure_rule(
-        db,
         code="PII_COLUMN_NO_MASKING",
         name="Potential PII Column Without Masking Policy",
         description=(
@@ -444,8 +410,8 @@ def check_pii_column(
             "(e.g. EMAIL, SSN, PHONE, PASSWORD, DOB, SALARY) should have a "
             "Snowflake Dynamic Data Masking policy applied and a PII tag attached."
         ),
-        category=RuleCategory.SECURITY,
-        severity=RuleSeverity.HIGH,
+        category='security',
+        severity='high',
         applies_to=["column"],
     )
     ctx = {
@@ -468,7 +434,7 @@ def check_pii_column(
 
 
 def check_generic_column_name(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str
 ) -> Optional[Dict]:
     """Flag columns with uninformative generic names."""
     col_upper = (col_asset.column_name or "").upper()
@@ -476,15 +442,14 @@ def check_generic_column_name(
         return None
 
     rule = _ensure_rule(
-        db,
         code="GENERIC_COLUMN_NAME",
         name="Generic / Uninformative Column Name",
         description=(
             "Column names like COL1, DATA, VALUE, FIELD, or MISC provide no semantic "
             "context. Rename them to describe what they actually store."
         ),
-        category=RuleCategory.NAMING,
-        severity=RuleSeverity.LOW,
+        category='naming',
+        severity='low',
         applies_to=["column"],
     )
     ctx = {
@@ -505,7 +470,7 @@ def check_generic_column_name(
 
 
 def check_column_type_mismatch(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str
 ) -> Optional[Dict]:
     """Flag columns whose name implies one type but are stored as another."""
     col_upper = (col_asset.column_name or "").upper()
@@ -520,8 +485,7 @@ def check_column_type_mismatch(
 
         rule_code = f"COLUMN_{suffix}"
         rule = _ensure_rule(
-            db,
-            code=rule_code,
+                code=rule_code,
             name=f"Column Type Mismatch — {label}",
             description=(
                 f"Column names matching '{pattern.pattern}' should use types such as "
@@ -529,8 +493,8 @@ def check_column_type_mismatch(
                 "Storing them as other types causes implicit conversions, silent bugs, "
                 "and join failures."
             ),
-            category=RuleCategory.SCHEMA,
-            severity=RuleSeverity.MEDIUM,
+            category='schema',
+            severity='medium',
             applies_to=["column"],
         )
         ctx = {
@@ -555,7 +519,7 @@ def check_column_type_mismatch(
 
 
 def check_fk_without_constraint(
-    db: Session, col_asset: Asset, table_name: str, scan_id: str
+    col_asset: Any, table_name: str, scan_id: str
 ) -> Optional[Dict]:
     """Flag _ID columns that look like FK references but have no constraint."""
     col_upper = (col_asset.column_name or "").upper()
@@ -570,7 +534,6 @@ def check_fk_without_constraint(
         return None
 
     rule = _ensure_rule(
-        db,
         code="FK_COLUMN_NO_CONSTRAINT",
         name="Foreign Key Column Without FK Constraint",
         description=(
@@ -578,8 +541,8 @@ def check_fk_without_constraint(
             "Snowflake does not enforce FK constraints by default — add an unenforced "
             "REFERENCES clause for documentation and data lineage tools."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.LOW,
+        category='schema',
+        severity='low',
         applies_to=["column"],
     )
     ctx = {
@@ -601,7 +564,7 @@ def check_fk_without_constraint(
 
 
 def check_nullable_id_column(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str
 ) -> Optional[Dict]:
     """Flag ID/PK columns that allow NULLs."""
     col_upper = (col_asset.column_name or "").upper()
@@ -614,7 +577,6 @@ def check_nullable_id_column(
         return None
 
     rule = _ensure_rule(
-        db,
         code="NULLABLE_ID_COLUMN",
         name="Nullable ID / Primary Key Column",
         description=(
@@ -622,8 +584,8 @@ def check_nullable_id_column(
             "A nullable PK column breaks referential integrity and causes "
             "unexpected results in GROUP BY, JOIN, and deduplication operations."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.HIGH,
+        category='schema',
+        severity='high',
         applies_to=["column"],
     )
     ctx = {
@@ -645,7 +607,7 @@ def check_nullable_id_column(
 
 
 def check_date_stored_as_varchar(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str
 ) -> Optional[Dict]:
     """Flag date/timestamp columns stored as VARCHAR/TEXT."""
     col_upper = (col_asset.column_name or "").upper()
@@ -661,7 +623,6 @@ def check_date_stored_as_varchar(
         return None
 
     rule = _ensure_rule(
-        db,
         code="DATE_STORED_AS_VARCHAR",
         name="Date/Timestamp Column Stored as VARCHAR",
         description=(
@@ -669,8 +630,8 @@ def check_date_stored_as_varchar(
             "This prevents date arithmetic, sorting, filtering, and indexing from "
             "working correctly. Cast or convert to DATE or TIMESTAMP."
         ),
-        category=RuleCategory.DATA_QUALITY,
-        severity=RuleSeverity.HIGH,
+        category='data_quality',
+        severity='high',
         applies_to=["column"],
     )
     ctx = {
@@ -693,7 +654,7 @@ def check_date_stored_as_varchar(
 
 
 def check_boolean_stored_as_varchar(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str
 ) -> Optional[Dict]:
     """Flag boolean/flag columns stored as VARCHAR instead of BOOLEAN or a numeric type."""
     col_upper = (col_asset.column_name or "").upper()
@@ -712,7 +673,6 @@ def check_boolean_stored_as_varchar(
         return None
 
     rule = _ensure_rule(
-        db,
         code="BOOLEAN_STORED_AS_VARCHAR",
         name="Boolean/Flag Column Stored as VARCHAR",
         description=(
@@ -720,8 +680,8 @@ def check_boolean_stored_as_varchar(
             "IS_, _YN) are stored as VARCHAR. This allows invalid values (e.g. 'maybe', "
             "'3') and prevents efficient filtering. Use BOOLEAN or a small integer type."
         ),
-        category=RuleCategory.DATA_QUALITY,
-        severity=RuleSeverity.MEDIUM,
+        category='data_quality',
+        severity='medium',
         applies_to=["column"],
     )
     ctx = {
@@ -768,9 +728,8 @@ _COLUMN_CHECK_CODES = {
 
 
 def run_dynamic_checks(
-    db: Session,
-    table_asset: Asset,
-    column_assets: List[Asset],
+    table_asset: Any,
+    column_assets: List[Any],
     scan_id: str,
     allowed_rule_codes=None,  # Optional[Set[str]] — from RuleClassifierAgent
 ) -> List[Dict[str, Any]]:
@@ -798,7 +757,7 @@ def run_dynamic_checks(
         if not _allowed(rule_code):
             logger.debug(f"[DynamicRules] Skipping {rule_code} (classifier decision)")
             continue
-        result = fn(db, table_asset, col_names, scan_id)
+        result = fn(table_asset, col_names, scan_id)
         if result:
             findings.append(result)
 
@@ -808,14 +767,11 @@ def run_dynamic_checks(
             if not _allowed(rule_code):
                 continue
             if fn is check_fk_without_constraint:
-                result = fn(db, col_asset, table_asset.table_name or "", scan_id)
+                result = fn(col_asset, table_asset.table_name or "", scan_id)
             else:
-                result = fn(db, col_asset, scan_id)
+                result = fn(col_asset, scan_id)
             if result:
                 findings.append(result)
-
-    # Commit auto-registered Rule rows
-    db.commit()
 
     logger.info(
         f"[DynamicRules] {table_asset.fqn}: {len(findings)} dynamic findings"

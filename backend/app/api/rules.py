@@ -1,11 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, HTTPException
 from typing import Optional, List, Dict, Any
 from collections import defaultdict
 from datetime import datetime
 import json, re, logging
-from app.core.database import get_db
-from app.models.rule import Rule, RuleCategory, RuleSeverity, RuleStatus
+from app.services import storage
 from app.schemas.rule import RuleCreate, RuleUpdate, RuleResponse, RuleListResponse
 from app.services.rule_engine import initialize_default_rules
 from app.services.claude_client import ask_claude
@@ -22,9 +20,9 @@ MEANINGFUL_FIELDS = {"name", "description", "category", "severity",
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 @router.get("/stats")
-def get_rule_stats(db: Session = Depends(get_db)):
+def get_rule_stats():
     """Aggregate rule counts by category and severity."""
-    rules = db.query(Rule).all()
+    rules = storage.list_all_rules()
 
     by_category: dict = defaultdict(int)
     by_severity: dict = defaultdict(int)
@@ -32,16 +30,16 @@ def get_rule_stats(db: Session = Depends(get_db)):
     active = 0
 
     for r in rules:
-        by_category[r.category.value if hasattr(r.category, 'value') else str(r.category)] += 1
-        by_severity[r.severity.value if hasattr(r.severity, 'value') else str(r.severity)] += 1
-        by_status[r.status.value if hasattr(r.status, 'value') else str(r.status or 'active')] += 1
+        by_category[r.category] += 1
+        by_severity[r.severity] += 1
+        by_status[r.status or 'active'] += 1
         if r.is_active:
             active += 1
 
     return {
         "total":       len(rules),
         "active":      active,
-        "pending":     by_status.get("pending", 0),
+        "pending":     by_status.get("pending", 0) + by_status.get("pending", 0),
         "by_category": dict(by_category),
         "by_severity": dict(by_severity),
         "by_status":   dict(by_status),
@@ -52,31 +50,25 @@ def get_rule_stats(db: Session = Depends(get_db)):
 
 @router.get("", response_model=RuleListResponse)
 def list_rules(
-    category:  Optional[RuleCategory] = None,
-    severity:  Optional[RuleSeverity] = None,
-    status:    Optional[RuleStatus]   = None,
-    is_active: Optional[bool]         = None,
+    category:  Optional[str] = None,
+    severity:  Optional[str] = None,
+    status:    Optional[str] = None,
+    is_active: Optional[bool] = None,
     skip: int = 0,
     limit: int = 500,
-    db: Session = Depends(get_db),
 ):
-    query = db.query(Rule)
-    if category:  query = query.filter(Rule.category  == category)
-    if severity:  query = query.filter(Rule.severity  == severity)
-    if status:    query = query.filter(Rule.status    == status)
-    if is_active is not None:
-        query = query.filter(Rule.is_active == is_active)
-
-    total = query.count()
-    rules = query.offset(skip).limit(limit).all()
+    total, rules = storage.list_rules(
+        category=category, severity=severity, status=status,
+        is_active=is_active, skip=skip, limit=limit,
+    )
     return RuleListResponse(total=total, rules=rules)
 
 
 # ── Get ───────────────────────────────────────────────────────────────────────
 
 @router.get("/{rule_id}", response_model=RuleResponse)
-def get_rule(rule_id: str, db: Session = Depends(get_db)):
-    rule = db.query(Rule).filter(Rule.id == rule_id).first()
+def get_rule(rule_id: str):
+    rule = storage.get_rule(rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
     return rule
@@ -85,30 +77,26 @@ def get_rule(rule_id: str, db: Session = Depends(get_db)):
 # ── Create (new rules go PENDING) ────────────────────────────────────────────
 
 @router.post("", response_model=RuleResponse, status_code=201)
-def create_rule(rule_data: RuleCreate, db: Session = Depends(get_db)):
-    existing = db.query(Rule).filter(Rule.code == rule_data.code).first()
+def create_rule(rule_data: RuleCreate):
+    existing = storage.get_rule_by_code(rule_data.code)
     if existing:
         raise HTTPException(status_code=400,
                             detail=f"Rule with code '{rule_data.code}' already exists")
 
     data = rule_data.model_dump()
     # New user-created rules start PENDING and inactive until approved
-    data["status"]    = RuleStatus.PENDING
+    data["status"]    = "pending"
     data["is_active"] = False
     data["version"]   = 1
 
-    rule = Rule(**data)
-    db.add(rule)
-    db.commit()
-    db.refresh(rule)
-    return rule
+    return storage.create_rule(**data)
 
 
 # ── Update ────────────────────────────────────────────────────────────────────
 
 @router.patch("/{rule_id}", response_model=RuleResponse)
-def update_rule(rule_id: str, update_data: RuleUpdate, db: Session = Depends(get_db)):
-    rule = db.query(Rule).filter(Rule.id == rule_id).first()
+def update_rule(rule_id: str, update_data: RuleUpdate):
+    rule = storage.get_rule(rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
 
@@ -117,47 +105,37 @@ def update_rule(rule_id: str, update_data: RuleUpdate, db: Session = Depends(get
     # Sync is_active with status if status is being changed
     if "status" in update_dict:
         new_status = update_dict["status"]
-        if new_status == RuleStatus.ACTIVE:
+        if new_status == "active":
             update_dict["is_active"] = True
-        elif new_status in (RuleStatus.DISABLED, RuleStatus.REJECTED, RuleStatus.PENDING):
+        elif new_status in ("disabled", "rejected", "pending"):
             update_dict["is_active"] = False
 
     # Plain is_active toggle (from Rules page toggle switch)
     if "is_active" in update_dict and "status" not in update_dict:
-        update_dict["status"] = (
-            RuleStatus.ACTIVE if update_dict["is_active"] else RuleStatus.DISABLED
-        )
+        update_dict["status"] = "active" if update_dict["is_active"] else "disabled"
 
     # Bump version on meaningful changes
     if MEANINGFUL_FIELDS & update_dict.keys():
         update_dict["version"] = (rule.version or 1) + 1
 
-    for field, value in update_dict.items():
-        setattr(rule, field, value)
-
-    db.commit()
-    db.refresh(rule)
-    return rule
+    return storage.update_rule(rule_id, **update_dict)
 
 
 # ── Approve ───────────────────────────────────────────────────────────────────
 
 @router.post("/{rule_id}/approve", response_model=RuleResponse)
-def approve_rule(rule_id: str, db: Session = Depends(get_db)):
+def approve_rule(rule_id: str):
     """Approve a pending rule — makes it active and starts running on scans."""
-    rule = db.query(Rule).filter(Rule.id == rule_id).first()
+    rule = storage.get_rule(rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
-    if rule.status != RuleStatus.PENDING:
+    if rule.status != "pending":
         raise HTTPException(status_code=400,
                             detail=f"Only PENDING rules can be approved (current: {rule.status})")
 
-    rule.status      = RuleStatus.ACTIVE
-    rule.is_active   = True
-    rule.approved_at = datetime.utcnow()
-    db.commit()
-    db.refresh(rule)
-    return rule
+    return storage.update_rule(
+        rule_id, status="active", is_active=True, approved_at=datetime.utcnow(),
+    )
 
 
 # ── Reject ────────────────────────────────────────────────────────────────────
@@ -166,22 +144,19 @@ class RejectRequest(BaseModel):
     reason: str
 
 @router.post("/{rule_id}/reject", response_model=RuleResponse)
-def reject_rule(rule_id: str, body: RejectRequest, db: Session = Depends(get_db)):
+def reject_rule(rule_id: str, body: RejectRequest):
     """Reject a pending rule with a reason."""
-    rule = db.query(Rule).filter(Rule.id == rule_id).first()
+    rule = storage.get_rule(rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
-    if rule.status != RuleStatus.PENDING:
+    if rule.status != "pending":
         raise HTTPException(status_code=400,
                             detail=f"Only PENDING rules can be rejected (current: {rule.status})")
 
-    rule.status           = RuleStatus.REJECTED
-    rule.is_active        = False
-    rule.rejection_reason = body.reason
-    rule.rejected_at      = datetime.utcnow()
-    db.commit()
-    db.refresh(rule)
-    return rule
+    return storage.update_rule(
+        rule_id, status="rejected", is_active=False,
+        rejection_reason=body.reason, rejected_at=datetime.utcnow(),
+    )
 
 
 # ── Generate rule from natural language prompt ───────────────────────────────
@@ -245,7 +220,7 @@ def _word_overlap_score(text1: str, text2: str) -> float:
     return len(w1 & w2) / min(len(w1), len(w2))
 
 
-def _find_similar_rule(db: Session, name: str, description: str, threshold: float = 0.55) -> Optional[Rule]:
+def _find_similar_rule(name: str, description: str, threshold: float = 0.55):
     """
     Return the most similar existing rule if overlap score ≥ threshold.
     Checks against all existing rule names and descriptions.
@@ -253,7 +228,7 @@ def _find_similar_rule(db: Session, name: str, description: str, threshold: floa
     combined = f"{name} {description}"
     best_score = 0.0
     best_rule = None
-    for rule in db.query(Rule).all():
+    for rule in storage.list_all_rules():
         rule_text = f"{rule.name} {rule.description or ''}"
         score = _word_overlap_score(combined, rule_text)
         if score > best_score:
@@ -263,10 +238,7 @@ def _find_similar_rule(db: Session, name: str, description: str, threshold: floa
 
 
 @router.post("/generate", response_model=GeneratedRule)
-def generate_rule_from_prompt(
-    request: GenerateRuleRequest,
-    db: Session = Depends(get_db),
-):
+def generate_rule_from_prompt(request: GenerateRuleRequest):
     """
     Convert a plain-English requirement into a structured rule definition using Claude.
     Returns duplicate_of if a semantically similar rule already exists.
@@ -277,7 +249,7 @@ def generate_rule_from_prompt(
 
     # Give Claude the full name + description of all existing rules so it can
     # detect semantic duplicates regardless of language/phrasing
-    existing_rules = db.query(Rule).all()
+    existing_rules = storage.list_all_rules()
     existing_details = "\n".join(
         f"  - {r.code}: {r.name} — {(r.description or '')[:100]}"
         for r in existing_rules
@@ -319,8 +291,8 @@ Convert this requirement into a data quality rule. Respond with JSON only."""
 
     # Normalise
     parsed["code"] = re.sub(r"[^A-Z0-9_]", "_", parsed.get("code", "").upper().strip())[:50]
-    valid_cats = {c.value for c in RuleCategory}
-    valid_sevs = {s.value for s in RuleSeverity}
+    valid_cats = {"naming", "documentation", "ownership", "schema", "data_quality", "security", "performance"}
+    valid_sevs = {"critical", "high", "medium", "low", "info"}
     if parsed.get("category") not in valid_cats:
         parsed["category"] = "data_quality"
     if parsed.get("severity") not in valid_sevs:
@@ -332,13 +304,13 @@ Convert this requirement into a data quality rule. Respond with JSON only."""
     parsed["duplicate_of"] = None
 
     # 1. Exact code match
-    exact = db.query(Rule).filter(Rule.code == parsed["code"]).first()
+    exact = storage.get_rule_by_code(parsed["code"])
     if exact:
         parsed["duplicate_of"] = {"code": exact.code, "name": exact.name}
         logger.info(f"[RuleGenerate] Exact code duplicate detected: {exact.code}")
     else:
         # 2. Word-overlap similarity check
-        similar = _find_similar_rule(db, parsed["name"], parsed["description"])
+        similar = _find_similar_rule(parsed["name"], parsed["description"])
         if similar:
             parsed["duplicate_of"] = {"code": similar.code, "name": similar.name}
             logger.info(
@@ -352,9 +324,9 @@ Convert this requirement into a data quality rule. Respond with JSON only."""
 # ── Initialize defaults ───────────────────────────────────────────────────────
 
 @router.post("/initialize")
-def initialize_rules(db: Session = Depends(get_db)):
+def initialize_rules():
     try:
-        initialize_default_rules(db)
+        initialize_default_rules()
         return {"message": "Default rules initialized successfully"}
     except Exception as e:
         raise HTTPException(status_code=500,

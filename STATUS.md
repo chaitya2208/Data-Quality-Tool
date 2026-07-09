@@ -6,15 +6,15 @@ Successfully implemented **Phase 0: Foundation** of the Enterprise Data Quality 
 
 ### Core Components
 
-#### 1. Database Layer ✅
-- **Models** (SQLAlchemy ORM):
+#### 1. Storage Layer ✅
+- **Entities** (`app/services/storage.py`, raw SQL — no ORM):
   - `Asset` - Represents Snowflake objects (database, schema, table, column)
   - `Scan` - Execution record of quality checks
   - `Finding` - Detected data quality issue
   - `Rule` - Quality rule definition
-- **Database**: PostgreSQL with full schema
-- **Migrations**: Alembic configuration ready
-- **Relationships**: Proper foreign keys and cascading deletes
+- **Database**: Snowflake (app tables live in `DQ_APP` schema, separate from source data)
+- **DDL**: versioned `.sql` files in `backend/snowflake/`, applied by `setup_db.py`
+- **Relationships**: FKs declared in DDL for documentation; Snowflake doesn't enforce them
 
 #### 2. Snowflake Connector ✅
 - Abstract connection management
@@ -54,7 +54,6 @@ Successfully implemented **Phase 0: Foundation** of the Enterprise Data Quality 
 - Input validation with Pydantic schemas
 
 #### 6. Supporting Infrastructure ✅
-- Docker Compose for PostgreSQL
 - Environment configuration
 - Connection testing script
 - Quick start scripts (Windows & Unix)
@@ -73,30 +72,23 @@ Data_Quality/
 │
 └── backend/
     ├── requirements.txt           # Python dependencies
-    ├── docker-compose.yml         # PostgreSQL container
-    ├── setup_db.py               # Database initialization
+    ├── setup_db.py               # Runs snowflake/*.sql against the app schema
     ├── test_connection.py        # Connection testing
     ├── quickstart.sh/.bat        # Quick start scripts
     ├── api_examples.http         # API testing examples
     ├── .env.example              # Environment template
     │
-    ├── alembic/                  # Database migrations
-    │   ├── alembic.ini
-    │   ├── env.py
-    │   └── script.py.mako
+    ├── snowflake/                 # DDL: app schema + tables + default rule seed
+    │   ├── 01_create_schema.sql
+    │   ├── 02_create_tables.sql
+    │   └── 03_seed_default_rules.sql
     │
     └── app/
         ├── main.py               # FastAPI application
         │
         ├── core/                 # Core configuration
         │   ├── config.py         # Settings management
-        │   └── database.py       # Database connection
-        │
-        ├── models/               # SQLAlchemy models
-        │   ├── asset.py
-        │   ├── scan.py
-        │   ├── finding.py
-        │   └── rule.py
+        │   └── enums.py          # Shared status/severity enums
         │
         ├── schemas/              # Pydantic schemas
         │   ├── asset.py
@@ -105,6 +97,7 @@ Data_Quality/
         │   └── rule.py
         │
         ├── services/             # Business logic
+        │   ├── storage.py        # Raw-SQL data layer (replaces ORM models)
         │   ├── snowflake_connector.py
         │   ├── rule_engine.py
         │   └── scan_service.py
@@ -164,7 +157,6 @@ quickstart.bat       # Windows
 python -m venv venv
 source venv/bin/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-docker-compose up -d
 python setup_db.py
 python test_connection.py
 uvicorn app.main:app --reload
@@ -215,7 +207,7 @@ Then visit:
 - ✅ Fetch metadata for tables
 - ✅ Execute 3 deterministic rules
 - ✅ Generate findings
-- ✅ Store in PostgreSQL
+- ✅ Store in Snowflake (app-owned schema)
 - ✅ REST API with all CRUD operations
 - ✅ Proper data model with relationships
 - ✅ Extensible architecture

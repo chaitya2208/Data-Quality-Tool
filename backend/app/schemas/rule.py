@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-from app.models.rule import RuleSeverity, RuleCategory, RuleStatus
+from app.core.enums import RuleSeverity, RuleCategory, RuleStatus
 
 
 class RuleBase(BaseModel):

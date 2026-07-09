@@ -3,7 +3,28 @@
     "allow": [
       "Read(//c/Users/cshah/Downloads/**)",
       "Bash(npx create-react-app *)",
-      "Bash(npm create *)"
+      "Bash(npm create *)",
+      "Bash(ls alembic/versions)",
+      "Bash(cat .env)",
+      "Bash(cat requirements.txt)",
+      "Bash(cat setup_db.py)",
+      "Bash(cat alembic/env.py)",
+      "Bash(find . -iname \"*.db\")",
+      "Bash(find . -iname \"snowflake_*.py\" -not -path \"*/venv/*\")",
+      "Bash(xargs grep -l \"sqlalchemy\\\\|CREATE TABLE\\\\|VARIANT\")",
+      "Bash(python -c \"import snowflake.sqlalchemy; print\\(snowflake.sqlalchemy.__file__\\)\")",
+      "Bash(pip show *)",
+      "Bash(./venv/Scripts/python.exe -c \"import snowflake.sqlalchemy; print\\('ok'\\)\")",
+      "Bash(grep -n \"get_db\\\\|Session\\\\|db\\\\.\" app/services/cortex_client.py app/services/claude_client.py)",
+      "Bash(cat app/main.py)",
+      "Bash(python3 -)",
+      "Bash(sed -i 's/from app\\\\.models\\\\.agent_run import AgentRunStatus, AgentTaskStatus/from app.core.enums import AgentRunStatus, AgentTaskStatus/' app/schemas/agent_run.py)",
+      "Bash(sed -i 's/from app\\\\.models\\\\.finding import FindingStatus/from app.core.enums import FindingStatus/' app/schemas/finding.py)",
+      "Bash(sed -i 's/from app\\\\.models\\\\.rule import RuleSeverity, RuleCategory, RuleStatus/from app.core.enums import RuleSeverity, RuleCategory, RuleStatus/' app/schemas/rule.py)",
+      "Bash(sed -i 's/from app\\\\.models\\\\.scan import ScanStatus, ScanType/from app.core.enums import ScanStatus, ScanType/' app/schemas/scan.py)",
+      "Bash(./.venv/Scripts/python.exe -m pip show snowflake-connector-python)",
+      "Bash(./.venv/Scripts/python.exe setup_db.py)",
+      "Bash(git log *)"
     ]
   }
 }

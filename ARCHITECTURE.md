@@ -32,8 +32,8 @@
 └───────────────┼────────────────────────────────────────────┘
                 │
      ┌──────────▼──────────┐
-     │   PostgreSQL DB     │
-     │                     │
+     │  Snowflake DQ_APP   │
+     │  schema (app data)  │
      │  - assets           │
      │  - scans            │
      │  - findings         │

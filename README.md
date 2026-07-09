@@ -14,7 +14,7 @@ A comprehensive platform to monitor, assess, and improve data quality in Snowfla
 ## ✅ Current Status: Phase 0 Complete
 
 **Phase 0 (Foundation)** is fully implemented and working:
-- ✅ PostgreSQL database with full schema
+- ✅ App storage schema in Snowflake (assets/scans/findings/rules/etc.)
 - ✅ Snowflake connector for metadata queries
 - ✅ Rule engine with 3 deterministic rules
 - ✅ FastAPI backend with REST API
@@ -45,7 +45,7 @@ This opens two windows:
 
 ```bash
 cd backend
-.\quick_start_sqlite.bat
+.\quickstart.bat
 ```
 
 Visit API docs: http://localhost:8000/docs
@@ -71,18 +71,16 @@ Data_Quality/
 │
 └── backend/
     ├── requirements.txt     # Python dependencies
-    ├── docker-compose.yml   # PostgreSQL setup
-    ├── setup_db.py         # Database initialization
-    ├── demo_data.py        # Demo data generator
+    ├── snowflake/           # DDL: app schema + tables + default rule seed
+    ├── setup_db.py         # Runs snowflake/*.sql against the app schema
     ├── test_connection.py  # Connection tests
     ├── api_examples.http   # API examples
     │
     └── app/
         ├── main.py            # FastAPI app
-        ├── core/             # Configuration
-        ├── models/           # Database models
+        ├── core/             # Configuration + shared enums
         ├── schemas/          # Pydantic schemas
-        ├── services/         # Business logic
+        ├── services/         # Business logic + storage.py (raw-SQL data layer)
         └── api/              # REST endpoints
 ```
 
@@ -180,11 +178,8 @@ uvicorn app.main:app --reload
 ## 🛠️ Tech Stack
 
 - **Backend**: Python 3.9+, FastAPI
-- **Database**: PostgreSQL 15+
-- **Data Warehouse**: Snowflake
-- **ORM**: SQLAlchemy
+- **Storage & Data Warehouse**: Snowflake (app tables and source data both live here — see `backend/snowflake/`)
 - **API Docs**: OpenAPI/Swagger
-- **Containerization**: Docker
 
 ## 🤝 Contributing
 

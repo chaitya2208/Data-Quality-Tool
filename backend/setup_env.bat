@@ -35,8 +35,7 @@ echo Setup complete!
 echo ==========================================
 echo.
 echo Next steps:
-echo 1. Make sure Docker Desktop is running
-echo 2. Run: docker-compose up -d
-echo 3. Run: python setup_db.py
-echo 4. Run: python test_connection.py
+echo 1. Fill in Snowflake credentials in .env (see .env.example)
+echo 2. Run: python setup_db.py
+echo 3. Run: python test_connection.py
 echo.

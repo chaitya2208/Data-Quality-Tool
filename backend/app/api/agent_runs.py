@@ -1,16 +1,10 @@
+import threading
 import uuid
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy.orm import Session
-from typing import List
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from typing import List, Optional
 
-from app.core.database import get_db, SessionLocal
-from app.models.agent_run import (
-    AgentRun, AgentTask,
-    AgentRunStatus, AgentTaskStatus,
-)
-from app.models.finding import Finding
-from app.models.rule import Rule, RuleStatus
+from app.services import storage
 from app.schemas.agent_run import (
     AgentRunCreateRequest, AgentRunResponse, AgentRunListResponse,
     AgentRuleSuggestion, AgentTaskResponse, RuleReviewRequest,
@@ -24,13 +18,13 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _task_duration(task: AgentTask) -> float | None:
+def _task_duration(task) -> Optional[float]:
     if task.started_at and task.completed_at:
         return (task.completed_at - task.started_at).total_seconds()
     return None
 
 
-def _build_task_response(task: AgentTask) -> AgentTaskResponse:
+def _build_task_response(task) -> AgentTaskResponse:
     return AgentTaskResponse(
         id=task.id,
         run_id=task.run_id,
@@ -44,7 +38,7 @@ def _build_task_response(task: AgentTask) -> AgentTaskResponse:
     )
 
 
-def _build_run_response(run: AgentRun) -> AgentRunResponse:
+def _build_run_response(run) -> AgentRunResponse:
     return AgentRunResponse(
         id=run.id,
         batch_id=getattr(run, "batch_id", None),
@@ -69,28 +63,16 @@ def _build_run_response(run: AgentRun) -> AgentRunResponse:
 def start_workflow(
     request: AgentRunCreateRequest,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
 ):
     """Start a new agent workflow run. Returns immediately; pipeline runs in background."""
-    run = AgentRun(
-        id=str(uuid.uuid4()),
+    run = storage.create_agent_run(
         database=request.database,
         schema_name=request.schema_name,
         table=request.table,
-        status=AgentRunStatus.PENDING,
+        status="pending",
     )
-    db.add(run)
-    db.flush()
-
-    for agent_name in DB_AGENT_ORDER:
-        db.add(AgentTask(
-            run_id=run.id,
-            agent_name=agent_name,
-            status=AgentTaskStatus.PENDING,
-        ))
-
-    db.commit()
-    db.refresh(run)
+    storage.create_agent_tasks(run.id, DB_AGENT_ORDER)
+    run = storage.get_agent_run(run.id)
 
     background_tasks.add_task(WorkflowCoordinator(run_id=run.id).run)
     logger.info(f"[API] Started run {run.id} for {request.database}.{request.schema_name}.{request.table}")
@@ -109,7 +91,7 @@ def _list_schemas(database: str) -> List[str]:
     return [n for n in names if n.upper() != "INFORMATION_SCHEMA"]
 
 
-def _expand_scope(req: AgentBatchCreateRequest) -> List[tuple[str, str, str]]:
+def _expand_scope(req: AgentBatchCreateRequest) -> List[tuple]:
     """Resolve a scope request into an ordered list of (database, schema, table)."""
     scope = (req.scope or "table").lower()
 
@@ -125,7 +107,7 @@ def _expand_scope(req: AgentBatchCreateRequest) -> List[tuple[str, str, str]]:
         return [(req.database, req.schema_name, t) for t in tables]
 
     if scope == "database":
-        targets: List[tuple[str, str, str]] = []
+        targets: List[tuple] = []
         for sch in _list_schemas(req.database):
             for t in _list_tables(req.database, sch):
                 targets.append((req.database, sch, t))
@@ -135,10 +117,7 @@ def _expand_scope(req: AgentBatchCreateRequest) -> List[tuple[str, str, str]]:
 
 
 @router.post("/runs/batch", response_model=AgentBatchResponse, status_code=202)
-def start_batch(
-    request: AgentBatchCreateRequest,
-    db: Session = Depends(get_db),
-):
+def start_batch(request: AgentBatchCreateRequest):
     """
     Start a workflow over a table / schema / database scope.
     Creates one AgentRun per table sharing a batch_id, processed sequentially:
@@ -156,34 +135,21 @@ def start_batch(
         raise HTTPException(status_code=404, detail="No tables found for the selected scope")
 
     batch_id = str(uuid.uuid4())
-    runs: List[AgentRun] = []
+    runs = []
     for idx, (database, schema_name, table) in enumerate(targets):
-        run = AgentRun(
-            id=str(uuid.uuid4()),
-            batch_id=batch_id,
-            batch_index=idx,
+        run = storage.create_agent_run(
             database=database,
             schema_name=schema_name,
             table=table,
-            status=AgentRunStatus.PENDING,
+            status="pending",
+            batch_id=batch_id,
+            batch_index=idx,
         )
-        db.add(run)
-        db.flush()
-        for agent_name in DB_AGENT_ORDER:
-            db.add(AgentTask(
-                run_id=run.id,
-                agent_name=agent_name,
-                status=AgentTaskStatus.PENDING,
-            ))
-        runs.append(run)
-
-    db.commit()
-    for r in runs:
-        db.refresh(r)
+        storage.create_agent_tasks(run.id, DB_AGENT_ORDER)
+        runs.append(storage.get_agent_run(run.id))
 
     # Kick off only the first table — the coordinator advances the rest sequentially
     first = runs[0]
-    import threading
     threading.Thread(target=WorkflowCoordinator(run_id=first.id).run, daemon=True).start()
 
     logger.info(
@@ -201,13 +167,8 @@ def start_batch(
 
 
 @router.get("/runs/batch/{batch_id}", response_model=AgentBatchResponse)
-def get_batch(batch_id: str, db: Session = Depends(get_db)):
-    runs = (
-        db.query(AgentRun)
-        .filter(AgentRun.batch_id == batch_id)
-        .order_by(AgentRun.batch_index.asc())
-        .all()
-    )
+def get_batch(batch_id: str):
+    runs = storage.list_agent_runs_by_batch(batch_id)
     if not runs:
         raise HTTPException(status_code=404, detail="Batch not found")
     first = runs[0]
@@ -225,67 +186,55 @@ def get_batch(batch_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/runs", response_model=AgentRunListResponse)
-def list_runs(limit: int = 20, db: Session = Depends(get_db)):
-    runs = (
-        db.query(AgentRun)
-        .order_by(AgentRun.created_at.desc())
-        .limit(limit)
-        .all()
-    )
+def list_runs(limit: int = 20):
+    runs = storage.list_agent_runs(limit=limit)
     return AgentRunListResponse(total=len(runs), runs=[_build_run_response(r) for r in runs])
 
 
 @router.get("/runs/{run_id}", response_model=AgentRunResponse)
-def get_run(run_id: str, db: Session = Depends(get_db)):
-    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+def get_run(run_id: str):
+    run = storage.get_agent_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Agent run not found")
     return _build_run_response(run)
 
 
 @router.post("/runs/{run_id}/review-rules", response_model=AgentRunResponse)
-def save_rule_review(
-    run_id: str,
-    request: RuleReviewRequest,
-    db: Session = Depends(get_db),
-):
+def save_rule_review(run_id: str, request: RuleReviewRequest):
     """
     Save the user's rule review decisions (active/skipped lists with edits).
     Does not trigger pipeline — call /run-pipeline after this.
     """
-    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    run = storage.get_agent_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Agent run not found")
-    if run.status != AgentRunStatus.AWAITING_RULE_REVIEW:
+    if run.status != "awaiting_rule_review":
         raise HTTPException(
             status_code=400,
             detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'"
         )
 
-    run.rule_review_state = {
-        "active":  [e.model_dump() for e in request.active],
-        "skipped": [e.model_dump() for e in request.skipped],
-    }
-    db.commit()
-    db.refresh(run)
+    run = storage.update_agent_run(
+        run_id,
+        rule_review_state={
+            "active":  [e.model_dump() for e in request.active],
+            "skipped": [e.model_dump() for e in request.skipped],
+        },
+    )
     logger.info(f"[API] Saved rule review for run {run_id}: {len(request.active)} active, {len(request.skipped)} skipped")
     return _build_run_response(run)
 
 
 @router.post("/runs/{run_id}/run-pipeline", status_code=202)
-def run_pipeline(
-    run_id: str,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-):
+def run_pipeline(run_id: str, background_tasks: BackgroundTasks):
     """
     Trigger FindingsAgent using the approved rule set from rule_review_state.
     Persists approved AI rules permanently to the rules library.
     """
-    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    run = storage.get_agent_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Agent run not found")
-    if run.status != AgentRunStatus.AWAITING_RULE_REVIEW:
+    if run.status != "awaiting_rule_review":
         raise HTTPException(
             status_code=400,
             detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'"
@@ -294,7 +243,6 @@ def run_pipeline(
         raise HTTPException(status_code=400, detail="No rule review state found. Call /review-rules first.")
 
     # Get current Snowflake user for rule ownership
-    from app.services.snowflake_session import session as sf_session
     ctx = sf_session.get_cached_context()
     snowflake_user = (ctx or {}).get("user", "data-governance-team")
 
@@ -306,22 +254,15 @@ def run_pipeline(
     return {"message": "Pipeline started", "run_id": run_id}
 
 
-
 @router.get("/runs/{run_id}/rule-suggestions", response_model=List[AgentRuleSuggestion])
-def get_rule_suggestions(run_id: str, db: Session = Depends(get_db)):
+def get_rule_suggestions(run_id: str):
     """Get AI-suggested rules created during this run."""
-    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    run = storage.get_agent_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Agent run not found")
 
     # Return ALL rules from this run regardless of their current approval status
-    rules = (
-        db.query(Rule)
-        .filter(Rule.created_by == "rule_suggestion_agent")
-        .order_by(Rule.created_at.desc())
-        .limit(50)
-        .all()
-    )
+    _, rules = storage.list_rules(created_by="rule_suggestion_agent", limit=50)
     run_rules = [r for r in rules if (r.rule_config or {}).get("source_run_id") == run_id]
 
     return [
@@ -330,34 +271,26 @@ def get_rule_suggestions(run_id: str, db: Session = Depends(get_db)):
             code=r.code,
             name=r.name,
             description=r.description,
-            category=r.category.value if hasattr(r.category, "value") else str(r.category),
-            severity=r.severity.value if hasattr(r.severity, "value") else str(r.severity),
+            category=r.category,
+            severity=r.severity,
             applies_to=r.applies_to or [],
             rationale=_extract_rationale(r.description),
-            rule_status=r.status.value if hasattr(r.status, "value") else str(r.status),
+            rule_status=r.status,
         )
         for r in run_rules
     ]
 
 
 @router.post("/runs/{run_id}/verify", status_code=202)
-def trigger_verification(
-    run_id: str,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-):
+def trigger_verification(run_id: str, background_tasks: BackgroundTasks):
     """
     Triggered manually after developer has fixed some issues.
     Checks current DB finding statuses — no re-scan needed.
     """
-    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    run = storage.get_agent_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Agent run not found")
-    if run.status not in (
-        AgentRunStatus.AWAITING_FIXES,
-        AgentRunStatus.COMPLETED,
-        AgentRunStatus.FAILED,
-    ):
+    if run.status not in ("awaiting_fixes", "completed", "failed"):
         raise HTTPException(
             status_code=400,
             detail="Run must be in awaiting_fixes or completed state before verification"
@@ -373,60 +306,39 @@ def trigger_verification(
     cancel_auto_verify(run_id)
 
     def _run_verification():
-        db2 = SessionLocal()
         try:
-            run2 = db2.query(AgentRun).filter(AgentRun.id == run_id).first()
-            task2 = db2.query(AgentTask).filter(
-                AgentTask.run_id == run_id,
-                AgentTask.agent_name == "verification_agent"
-            ).first()
+            run2 = storage.get_agent_run(run_id)
+            task2 = storage.get_agent_task(run_id, "verification_agent")
             if not task2:
                 return
 
-            task2.status = AgentTaskStatus.RUNNING
-            task2.started_at = datetime.utcnow()
-            db2.commit()
+            storage.update_agent_task(task2.id, status="running", started_at=datetime.utcnow())
 
             from app.services.agents.verification_agent import VerificationAgent
-            result = VerificationAgent(db2).run(run2, task2)
+            result = VerificationAgent().run(run2, task2)
 
-            task2.status = AgentTaskStatus.COMPLETED
-            task2.completed_at = datetime.utcnow()
-            task2.output = result
-            db2.commit()
+            storage.update_agent_task(task2.id, status="completed", completed_at=datetime.utcnow(), output=result)
 
             # Auto-complete when fully resolved; otherwise stay awaiting fixes
             if result.get("fully_resolved"):
-                run2.status = AgentRunStatus.COMPLETED
-                run2.completed_at = datetime.utcnow()
-                db2.commit()
+                storage.update_agent_run(run_id, status="completed", completed_at=datetime.utcnow())
                 # No need to re-schedule — workflow is done
             else:
-                run2.status = AgentRunStatus.AWAITING_FIXES
-                db2.commit()
+                storage.update_agent_run(run_id, status="awaiting_fixes")
                 # Reschedule auto-verify for next cycle
                 schedule_auto_verify(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
 
         except Exception as e:
             logger.error(f"Verification failed: {e}")
-            db2.close()
-            db3 = SessionLocal()
             try:
-                t = db3.query(AgentTask).filter(
-                    AgentTask.run_id == run_id,
-                    AgentTask.agent_name == "verification_agent"
-                ).first()
+                t = storage.get_agent_task(run_id, "verification_agent")
                 if t:
-                    t.status = AgentTaskStatus.FAILED
-                    t.error_message = str(e)[:1024]
-                    db3.commit()
-            finally:
-                db3.close()
+                    storage.update_agent_task(t.id, status="failed", error_message=str(e)[:1024])
+            except Exception:
+                pass
             # Reschedule even after failure
             schedule_auto_verify(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
             return
-        finally:
-            db2.close()
 
     background_tasks.add_task(_run_verification)
     return {"message": "Verification started", "run_id": run_id}

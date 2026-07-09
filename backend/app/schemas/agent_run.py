@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 from datetime import datetime
-from app.models.agent_run import AgentRunStatus, AgentTaskStatus
+from app.core.enums import AgentRunStatus, AgentTaskStatus
 
 
 class AgentRunCreateRequest(BaseModel):

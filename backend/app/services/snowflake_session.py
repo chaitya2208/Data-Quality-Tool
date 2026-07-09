@@ -56,6 +56,11 @@ class SnowflakeSession:
             params["role"] = settings.SNOWFLAKE_ROLE
         if settings.SNOWFLAKE_DATABASE:
             params["database"] = settings.SNOWFLAKE_DATABASE
+        # Default schema = app storage schema, so storage.py's unqualified
+        # table names (ASSETS, RULES, ...) resolve without prefixing every
+        # query. Source-table queries always use fully-qualified
+        # database.schema.table names, so they're unaffected by this.
+        params["schema"] = settings.SNOWFLAKE_APP_SCHEMA
 
         auth = getattr(settings, "SNOWFLAKE_AUTH_METHOD", "externalbrowser")
         if auth.lower() == "externalbrowser":
@@ -84,13 +89,29 @@ class SnowflakeSession:
     # Read queries (use shared connection directly)
     # ─────────────────────────────────────────────
 
-    def query(self, sql: str) -> List[Dict[str, Any]]:
+    def query(self, sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         conn = self.get_connection()
         cur = conn.cursor(DictCursor)
-        cur.execute(sql)
+        cur.execute(sql, params or {})
         rows = cur.fetchall()
         cur.close()
         return rows
+
+    def execute(self, sql: str, params: Optional[Dict[str, Any]] = None) -> int:
+        """
+        Run one INSERT/UPDATE/DELETE (or any non-SELECT) statement with bind
+        parameters, on the shared app-storage connection. Returns rowcount.
+        Not used for scanned-source-table execution — that path is
+        execute_with_context() below, which switches role/warehouse first.
+        """
+        with self._exec_lock:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, params or {})
+                return cur.rowcount
+            finally:
+                cur.close()
 
     def describe_table(self, database: str, schema: str, table: str) -> List[Dict[str, Any]]:
         """

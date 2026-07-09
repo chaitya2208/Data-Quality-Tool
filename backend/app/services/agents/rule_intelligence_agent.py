@@ -17,14 +17,9 @@ Output stored in AgentTask.output for the UI:
 import json
 import logging
 import re
-import uuid
-from datetime import datetime
 from typing import List, Optional, Dict, Any, Set
-from sqlalchemy.orm import Session
 
-from app.models.asset import Asset
-from app.models.rule import Rule, RuleStatus, RuleCategory, RuleSeverity
-from app.models.finding import Finding, FindingStatus
+from app.services import storage
 from app.services.snowflake_session import session as sf_session
 from app.services.claude_client import ask_claude
 
@@ -91,6 +86,9 @@ IMPORTANT REQUIREMENTS:
 - Include ALL {rule_count} existing rules in the existing_rules object.
 - Your ENTIRE response must be a single valid JSON object starting with {{ and ending with }}."""
 
+VALID_CATEGORIES = {"naming", "documentation", "ownership", "schema", "data_quality", "security", "performance"}
+VALID_SEVERITIES = {"critical", "high", "medium", "low", "info"}
+
 
 class RuleIntelligenceAgent:
     """
@@ -98,14 +96,16 @@ class RuleIntelligenceAgent:
     Single Claude call, results applied directly.
     """
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self):
+        # rule_code -> original severity, while a severity_override is
+        # temporarily applied for a FindingsAgent run (see apply/restore below)
+        self._severity_backup: Dict[str, str] = {}
 
     def run(
         self,
-        table_asset: Asset,
-        column_assets: List[Asset],
-        existing_rules: List[Rule],
+        table_asset: Any,
+        column_assets: List[Any],
+        existing_rules: List[Any],
         run_id: str,
     ) -> Dict[str, Any]:
         """
@@ -205,33 +205,29 @@ class RuleIntelligenceAgent:
         return d.get("severity_override") or None
 
     def apply_severity_overrides(self, classification: dict) -> None:
-        """Temporarily patch Rule.severity for overridden rules."""
+        """Temporarily patch RULES.SEVERITY for overridden rules — restored by restore_severity_overrides()."""
+        self._severity_backup = {}
         for rule_code, decision in classification.get("existing_rules", {}).items():
             override = decision.get("severity_override")
             if not override or not decision.get("run", True):
                 continue
-            rule = self.db.query(Rule).filter(Rule.code == rule_code).first()
-            if rule:
-                rule._original_severity = rule.severity
-                try:
-                    rule.severity = RuleSeverity(override)
-                except ValueError:
-                    pass
-        self.db.flush()
+            rule = storage.get_rule_by_code(rule_code)
+            if rule and override in VALID_SEVERITIES:
+                self._severity_backup[rule_code] = rule.severity
+                storage.update_rule(rule.id, severity=override)
 
     def restore_severity_overrides(self, classification: dict) -> None:
-        for rule_code in classification.get("existing_rules", {}):
-            rule = self.db.query(Rule).filter(Rule.code == rule_code).first()
-            if rule and hasattr(rule, "_original_severity"):
-                rule.severity = rule._original_severity
-                del rule._original_severity
-        self.db.commit()
+        for rule_code, original_severity in self._severity_backup.items():
+            rule = storage.get_rule_by_code(rule_code)
+            if rule:
+                storage.update_rule(rule.id, severity=original_severity)
+        self._severity_backup = {}
 
     def _process_ai_rule(
         self,
         data: dict,
-        table_asset: Asset,
-        column_assets: List[Asset],
+        table_asset: Any,
+        column_assets: List[Any],
         run_id: str,
     ):
         code = (data.get("code") or "").upper().strip()
@@ -241,22 +237,20 @@ class RuleIntelligenceAgent:
             return None, None
 
         # Skip if rule already exists
-        existing = self.db.query(Rule).filter(Rule.code == code).first()
+        existing = storage.get_rule_by_code(code)
 
         if not existing:
             category_raw = (data.get("category") or "data_quality").lower()
             severity_raw = (data.get("severity") or "medium").lower()
             applies_to   = data.get("applies_to") or ["table"]
 
-            valid_cats = {c.value for c in RuleCategory}
-            valid_sevs = {s.value for s in RuleSeverity}
-            category = category_raw if category_raw in valid_cats else "data_quality"
-            severity = severity_raw if severity_raw in valid_sevs else "medium"
+            category = category_raw if category_raw in VALID_CATEGORIES else "data_quality"
+            severity = severity_raw if severity_raw in VALID_SEVERITIES else "medium"
 
             rationale = data.get("rationale", "")
             full_desc = f"{description}\n\n[AI Rationale] {rationale}" if rationale else description
 
-            rule = Rule(
+            target_rule = storage.create_rule(
                 code=code,
                 name=name,
                 description=full_desc,
@@ -265,14 +259,11 @@ class RuleIntelligenceAgent:
                 applies_to=applies_to if isinstance(applies_to, list) else ["table"],
                 rule_config={"source_run_id": run_id, "ai_generated": True},
                 is_active=True,       # runs immediately — no approval needed
-                status=RuleStatus.ACTIVE,
+                status="active",
                 owner="rule-intelligence-agent",
                 created_by="rule_intelligence_agent",
                 version=1,
             )
-            self.db.add(rule)
-            self.db.flush()
-            target_rule = rule
         else:
             target_rule = existing
 
@@ -285,10 +276,7 @@ class RuleIntelligenceAgent:
             # Find the right asset (column or table)
             if col_name:
                 col_fqn = f"{table_asset.fqn}.{col_name}"
-                asset = (
-                    self.db.query(Asset).filter(Asset.fqn == col_fqn).first()
-                    or table_asset
-                )
+                asset = storage.get_asset_by_fqn(col_fqn) or table_asset
             else:
                 asset = table_asset
 
@@ -298,8 +286,8 @@ class RuleIntelligenceAgent:
                 "rule_id":     target_rule.id,
                 "title":       f"{name} violated on {asset.fqn.split('.')[-1]}",
                 "description": f"AI Rule Intelligence detected: {evidence_text}",
-                "severity":    target_rule.severity.value if hasattr(target_rule.severity, "value") else str(target_rule.severity),
-                "status":      FindingStatus.DETECTED,
+                "severity":    target_rule.severity,
+                "status":      "detected",
                 "context": {
                     "rule_code":     code,
                     "fqn":           asset.fqn,
@@ -314,7 +302,7 @@ class RuleIntelligenceAgent:
 
         return target_rule, violation_finding
 
-    def _fetch_sample(self, table_asset: Asset) -> str:
+    def _fetch_sample(self, table_asset: Any) -> str:
         """Fetch first 3 rows of actual data for Claude to inspect."""
         try:
             fqn = table_asset.fqn
@@ -334,7 +322,7 @@ class RuleIntelligenceAgent:
             logger.warning(f"[RuleIntelligence] Could not fetch sample data: {e}")
         return "(sample data unavailable)"
 
-    def _format_columns(self, column_assets: List[Asset]) -> str:
+    def _format_columns(self, column_assets: List[Any]) -> str:
         lines = []
         for col in column_assets:
             meta = col.raw_metadata or {}
@@ -348,11 +336,11 @@ class RuleIntelligenceAgent:
             )
         return "\n".join(lines) if lines else "  (no columns)"
 
-    def _format_existing_rules(self, rules: List[Rule]) -> str:
+    def _format_existing_rules(self, rules: List[Any]) -> str:
         lines = []
         for rule in rules:
-            cat = rule.category.value if hasattr(rule.category, "value") else rule.category
-            sev = rule.severity.value if hasattr(rule.severity, "value") else rule.severity
+            cat = rule.category
+            sev = rule.severity
             app = "/".join(rule.applies_to or [])
             lines.append(
                 f"  {rule.code:<45} [{cat}] severity={sev} applies_to={app}"

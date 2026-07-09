@@ -25,23 +25,8 @@ pip install %PIP_ARGS% pydantic==2.4.2
 pip install %PIP_ARGS% pydantic-settings==2.0.3
 
 echo.
-echo [3/5] Installing database packages...
-pip install %PIP_ARGS% sqlalchemy==2.0.23
-pip install %PIP_ARGS% alembic==1.12.1
-
-echo.
-echo [4/5] Installing PostgreSQL driver...
-REM Try psycopg2-binary first (has pre-built wheels)
-pip install %PIP_ARGS% psycopg2-binary==2.9.7
-if %errorlevel% neq 0 (
-    echo psycopg2-binary failed, trying alternative...
-    pip install %PIP_ARGS% "psycopg[binary]>=3.1.0"
-)
-
-echo.
-echo [5/5] Installing Snowflake connector...
+echo [3/3] Installing Snowflake connector...
 pip install %PIP_ARGS% snowflake-connector-python==3.6.0
-pip install %PIP_ARGS% snowflake-sqlalchemy==1.5.1
 
 echo.
 echo Installing utilities...
@@ -66,7 +51,6 @@ echo Installation complete!
 echo ==========================================
 echo.
 echo Next steps:
-echo 1. docker-compose up -d
-echo 2. python setup_db.py
-echo 3. python test_sso.py
+echo 1. python setup_db.py
+echo 2. python test_sso.py
 echo.

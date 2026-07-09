@@ -45,20 +45,7 @@ pip install -q --upgrade pip
 pip install -q -r requirements.txt
 echo "✓ Dependencies installed"
 
-# Check if PostgreSQL is running
-echo ""
-echo "Checking PostgreSQL..."
-if docker ps | grep -q dq_postgres; then
-    echo "✓ PostgreSQL is running"
-else
-    echo "Starting PostgreSQL with Docker..."
-    docker-compose up -d
-    echo "Waiting for PostgreSQL to be ready..."
-    sleep 5
-    echo "✓ PostgreSQL started"
-fi
-
-# Setup database
+# Setup database (creates the app schema + tables in Snowflake)
 echo ""
 echo "Setting up database..."
 python setup_db.py

@@ -13,12 +13,8 @@ Returns: List[Finding] — all persisted findings for this run.
 import logging
 from datetime import datetime
 from typing import List, Dict, Any, Set
-from sqlalchemy.orm import Session
 
-from app.models.asset import Asset
-from app.models.finding import Finding, FindingStatus
-from app.models.rule import RuleSeverity
-from app.models.scan import Scan, ScanStatus
+from app.services import storage
 from app.services.rule_engine import RuleEngine
 
 logger = logging.getLogger(__name__)
@@ -30,20 +26,19 @@ class FindingsAgent:
     persists all findings including AI rule violations.
     """
 
-    def __init__(self, db: Session):
-        self.db = db
-        self.rule_engine = RuleEngine(db)
+    def __init__(self):
+        self.rule_engine = RuleEngine()
 
     def run(
         self,
-        scan: Scan,
-        table_asset: Asset,
-        column_assets: List[Asset],
+        scan: Any,
+        table_asset: Any,
+        column_assets: List[Any],
         classification: dict,
         ai_violations: List[Dict[str, Any]],
         intelligence_agent,  # RuleIntelligenceAgent instance for severity helpers
         allowed_codes: set = None,  # if provided, overrides classification selection
-    ) -> List[Finding]:
+    ) -> List[Any]:
 
         # Use explicit allowed_codes if provided (post-review), else use classification
         selected_codes: Set[str] = allowed_codes if allowed_codes is not None else intelligence_agent.get_selected_codes(classification)
@@ -72,17 +67,18 @@ class FindingsAgent:
             findings_data.append(vf)
 
         # Persist all findings
-        for fd in findings_data:
-            self.db.add(Finding(**fd))
+        storage.create_findings_bulk(findings_data)
 
         # Complete the scan
-        scan.rules_checked = len(selected_codes) + len(ai_violations)
-        scan.findings_count = len(findings_data)
-        scan.status = ScanStatus.COMPLETED
-        scan.completed_at = datetime.utcnow()
-        self.db.commit()
+        storage.update_scan(
+            scan.id,
+            rules_checked=len(selected_codes) + len(ai_violations),
+            findings_count=len(findings_data),
+            status="completed",
+            completed_at=datetime.utcnow(),
+        )
 
-        findings = self.db.query(Finding).filter(Finding.scan_id == scan.id).all()
+        findings = storage.list_findings_by_scan(scan.id)
         logger.info(
             f"[FindingsAgent] Done — {len(findings)} findings "
             f"({len(findings) - len(ai_violations)} from existing rules, "

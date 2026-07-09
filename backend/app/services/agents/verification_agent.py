@@ -1,23 +1,15 @@
 import logging
 from datetime import datetime
-from typing import Set, Tuple
-from sqlalchemy.orm import Session
+from typing import Set, Tuple, Any
 
-from app.models.agent_run import AgentRun, AgentTask
-from app.models.finding import Finding, FindingStatus
-from app.models.asset import Asset
+from app.services import storage
 from app.services.scan_service import ScanService
 from app.services.rule_engine import RuleEngine
 
 logger = logging.getLogger(__name__)
 
 # Statuses that are already considered closed — skip re-checking these
-CLOSED_STATUSES = {
-    FindingStatus.RESOLVED,
-    FindingStatus.FALSE_POSITIVE,
-    FindingStatus.WONT_FIX,
-    FindingStatus.CLOSED,
-}
+CLOSED_STATUSES = {"resolved", "false_positive", "wont_fix", "closed"}
 
 
 class VerificationAgent:
@@ -34,19 +26,18 @@ class VerificationAgent:
       4. Return stats
     """
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self):
+        pass
 
-    def run(self, run: AgentRun, task: AgentTask) -> dict:
+    def run(self, run: Any, task: Any) -> dict:
         if not run.scan_id:
             raise ValueError("No scan_id on run — cannot verify")
 
-        task.output = {"progress": "Refreshing table metadata from Snowflake..."}
-        self.db.commit()
+        storage.update_agent_task(task.id, output={"progress": "Refreshing table metadata from Snowflake..."})
 
         # ── Step 1: Re-fetch fresh metadata ───────────────────────────────────
         try:
-            service = ScanService(self.db)
+            service = ScanService()
             _, table_asset, column_assets = service.scan_metadata_only(
                 run.database, run.schema_name, run.table
             )
@@ -57,11 +48,10 @@ class VerificationAgent:
         except Exception as e:
             raise ValueError(f"Failed to refresh metadata from Snowflake: {e}")
 
-        task.output = {"progress": "Re-running quality rules against fresh schema..."}
-        self.db.commit()
+        storage.update_agent_task(task.id, output={"progress": "Re-running quality rules against fresh schema..."})
 
         # ── Step 2: Re-run all rules — collect still-firing violations ────────
-        rule_engine = RuleEngine(self.db)
+        rule_engine = RuleEngine()
         still_firing: Set[Tuple[str, str]] = set()  # (rule_code, asset_fqn)
 
         try:
@@ -84,15 +74,10 @@ class VerificationAgent:
             logger.error(f"[VerificationAgent] Rule re-run failed: {e}")
             raise
 
-        task.output = {"progress": "Checking which findings are now resolved..."}
-        self.db.commit()
+        storage.update_agent_task(task.id, output={"progress": "Checking which findings are now resolved..."})
 
         # ── Step 3: Compare against open findings ─────────────────────────────
-        all_findings = (
-            self.db.query(Finding)
-            .filter(Finding.scan_id == run.scan_id)
-            .all()
-        )
+        all_findings = storage.list_findings_by_scan(run.scan_id)
 
         newly_resolved = 0
         already_resolved = 0
@@ -106,17 +91,17 @@ class VerificationAgent:
             ctx = finding.context or {}
             rule_code = ctx.get("rule_code", "")
             # Get the asset's FQN
-            asset = self.db.query(Asset).filter(Asset.id == finding.asset_id).first()
+            asset = storage.get_asset(finding.asset_id)
             asset_fqn = asset.fqn if asset else ctx.get("fqn", "")
 
             if (rule_code, asset_fqn) not in still_firing:
                 # Rule no longer fires → issue is resolved
-                finding.status = FindingStatus.RESOLVED
-                finding.resolved_at = datetime.utcnow()
-                finding.resolution_notes = (
-                    "Auto-resolved by verification scan — rule no longer fires on current schema."
+                storage.update_finding(
+                    finding.id,
+                    status="resolved",
+                    resolved_at=datetime.utcnow(),
+                    resolution_notes="Auto-resolved by verification scan — rule no longer fires on current schema.",
                 )
-                finding.updated_at = datetime.utcnow()
                 newly_resolved += 1
                 logger.info(
                     f"[VerificationAgent] Auto-resolved: {finding.title} "
@@ -124,8 +109,6 @@ class VerificationAgent:
                 )
             else:
                 still_open += 1
-
-        self.db.commit()
 
         total = len(all_findings)
         total_resolved = already_resolved + newly_resolved

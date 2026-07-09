@@ -1,15 +1,11 @@
 import json
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from app.core.database import get_db
-from app.models.finding import Finding
-from app.models.asset import Asset
-from app.models.rule import Rule
+from fastapi import APIRouter, HTTPException
+from app.services import storage
 from app.services.snowflake_session import session as sf_session
 from app.services import recommendation_cache_service as rec_cache
 from app.services.cortex_client import ask_for_recommendation, _sanitize_sql
 from pydantic import BaseModel
-from typing import List
+from typing import List, Any
 from datetime import datetime
 import logging
 
@@ -17,10 +13,10 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _build_context(finding: Finding, db: Session) -> dict:
+def _build_context(finding: Any) -> dict:
     """Build a context dict with all substitution values for cache templatization."""
     ctx = finding.context or {}
-    asset = db.query(Asset).filter(Asset.id == finding.asset_id).first()
+    asset = storage.get_asset(finding.asset_id)
     data_type = ""
     if asset and asset.raw_metadata:
         data_type = asset.raw_metadata.get("data_type", "")
@@ -34,7 +30,7 @@ def _build_context(finding: Finding, db: Session) -> dict:
     }
 
 
-def _call_claude_for_finding(finding: Finding, rule_code: str, context: dict, db: Session):
+def _call_claude_for_finding(finding: Any, rule_code: str, context: dict):
     """
     Get a fix recommendation for a finding.
     1. Check persistent DB cache (keyed by rule_code + data_type) — instant if hit.
@@ -42,12 +38,12 @@ def _call_claude_for_finding(finding: Finding, rule_code: str, context: dict, db
        → falls back to Claude/Bedrock if Cortex unavailable.
     3. Templatize and store result to cache for future reuse.
     """
-    full_context = _build_context(finding, db)
+    full_context = _build_context(finding)
     data_type = full_context["data_type"]
     cache_key = rec_cache.build_cache_key(rule_code, data_type)
 
     # ── Cache hit ──────────────────────────────────────────────────────────────
-    cached = rec_cache.get_cached(db, cache_key, full_context)
+    cached = rec_cache.get_cached(cache_key, full_context)
     if cached:
         return AIRecommendation(
             finding_id=finding.id,
@@ -60,10 +56,7 @@ def _call_claude_for_finding(finding: Finding, rule_code: str, context: dict, db
         )
 
     # ── Cache miss: call Cortex (with live schema) → fallback Claude ──────────
-    rule = (
-        db.query(Rule).filter(Rule.id == finding.rule_id).first()
-        if finding.rule_id else None
-    )
+    rule = storage.get_rule(finding.rule_id) if finding.rule_id else None
     result = ask_for_recommendation(
         rule_code=rule_code,
         rule_description=rule.description if rule else "",
@@ -86,7 +79,6 @@ def _call_claude_for_finding(finding: Finding, rule_code: str, context: dict, db
     # Store to persistent cache (templatized) — skip if generation failed
     if source != "error":
         rec_cache.store(
-            db=db,
             cache_key=cache_key,
             rule_code=rule_code,
             data_type=data_type,
@@ -195,7 +187,7 @@ def get_roles():
 
 
 @router.post("/recommendations", response_model=List[AIRecommendation])
-def get_ai_recommendations(finding_ids: List[str], db: Session = Depends(get_db)):
+def get_ai_recommendations(finding_ids: List[str]):
     """
     Generate AI recommendations for selected findings using Claude.
     Cache-first: same rule_code + data_type reuses a prior response.
@@ -203,14 +195,14 @@ def get_ai_recommendations(finding_ids: List[str], db: Session = Depends(get_db)
     """
     recommendations = []
     for finding_id in finding_ids:
-        finding = db.query(Finding).filter(Finding.id == finding_id).first()
+        finding = storage.get_finding(finding_id)
         if not finding:
             continue
         context = finding.context or {}
         rule_code = context.get("rule_code", "")
 
         try:
-            rec = _call_claude_for_finding(finding, rule_code, context, db)
+            rec = _call_claude_for_finding(finding, rule_code, context)
         except Exception as e:
             logger.warning(f"Claude call failed for {finding_id}, using template: {e}")
             rec = _generate_recommendation(finding, rule_code, context)
@@ -220,13 +212,13 @@ def get_ai_recommendations(finding_ids: List[str], db: Session = Depends(get_db)
 
 
 @router.post("/execute", response_model=ExecuteSQLResponse)
-def execute_sql_fix(request: ExecuteSQLRequest, db: Session = Depends(get_db)):
+def execute_sql_fix(request: ExecuteSQLRequest):
     """
     Execute the SQL fix using the SAME connection opened at startup.
     Switches role+warehouse, runs SQL, then restores original state.
     No new SSO prompt ever.
     """
-    finding = db.query(Finding).filter(Finding.id == request.finding_id).first()
+    finding = storage.get_finding(request.finding_id)
     if not finding:
         raise HTTPException(status_code=404, detail="Finding not found")
 
@@ -248,16 +240,17 @@ def execute_sql_fix(request: ExecuteSQLRequest, db: Session = Depends(get_db)):
             warehouse=request.warehouse,
         )
 
-        finding.status = "resolved"
-        finding.resolution_notes = (
-            f"Fixed via AI recommendation. "
-            f"Role: {request.role}. "
-            f"Warehouse: {request.warehouse}. "
-            f"SQL: {request.sql_query}"
+        storage.update_finding(
+            finding.id,
+            status="resolved",
+            resolution_notes=(
+                f"Fixed via AI recommendation. "
+                f"Role: {request.role}. "
+                f"Warehouse: {request.warehouse}. "
+                f"SQL: {request.sql_query}"
+            ),
+            resolved_at=datetime.utcnow(),
         )
-        finding.resolved_at = datetime.utcnow()
-        finding.updated_at = datetime.utcnow()
-        db.commit()
 
         return ExecuteSQLResponse(
             success=True,
@@ -270,19 +263,20 @@ def execute_sql_fix(request: ExecuteSQLRequest, db: Session = Depends(get_db)):
 
     except Exception as e:
         logger.error(f"Execution failed for finding {request.finding_id}: {e}")
-        finding.resolution_notes = (
-            f"Execution failed. Role: {request.role}, "
-            f"Warehouse: {request.warehouse}. Error: {str(e)}"
+        storage.update_finding(
+            finding.id,
+            resolution_notes=(
+                f"Execution failed. Role: {request.role}, "
+                f"Warehouse: {request.warehouse}. Error: {str(e)}"
+            ),
         )
-        finding.updated_at = datetime.utcnow()
-        db.commit()
         raise HTTPException(
             status_code=500,
             detail=f"Failed to execute SQL: {str(e)}"
         )
 
 
-def _generate_recommendation(finding: Finding, rule_code: str, context: dict) -> AIRecommendation:  # noqa: C901
+def _generate_recommendation(finding: Any, rule_code: str, context: dict) -> "AIRecommendation":  # noqa: C901
     fqn         = context.get("fqn", "")
     table_fqn   = ".".join(filter(None, [
         context.get("database_name"),

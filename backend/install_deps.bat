@@ -16,18 +16,8 @@ pip install pydantic==2.5.3
 pip install pydantic-settings==2.1.0
 
 echo.
-echo Installing database packages...
-pip install sqlalchemy==2.0.25
-pip install alembic==1.13.1
-
-echo.
-echo Installing PostgreSQL driver (psycopg3 with binary)...
-pip install "psycopg[binary]>=3.1.0"
-
-echo.
 echo Installing Snowflake connector...
 pip install snowflake-connector-python==3.6.0
-pip install snowflake-sqlalchemy==1.5.1
 
 echo.
 echo Installing utilities...

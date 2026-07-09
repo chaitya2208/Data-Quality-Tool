@@ -1,25 +1,23 @@
 """
-Rules Fetch Agent — loads all active rules from DB.
+Rules Fetch Agent — loads all active rules from storage.
 
-Runs in parallel with MetadataAgent. Lightweight — just a DB query.
+Runs in parallel with MetadataAgent. Lightweight — just a couple of queries.
 Exists as a named agent so it shows in the UI pipeline.
 """
 import logging
-from typing import List
-from sqlalchemy.orm import Session
+from typing import List, Any
 
-from app.models.rule import Rule
 from app.services.rule_engine import RuleEngine
 
 logger = logging.getLogger(__name__)
 
 
 class RulesFetchAgent:
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self):
+        pass
 
-    def run(self) -> List[Rule]:
-        engine = RuleEngine(self.db)
+    def run(self) -> List[Any]:
+        engine = RuleEngine()
         table_rules  = engine.get_active_rules("table")
         column_rules = engine.get_active_rules("column")
 
