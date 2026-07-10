@@ -14,7 +14,7 @@ from app.schemas.connection import (
     ConnectionCreate, ConnectionUpdate, ConnectionResponse,
     ConnectionListResponse, ConnectionTestResult,
 )
-from app.services import storage
+from app.services import storage, secrets_manager
 from app.services.connection_types import ConnectionType
 from app.services.datasources import get_source, clear_cached_source
 
@@ -56,19 +56,40 @@ def list_connections():
 
 @router.post("", response_model=ConnectionResponse, status_code=201)
 def create_connection(req: ConnectionCreate):
+    conn_type = _validate_type(req.type)
+    postgres_with_secret = conn_type == ConnectionType.POSTGRES.value and req.secret
+
+    # For Postgres/RDS the password goes to AWS Secrets Manager, never the
+    # CONNECTIONS.SECRET column. Create the row first (no raw secret) so we have
+    # the connection id, then store the password under that id and persist only
+    # the pointer. Snowflake connections pass their secret through unchanged.
     conn = storage.create_connection(
         name=req.name,
-        type=_validate_type(req.type),
+        type=conn_type,
         host=req.host,
         port=req.port,
         database=req.database,
         schema_=req.schema_name,
         username=req.username,
-        secret=req.secret,
+        secret=None if postgres_with_secret else req.secret,
         auth_method=req.auth_method,
         extra=req.extra,
         is_active=req.is_active,
     )
+
+    if postgres_with_secret:
+        try:
+            pointer = secrets_manager.put_secret(conn.id, req.secret)
+            conn = storage.update_connection(conn.id, secret=pointer)
+        except Exception as e:
+            # Don't leave a half-created row with no usable secret.
+            storage.delete_connection(conn.id)
+            logger.error(f"[Connections] Secrets Manager store failed, rolled back {conn.id}: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not store the password in AWS Secrets Manager: {e}",
+            )
+
     logger.info(f"[Connections] Created {conn.type} connection {conn.id} ({conn.name})")
     return _to_response(conn)
 
@@ -86,6 +107,20 @@ def update_connection(connection_id: str, req: ConnectionUpdate):
     # Only overwrite the secret when a non-empty value is explicitly provided
     if "secret" in data and not data["secret"]:
         data.pop("secret")
+
+    # A new Postgres/RDS password goes to Secrets Manager; persist only the
+    # pointer in the SECRET column. Snowflake secrets pass through unchanged.
+    if "secret" in data and conn.type == ConnectionType.POSTGRES.value:
+        raw_secret = data.pop("secret")
+        try:
+            data["secret"] = secrets_manager.put_secret(connection_id, raw_secret)
+        except Exception as e:
+            logger.error(f"[Connections] Secrets Manager store failed for {connection_id}: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not store the password in AWS Secrets Manager: {e}",
+            )
+
     fields.update(data)
 
     if fields:
@@ -99,6 +134,10 @@ def delete_connection(connection_id: str):
     conn = storage.get_connection_record(connection_id)
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found")
+    # Clean up the AWS Secrets Manager entry for Postgres/RDS connections whose
+    # secret was stored there (best-effort — never blocks the delete).
+    if conn.type == ConnectionType.POSTGRES.value and secrets_manager.is_pointer(conn.secret):
+        secrets_manager.delete_secret(conn.secret)
     storage.delete_connection(connection_id)
     clear_cached_source(connection_id)
     return None

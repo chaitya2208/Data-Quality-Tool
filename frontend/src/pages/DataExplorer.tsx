@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { assetsApi, profilingApi } from '../api/client'
 import type { ColumnMeta, TableProfile, TopValue, ColumnProfile } from '../api/client'
@@ -316,10 +316,16 @@ export default function DataExplorer() {
 
   const { selectedId: connId } = useConnection()
 
-  // Reset the drill-down when the active connection changes — a DB/schema/table
-  // from one source is meaningless on another.
+  // Reset the drill-down when the active connection ACTUALLY changes — a
+  // DB/schema/table from one source is meaningless on another. We skip the
+  // first run (mount) so navigating back to this page keeps the persisted
+  // selection instead of wiping it every time the component remounts.
+  const prevConnId = useRef(connId)
   useEffect(() => {
-    setSelectedDatabase(null); setSelectedSchema(null); setSelectedTable(null); setProfile(null)
+    if (prevConnId.current !== connId) {
+      prevConnId.current = connId
+      setSelectedDatabase(null); setSelectedSchema(null); setSelectedTable(null); setProfile(null)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connId])
 

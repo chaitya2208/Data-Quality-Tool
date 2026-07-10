@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import psycopg
@@ -36,8 +37,33 @@ class PostgresSource(DataSource):
         self.conn_row = conn
         self._database = conn.database
         self._default_schema = conn.schema_ or "public"
+        self._password = None  # resolved lazily once, then cached (see _resolve_password)
+        self._session_cx = None  # one reusable connection held during a profiling pass
 
     # ── connection ────────────────────────────────────────────────────────────
+    def _resolve_password(self):
+        """
+        The stored SECRET is normally a Secrets Manager pointer — resolve it to
+        the real password. A non-pointer value is treated as a legacy plaintext
+        password (defensive; migration replaces these with pointers). Raises
+        loudly if a pointer can't be fetched — never silently connects blank.
+
+        Cached on the instance so we hit Secrets Manager ONCE, not on every
+        _connect(). Profiling/discovery open many short-lived connections; an
+        AWS round-trip per connection added seconds of latency. The registry
+        caches this source per connection and evicts it (clear_cached_source)
+        when the connection is edited, so a rotated password rebuilds the source.
+        """
+        if self._password is not None:
+            return self._password
+        from app.services import secrets_manager
+        secret = self.conn_row.secret
+        if secrets_manager.is_pointer(secret):
+            self._password = secrets_manager.get_secret(secret)
+        else:
+            self._password = secret
+        return self._password
+
     def _connect(self):
         extra = self.conn_row.extra or {}
         return psycopg.connect(
@@ -45,12 +71,43 @@ class PostgresSource(DataSource):
             port=self.conn_row.port or 5432,
             dbname=self.conn_row.database,
             user=self.conn_row.username,
-            password=self.conn_row.secret,
+            password=self._resolve_password(),
             sslmode=extra.get("sslmode", "require"),
             connect_timeout=extra.get("connect_timeout", 10),
         )
 
+    @contextmanager
+    def profiling_session(self):
+        """
+        Hold ONE connection open for a profiling pass so the dozen+ per-table
+        stat queries don't each pay a fresh TLS handshake to RDS. _query reuses
+        self._session_cx while it's set. Nested use is a no-op (keeps the
+        outermost session). Always torn down, even on error.
+        """
+        if self._session_cx is not None:
+            yield  # already inside a session — reuse it
+            return
+        cx = self._connect()
+        self._session_cx = cx
+        try:
+            yield
+        finally:
+            self._session_cx = None
+            try:
+                cx.close()
+            except Exception as e:
+                logger.warning(f"[PostgresSource] closing profiling session failed: {e}")
+
     def _query(self, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+        # Reuse the open profiling-session connection when present; otherwise
+        # open a short-lived one (context-managed → auto-closed).
+        if self._session_cx is not None:
+            with self._session_cx.cursor() as cur:
+                cur.execute(sql, params)
+                if cur.description is None:
+                    return []
+                cols = [d[0].lower() for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
         with self._connect() as cx:
             with cx.cursor() as cur:
                 cur.execute(sql, params)

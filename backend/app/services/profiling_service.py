@@ -184,6 +184,14 @@ def profile_table(source: DataSource, database: str, schema: str, table: str) ->
     top_values_cap = settings_service.get_top_values_max_distinct()
     outlier_mult = settings_service.get_outlier_stddev_mult()
 
+    # Hold one source connection open for the whole pass — profiling issues a
+    # dozen+ queries per table, and reconnecting per query is slow over RDS
+    # (a TLS handshake each). No-op for sources that already reuse a session.
+    with source.profiling_session():
+        return _profile_table_body(source, database, schema, table, top_values_cap, outlier_mult)
+
+
+def _profile_table_body(source, database, schema, table, top_values_cap, outlier_mult):
     columns = get_columns_with_pk(source, database, schema, table)
     column_profiles: List[Dict[str, Any]] = []
 

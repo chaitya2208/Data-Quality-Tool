@@ -9,6 +9,7 @@ type spellings). All row dicts returned here use **lowercase** keys.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 
@@ -84,3 +85,16 @@ class DataSource(ABC):
         caller should use the Bedrock/Claude fallback. Default: no native AI.
         """
         return None
+
+    # ── batch session ─────────────────────────────────────────────────────────
+    @contextmanager
+    def profiling_session(self):
+        """
+        Context manager that lets an adapter hold ONE reusable connection open
+        for the duration of a profiling pass (which issues many queries per
+        table). Default is a no-op — sources that reuse a process-wide session
+        (e.g. Snowflake's shared SSO connection) need nothing here. Adapters
+        that otherwise reconnect per query (Postgres) override this to avoid a
+        TLS handshake on every stat query.
+        """
+        yield

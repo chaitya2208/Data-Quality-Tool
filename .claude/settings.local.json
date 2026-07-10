@@ -42,7 +42,8 @@
       "Bash(grep -i sqlglot requirements.txt)",
       "Bash(./.venv/Scripts/python.exe -c \"import sqlglot; print\\(sqlglot.__version__\\)\")",
       "Bash(./.venv/Scripts/python.exe -m pip install sqlglot)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(git check-ignore *)"
     ]
   }
 }

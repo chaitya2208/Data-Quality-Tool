@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { assetsApi, agentRunsApi, findingsApi } from '../api/client'
@@ -79,7 +79,12 @@ const AGENTS = [
 type RunStatus = 'pending' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes' | 'completed' | 'failed'
 
 function isPolling(status: RunStatus) {
-  return status === 'running' || status === 'awaiting_rule_review' || status === 'awaiting_fixes'
+  // 'pending' must be here too: a freshly-started run begins as pending, and if
+  // we don't poll it we never observe the pending→running→… transitions — the
+  // nodes look frozen at "waiting" and only snap to green once something else
+  // refetches at the end. Poll through every non-terminal state.
+  return status === 'pending' || status === 'running' ||
+         status === 'awaiting_rule_review' || status === 'awaiting_fixes'
 }
 
 function fixIssuesStatus(runStatus: RunStatus): string {
@@ -88,11 +93,11 @@ function fixIssuesStatus(runStatus: RunStatus): string {
 
 function nodeBorderColor(status: string) {
   switch (status) {
-    case 'running':   return 'border-blue-400 bg-blue-50'
-    case 'completed': return 'border-green-400 bg-green-50'
-    case 'failed':    return 'border-red-400 bg-red-50'
+    case 'running':   return 'border-blue-400 dark:border-blue-500/50 bg-blue-50 dark:bg-blue-950/40'
+    case 'completed': return 'border-green-400 dark:border-green-500/50 bg-green-50 dark:bg-green-950/40'
+    case 'failed':    return 'border-red-400 dark:border-red-500/50 bg-red-50 dark:bg-red-950/40'
     case 'skipped':   return 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 opacity-50'
-    case 'active':    return 'border-primary-400 bg-primary-50'
+    case 'active':    return 'border-primary-400 dark:border-primary-500/50 bg-primary-50 dark:bg-primary-950/40'
     default:          return 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'
   }
 }
@@ -110,17 +115,17 @@ function nodeIconColor(status: string) {
 function statusBadge(status: string) {
   switch (status) {
     case 'running':
-      return <span className="flex items-center gap-1 text-blue-700 text-xs font-medium"><Loader2 className="w-3 h-3 animate-spin" />Running</span>
+      return <span className="flex items-center gap-1 text-blue-700 dark:text-blue-300 text-xs font-medium"><Loader2 className="w-3 h-3 animate-spin" />Running</span>
     case 'completed':
-      return <span className="flex items-center gap-1 text-green-700 text-xs font-medium"><CheckCircle2 className="w-3 h-3" />Done</span>
+      return <span className="flex items-center gap-1 text-green-700 dark:text-green-300 text-xs font-medium"><CheckCircle2 className="w-3 h-3" />Done</span>
     case 'failed':
-      return <span className="flex items-center gap-1 text-red-700 text-xs font-medium"><AlertTriangle className="w-3 h-3" />Failed</span>
+      return <span className="flex items-center gap-1 text-red-700 dark:text-red-300 text-xs font-medium"><AlertTriangle className="w-3 h-3" />Failed</span>
     case 'skipped':
-      return <span className="text-gray-400 dark:text-gray-400 text-xs">Skipped</span>
+      return <span className="text-gray-400 dark:text-gray-500 text-xs">Skipped</span>
     case 'active':
-      return <span className="flex items-center gap-1 text-primary-700 text-xs font-medium"><ArrowRight className="w-3 h-3" />Ready</span>
+      return <span className="flex items-center gap-1 text-primary-700 dark:text-primary-300 text-xs font-medium"><ArrowRight className="w-3 h-3" />Ready</span>
     default:
-      return <span className="text-gray-300 text-xs">Waiting</span>
+      return <span className="text-gray-300 dark:text-gray-600 text-xs">Waiting</span>
   }
 }
 
@@ -196,13 +201,13 @@ function AgentNode({
           </div>
 
           {isFixNode && status === 'active' && scanId && (
-            <p className="mt-1.5 text-xs text-primary-700 font-medium">Go to Findings →</p>
+            <p className="mt-1.5 text-xs text-primary-700 dark:text-primary-300 font-medium">Go to Findings →</p>
           )}
           {status === 'running' && liveProgress && (
-            <p className="mt-1.5 text-xs text-blue-700 font-medium truncate">{liveProgress}</p>
+            <p className="mt-1.5 text-xs text-blue-700 dark:text-blue-300 font-medium truncate">{liveProgress}</p>
           )}
           {status === 'failed' && task?.error_message && (
-            <p className="mt-1.5 text-xs text-red-600 truncate" title={task.error_message}>
+            <p className="mt-1.5 text-xs text-red-600 dark:text-red-300 truncate" title={task.error_message}>
               {task.error_message}
             </p>
           )}
@@ -253,11 +258,11 @@ function ParallelGroup({ children }: { children: React.ReactNode }) {
 
 function batchRunTone(status: RunStatus) {
   switch (status) {
-    case 'completed':            return 'border-green-300 bg-green-50 text-green-800'
-    case 'failed':               return 'border-red-300 bg-red-50 text-red-700'
-    case 'running':              return 'border-blue-300 bg-blue-50 text-blue-800'
-    case 'awaiting_rule_review': return 'border-purple-300 bg-purple-50 text-purple-800'
-    case 'awaiting_fixes':       return 'border-primary-300 bg-primary-50 text-primary-800'
+    case 'completed':            return 'border-green-300 dark:border-green-500/40 bg-green-50 dark:bg-green-950/40 text-green-800 dark:text-green-300'
+    case 'failed':               return 'border-red-300 dark:border-red-500/40 bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300'
+    case 'running':              return 'border-blue-300 dark:border-blue-500/40 bg-blue-50 dark:bg-blue-950/40 text-blue-800 dark:text-blue-300'
+    case 'awaiting_rule_review': return 'border-purple-300 dark:border-purple-500/40 bg-purple-50 dark:bg-purple-950/40 text-purple-800 dark:text-purple-300'
+    case 'awaiting_fixes':       return 'border-primary-300 dark:border-primary-500/40 bg-primary-50 dark:bg-primary-950/40 text-primary-800 dark:text-primary-300'
     default:                     return 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-gray-500 dark:text-gray-300'
   }
 }
@@ -304,6 +309,7 @@ export default function AgentWorkflow() {
   const [editingRule,   setEditingRule]   = useState<string | null>(null) // instance_id being edited
   const [editForm,      setEditForm]      = useState<Partial<RuleReviewEntry>>({})
   const [selectedIds,   setSelectedIds]   = useState<Set<string>>(new Set())
+  const [approvedIds,   setApprovedIds]   = useState<Set<string>>(new Set()) // AI rules explicitly approved by the user
 
   const { data: databases } = useQuery({
     queryKey: ['databases', connId],
@@ -323,21 +329,36 @@ export default function AgentWorkflow() {
     staleTime: 5 * 60 * 1000,
   })
 
-  const { data: activeRun } = useQuery({
+  const { data: activeRun, error: activeRunError } = useQuery({
     queryKey: ['agent-run', activeRunId],
     queryFn: () => agentRunsApi.get(activeRunId!).then(r => r.data),
     enabled: !!activeRunId,
+    // Don't retry a missing run — a stale id persisted in localStorage (e.g. a
+    // run that was later deleted) would otherwise 404 forever and leave the
+    // page blank with no nodes. We self-heal below instead.
+    retry: false,
     refetchInterval: (query) => {
       const s = query.state.data?.status as RunStatus | undefined
       return s && isPolling(s) ? 2000 : false
     },
   })
 
+  // Self-heal: if the persisted active run can't be loaded (deleted / 404),
+  // clear the stale id so the UI falls back to the start screen instead of
+  // appearing stuck with no pipeline nodes.
+  useEffect(() => {
+    if (activeRunId && activeRunError) {
+      setActiveRunId(null)
+      setActiveBatchId(null)
+    }
+  }, [activeRunId, activeRunError])
+
   // Batch progress — polls while any run in the batch is still working
   const { data: activeBatch } = useQuery({
     queryKey: ['agent-batch', activeBatchId],
     queryFn: () => agentRunsApi.getBatch(activeBatchId!).then(r => r.data),
     enabled: !!activeBatchId,
+    retry: false,   // stale/deleted batch id shouldn't hang the view
     refetchInterval: (query) => {
       const runs = query.state.data?.runs ?? []
       const anyActive = runs.some(r => r.status === 'pending' || r.status === 'running')
@@ -364,10 +385,14 @@ export default function AgentWorkflow() {
       agentRunsApi.startBatch(data).then(r => r.data),
     onSuccess: (batch) => {
       // Focus the first run; track the batch when it spans multiple tables
-      setActiveRunId(batch.runs[0]?.id ?? null)
+      const firstId = batch.runs[0]?.id ?? null
+      setActiveRunId(firstId)
       setActiveBatchId(batch.total > 1 ? batch.batch_id : null)
       setCollapsed(false)
       queryClient.invalidateQueries({ queryKey: ['agent-runs'] })
+      // Kick the run query immediately so the pipeline starts polling from the
+      // pending state right away (don't wait for the first refetchInterval tick).
+      if (firstId) queryClient.invalidateQueries({ queryKey: ['agent-run', firstId] })
     },
   })
 
@@ -413,16 +438,24 @@ export default function AgentWorkflow() {
     setReviewInitialized(false)
   }
 
-  // Move an instance from active → skipped
+  // Move a rule from active → skipped (reject)
   const rejectRule = (instanceId: string) => {
     const rule = reviewActive.find(r => r.instance_id === instanceId)
     if (!rule) return
     setReviewActive(prev => prev.filter(r => r.instance_id !== instanceId))
     setReviewSkipped(prev => [...prev, { ...rule, reason: rule.reason || 'Rejected by user' }])
     setSelectedIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
+    setApprovedIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
   }
 
-  // Move an instance from skipped → active
+  // Explicitly approve an AI-generated rule (it stays in Active; this just
+  // records the affirmative decision for clear visual feedback).
+  const approveRule = (instanceId: string) => {
+    setApprovedIds(prev => new Set(prev).add(instanceId))
+    setSelectedIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
+  }
+
+  // Move a rule from skipped → active (activate/approve a skipped one)
   const activateRule = (instanceId: string) => {
     const rule = reviewSkipped.find(r => r.instance_id === instanceId)
     if (!rule) return
@@ -681,27 +714,27 @@ export default function AgentWorkflow() {
                 <div className="flex items-center gap-2">
                   <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide">Pipeline</h2>
                   {isRunning && (
-                    <span className="flex items-center gap-1 text-xs text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-full font-medium">
+                    <span className="flex items-center gap-1 text-xs text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-500/40 px-2 py-0.5 rounded-full font-medium">
                       <Loader2 className="w-3 h-3 animate-spin" />Running
                     </span>
                   )}
                   {isReviewing && (
-                    <span className="flex items-center gap-1 text-xs text-purple-700 bg-purple-50 border border-purple-200 px-2 py-0.5 rounded-full font-medium">
+                    <span className="flex items-center gap-1 text-xs text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-500/40 px-2 py-0.5 rounded-full font-medium">
                       <BrainCircuit className="w-3 h-3" />Review Rules
                     </span>
                   )}
                   {isAwaiting && (
-                    <span className="flex items-center gap-1 text-xs text-primary-700 bg-primary-50 border border-primary-200 px-2 py-0.5 rounded-full font-medium">
+                    <span className="flex items-center gap-1 text-xs text-primary-700 dark:text-primary-300 bg-primary-50 dark:bg-primary-950/40 border border-primary-200 dark:border-primary-500/40 px-2 py-0.5 rounded-full font-medium">
                       <Wrench className="w-3 h-3" />Awaiting Fixes
                     </span>
                   )}
                   {isCompleted && (
-                    <span className="flex items-center gap-1 text-xs text-green-700 bg-green-50 border border-green-200 px-2 py-0.5 rounded-full font-medium">
+                    <span className="flex items-center gap-1 text-xs text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-950/40 border border-green-200 dark:border-green-500/40 px-2 py-0.5 rounded-full font-medium">
                       <CheckCircle2 className="w-3 h-3" />Completed
                     </span>
                   )}
                   {isFailed && (
-                    <span className="flex items-center gap-1 text-xs text-red-700 bg-red-50 border border-red-200 px-2 py-0.5 rounded-full font-medium">
+                    <span className="flex items-center gap-1 text-xs text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-500/40 px-2 py-0.5 rounded-full font-medium">
                       <AlertTriangle className="w-3 h-3" />Failed
                     </span>
                   )}
@@ -796,11 +829,11 @@ export default function AgentWorkflow() {
               <div>
                 <h2 className="text-base font-semibold text-purple-900 flex items-center gap-2">
                   <BrainCircuit className="w-5 h-5 text-purple-600" />
-                  Review Instances Before Running
+                  Review Rules Before Running
                 </h2>
                 <p className="text-xs text-purple-700 mt-0.5">
                   Claude kept {reviewActive.length} active and skipped {reviewSkipped.length}.
-                  Reject to skip, activate skipped ones, edit new instances, or select several and use bulk actions. Then click Run Pipeline.
+                  Approve or reject AI-generated rules, activate skipped ones, edit new rules, or select several and use bulk actions. Then click Run Pipeline.
                 </p>
               </div>
               <button
@@ -815,7 +848,7 @@ export default function AgentWorkflow() {
               >
                 {(saveReviewMutation.isPending || runPipelineMutation.isPending)
                   ? <><Loader2 className="w-4 h-4 animate-spin" />Starting...</>
-                  : <><Play className="w-4 h-4" />Run Pipeline ({reviewActive.length} instances)</>
+                  : <><Play className="w-4 h-4" />Run Pipeline ({reviewActive.length} rules)</>
                 }
               </button>
             </div>
@@ -849,7 +882,7 @@ export default function AgentWorkflow() {
             <div className="p-5">
               <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
-                Active Instances ({reviewActive.length})
+                Active Rules ({reviewActive.length})
               </h3>
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewActive.map(rule => (
@@ -935,25 +968,52 @@ export default function AgentWorkflow() {
                             <button
                               onClick={() => { setEditingRule(rule.instance_id); setEditForm({}) }}
                               className="text-xs px-1.5 py-1 text-purple-600 border border-purple-200 rounded hover:bg-purple-50"
-                              title="Edit this new instance"
+                              title="Edit this new rule"
                             >
                               Edit
                             </button>
                           )}
-                          <button
-                            onClick={() => rejectRule(rule.instance_id)}
-                            className="text-xs px-1.5 py-1 text-red-600 border border-red-200 rounded hover:bg-red-50"
-                            title="Skip this instance"
-                          >
-                            Skip
-                          </button>
+                          {rule.is_new_instance ? (
+                            /* AI-generated rule: explicit Approve + Reject pair */
+                            <>
+                              <button
+                                onClick={() => approveRule(rule.instance_id)}
+                                disabled={approvedIds.has(rule.instance_id)}
+                                className={`flex items-center gap-1 text-xs px-1.5 py-1 rounded border ${
+                                  approvedIds.has(rule.instance_id)
+                                    ? 'text-green-700 border-green-300 bg-green-50 dark:bg-green-950/40'
+                                    : 'text-green-600 border-green-200 hover:bg-green-50'
+                                }`}
+                                title="Approve this AI-generated rule"
+                              >
+                                <CheckCircle2 className="w-3 h-3" />
+                                {approvedIds.has(rule.instance_id) ? 'Approved' : 'Approve'}
+                              </button>
+                              <button
+                                onClick={() => rejectRule(rule.instance_id)}
+                                className="text-xs px-1.5 py-1 text-red-600 border border-red-200 rounded hover:bg-red-50"
+                                title="Reject this AI-generated rule"
+                              >
+                                Reject
+                              </button>
+                            </>
+                          ) : (
+                            /* Existing check: keep the single Skip control */
+                            <button
+                              onClick={() => rejectRule(rule.instance_id)}
+                              className="text-xs px-1.5 py-1 text-red-600 border border-red-200 rounded hover:bg-red-50"
+                              title="Skip this rule"
+                            >
+                              Skip
+                            </button>
+                          )}
                         </div>
                       </div>
                     )}
                   </div>
                 ))}
                 {reviewActive.length === 0 && (
-                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No active instances — activate some from the Skipped column.</p>
+                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No active rules — activate some from the Skipped column.</p>
                 )}
               </div>
             </div>
@@ -962,7 +1022,7 @@ export default function AgentWorkflow() {
             <div className="p-5">
               <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />
-                Skipped Instances ({reviewSkipped.length})
+                Skipped Rules ({reviewSkipped.length})
               </h3>
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewSkipped.map(rule => (
@@ -996,7 +1056,7 @@ export default function AgentWorkflow() {
                   </div>
                 ))}
                 {reviewSkipped.length === 0 && (
-                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No skipped instances.</p>
+                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No skipped rules.</p>
                 )}
               </div>
             </div>
