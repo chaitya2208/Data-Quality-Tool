@@ -91,9 +91,9 @@ function nodeBorderColor(status: string) {
     case 'running':   return 'border-blue-400 bg-blue-50'
     case 'completed': return 'border-green-400 bg-green-50'
     case 'failed':    return 'border-red-400 bg-red-50'
-    case 'skipped':   return 'border-gray-200 bg-gray-50 opacity-50'
+    case 'skipped':   return 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 opacity-50'
     case 'active':    return 'border-primary-400 bg-primary-50'
-    default:          return 'border-gray-200 bg-white'
+    default:          return 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'
   }
 }
 
@@ -116,7 +116,7 @@ function statusBadge(status: string) {
     case 'failed':
       return <span className="flex items-center gap-1 text-red-700 text-xs font-medium"><AlertTriangle className="w-3 h-3" />Failed</span>
     case 'skipped':
-      return <span className="text-gray-400 text-xs">Skipped</span>
+      return <span className="text-gray-400 dark:text-gray-400 text-xs">Skipped</span>
     case 'active':
       return <span className="flex items-center gap-1 text-primary-700 text-xs font-medium"><ArrowRight className="w-3 h-3" />Ready</span>
     default:
@@ -174,12 +174,12 @@ function AgentNode({
           <div className="flex items-center justify-between mb-1.5">
             <div className="flex items-center gap-2">
               <Icon className={`w-4 h-4 flex-shrink-0 ${nodeIconColor(status)}`} />
-              <span className="font-semibold text-xs text-gray-900 truncate">{agentDef.label}</span>
+              <span className="font-semibold text-xs text-gray-900 dark:text-gray-100 truncate">{agentDef.label}</span>
             </div>
             {hasLogs && (
               expanded
-                ? <ChevronDown className="w-3 h-3 text-gray-400 flex-shrink-0" />
-                : <ChevronRight className="w-3 h-3 text-gray-400 flex-shrink-0" />
+                ? <ChevronDown className="w-3 h-3 text-gray-400 dark:text-gray-400 flex-shrink-0" />
+                : <ChevronRight className="w-3 h-3 text-gray-400 dark:text-gray-400 flex-shrink-0" />
             )}
             {isFixNode && status === 'active' && (
               <ExternalLink className="w-3 h-3 text-primary-500 flex-shrink-0" />
@@ -189,7 +189,7 @@ function AgentNode({
           <div className="flex items-center justify-between gap-1 flex-wrap">
             {statusBadge(status)}
             {duration && (
-              <span className="flex items-center gap-0.5 text-xs text-gray-400">
+              <span className="flex items-center gap-0.5 text-xs text-gray-400 dark:text-gray-400">
                 <Clock className="w-2.5 h-2.5" />{duration}
               </span>
             )}
@@ -212,7 +212,7 @@ function AgentNode({
           <div className="w-full mt-1.5 p-2.5 bg-gray-900 rounded-lg text-xs font-mono text-green-400 max-h-56 overflow-y-auto">
             {Object.entries(task!.output!).map(([k, v]) => (
               <div key={k} className="py-0.5">
-                <span className="text-gray-500">{k}: </span>
+                <span className="text-gray-500 dark:text-gray-300">{k}: </span>
                 <span>{typeof v === 'object' ? JSON.stringify(v, null, 0) : String(v)}</span>
               </div>
             ))}
@@ -235,8 +235,8 @@ function ParallelGroup({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex items-start gap-0 min-w-0">
       <div className="flex flex-col items-center flex-1 min-w-0">
-        <div className="w-full border-2 border-dashed border-gray-200 rounded-xl p-2 bg-gray-50/50">
-          <p className="text-xs text-gray-400 font-medium mb-2 text-center">parallel</p>
+        <div className="w-full border-2 border-dashed border-gray-200 dark:border-gray-700 rounded-xl p-2 bg-gray-50 dark:bg-gray-900/50">
+          <p className="text-xs text-gray-400 dark:text-gray-400 font-medium mb-2 text-center">parallel</p>
           <div className="flex items-start gap-2">
             {children}
           </div>
@@ -258,7 +258,7 @@ function batchRunTone(status: RunStatus) {
     case 'running':              return 'border-blue-300 bg-blue-50 text-blue-800'
     case 'awaiting_rule_review': return 'border-purple-300 bg-purple-50 text-purple-800'
     case 'awaiting_fixes':       return 'border-primary-300 bg-primary-50 text-primary-800'
-    default:                     return 'border-gray-200 bg-gray-50 text-gray-500'
+    default:                     return 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-gray-500 dark:text-gray-300'
   }
 }
 
@@ -470,15 +470,15 @@ export default function AgentWorkflow() {
 
       {/* Header */}
       <div>
-        <h1 className="text-3xl font-bold text-gray-900">Agent Workflow</h1>
-        <p className="mt-1 text-gray-600">
+        <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Agent Workflow</h1>
+        <p className="mt-1 text-gray-600 dark:text-gray-300">
           AI-powered data quality pipeline — parallel scan, intelligent rule selection, findings, verify.
         </p>
       </div>
 
       {/* Target selector */}
-      <div className="bg-white rounded-xl shadow p-6">
-        <h2 className="text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wide">Select Scan Scope</h2>
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
+        <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200 mb-3 uppercase tracking-wide">Select Scan Scope</h2>
 
         {/* Scope selector */}
         <div className="grid grid-cols-3 gap-2 mb-4">
@@ -490,10 +490,10 @@ export default function AgentWorkflow() {
                 onClick={() => { setScope(opt.value); setSelectedTable('') }}
                 disabled={isRunning}
                 className={`text-left rounded-lg border-2 px-3 py-2.5 transition-all disabled:opacity-50 ${
-                  selected ? 'border-primary-500 bg-primary-50' : 'border-gray-200 hover:border-gray-300 bg-white'
+                  selected ? 'border-primary-500 bg-primary-50' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 bg-white dark:bg-gray-800'
                 }`}>
-                <p className={`text-sm font-semibold ${selected ? 'text-primary-800' : 'text-gray-800'}`}>{opt.label}</p>
-                <p className="text-xs text-gray-500 mt-0.5">{opt.hint}</p>
+                <p className={`text-sm font-semibold ${selected ? 'text-primary-800' : 'text-gray-800 dark:text-gray-200'}`}>{opt.label}</p>
+                <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">{opt.hint}</p>
               </button>
             )
           })}
@@ -501,34 +501,34 @@ export default function AgentWorkflow() {
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
           <div>
-            <label className="block text-xs font-medium text-gray-500 mb-1">Database</label>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-300 mb-1">Database</label>
             <select value={selectedDatabase}
               onChange={e => { setSelectedDatabase(e.target.value); setSelectedSchema(''); setSelectedTable('') }}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500"
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500"
               disabled={isRunning}>
               <option value="">Choose database...</option>
               {databases?.databases.map(db => <option key={db} value={db}>{db}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-xs font-medium text-gray-500 mb-1">
-              Schema {scope === 'database' && <span className="text-gray-400 font-normal">(all)</span>}
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-300 mb-1">
+              Schema {scope === 'database' && <span className="text-gray-400 dark:text-gray-400 font-normal">(all)</span>}
             </label>
             <select value={selectedSchema}
               onChange={e => { setSelectedSchema(e.target.value); setSelectedTable('') }}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 disabled:bg-gray-50"
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 disabled:bg-gray-50"
               disabled={!selectedDatabase || isRunning || scope === 'database'}>
               <option value="">{scope === 'database' ? 'All schemas' : 'Choose schema...'}</option>
               {schemas?.schemas.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-xs font-medium text-gray-500 mb-1">
-              Table {scope !== 'table' && <span className="text-gray-400 font-normal">(all)</span>}
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-300 mb-1">
+              Table {scope !== 'table' && <span className="text-gray-400 dark:text-gray-400 font-normal">(all)</span>}
             </label>
             <select value={selectedTable}
               onChange={e => setSelectedTable(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 disabled:bg-gray-50"
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 disabled:bg-gray-50"
               disabled={!selectedSchema || isRunning || scope !== 'table'}>
               <option value="">{scope !== 'table' ? 'All tables' : 'Choose table...'}</option>
               {tables?.tables.map(t => <option key={t} value={t}>{t}</option>)}
@@ -563,8 +563,8 @@ export default function AgentWorkflow() {
                 }
               </button>
               {canRun && (
-                <span className="text-xs text-gray-500">
-                  Will scan <span className="font-medium text-gray-700">{scopeLabel}</span>
+                <span className="text-xs text-gray-500 dark:text-gray-300">
+                  Will scan <span className="font-medium text-gray-700 dark:text-gray-200">{scopeLabel}</span>
                   {scope !== 'table' && ' — one table at a time, review rules for each'}
                 </span>
               )}
@@ -581,25 +581,25 @@ export default function AgentWorkflow() {
         const inProgress= runs.filter(r => ['running', 'awaiting_rule_review', 'awaiting_fixes'].includes(r.status)).length
         const pct = Math.round(((done + failed) / runs.length) * 100)
         return (
-          <div className="bg-white rounded-xl shadow p-6">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
             <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
               <div>
-                <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide flex items-center gap-2">
+                <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide flex items-center gap-2">
                   <GitBranch className="w-4 h-4 text-primary-500" />
                   Batch Scan — {activeBatch.scope === 'database'
                     ? activeBatch.database
                     : `${activeBatch.database}.${activeBatch.schema_name}`}
                 </h2>
-                <p className="text-xs text-gray-500 mt-0.5">
+                <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">
                   {done} done · {inProgress} in progress · {failed > 0 && <span className="text-red-600">{failed} failed · </span>}{runs.length} tables total
                 </p>
               </div>
               <button onClick={() => { setActiveBatchId(null); setActiveRunId(null) }}
-                className="text-xs text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 transition-colors">
+                className="text-xs text-gray-400 dark:text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
                 Close batch ✕
               </button>
             </div>
-            <div className="w-full h-1.5 bg-gray-100 rounded-full overflow-hidden mb-4">
+            <div className="w-full h-1.5 bg-gray-100 dark:bg-gray-700 rounded-full overflow-hidden mb-4">
               <div className="h-full bg-primary-500 transition-all" style={{ width: `${pct}%` }} />
             </div>
             <div className="flex flex-wrap gap-2">
@@ -625,7 +625,7 @@ export default function AgentWorkflow() {
                 )
               })}
             </div>
-            <p className="text-xs text-gray-400 mt-3">
+            <p className="text-xs text-gray-400 dark:text-gray-400 mt-3">
               Tables are processed one at a time. Review rules for the active table below — the next table starts automatically.
             </p>
           </div>
@@ -634,20 +634,20 @@ export default function AgentWorkflow() {
 
       {/* Pipeline visualization */}
       {activeRunId && activeRun && (
-        <div className="bg-white rounded-xl shadow overflow-hidden">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
           {/* Clickable header — always visible, click to expand/collapse */}
           <div
-            className="flex items-center justify-between px-6 py-4 cursor-pointer hover:bg-gray-50 transition-colors"
+            className="flex items-center justify-between px-6 py-4 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors"
             onClick={() => setCollapsed(c => !c)}
           >
             <div className="flex items-center gap-3 min-w-0">
               {collapsed
-                ? <ChevronRight className="w-4 h-4 text-gray-400 flex-shrink-0" />
-                : <ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                ? <ChevronRight className="w-4 h-4 text-gray-400 dark:text-gray-400 flex-shrink-0" />
+                : <ChevronDown className="w-4 h-4 text-gray-400 dark:text-gray-400 flex-shrink-0" />
               }
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Pipeline</h2>
+                  <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide">Pipeline</h2>
                   {isRunning && (
                     <span className="flex items-center gap-1 text-xs text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-full font-medium">
                       <Loader2 className="w-3 h-3 animate-spin" />Running
@@ -674,16 +674,16 @@ export default function AgentWorkflow() {
                     </span>
                   )}
                 </div>
-                <p className="text-xs text-gray-400 mt-0.5 font-mono truncate">
+                <p className="text-xs text-gray-400 dark:text-gray-400 mt-0.5 font-mono truncate">
                   {activeRun.database}.{activeRun.schema_name}.{activeRun.table}
                 </p>
               </div>
             </div>
             <div className="flex items-center gap-3 flex-shrink-0" onClick={e => e.stopPropagation()}>
-              {totalDuration && <span className="text-xs text-gray-400 flex items-center gap-1"><Clock className="w-3 h-3" />{totalDuration}</span>}
+              {totalDuration && <span className="text-xs text-gray-400 dark:text-gray-400 flex items-center gap-1"><Clock className="w-3 h-3" />{totalDuration}</span>}
               <button
                 onClick={() => setActiveRunId(null)}
-                className="text-xs text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 transition-colors"
+                className="text-xs text-gray-400 dark:text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
                 title="Close this run"
               >
                 ✕
@@ -714,16 +714,16 @@ export default function AgentWorkflow() {
                 <AgentNode agentDef={AGENTS[7]} task={getTask('verification_agent')}
                   isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
               </div>
-              <div className="mt-5 pt-4 border-t border-gray-100 grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div className="mt-5 pt-4 border-t border-gray-100 dark:border-gray-700 grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <div className="text-center">
-                  <p className="text-2xl font-bold text-gray-900">{activeRun.findings_count}</p>
-                  <p className="text-xs text-gray-500">Findings</p>
+                  <p className="text-2xl font-bold text-gray-900 dark:text-gray-100">{activeRun.findings_count}</p>
+                  <p className="text-xs text-gray-500 dark:text-gray-300">Findings</p>
                 </div>
                 <div className="text-center">
                   <p className="text-2xl font-bold text-purple-600 flex items-center justify-center gap-1">
                     <Sparkles className="w-5 h-5" />{activeRun.ai_rules_count}
                   </p>
-                  <p className="text-xs text-gray-500">AI rules generated</p>
+                  <p className="text-xs text-gray-500 dark:text-gray-300">AI rules generated</p>
                 </div>
                 <div className="text-center">
                   {liveResolved !== null ? (
@@ -731,12 +731,12 @@ export default function AgentWorkflow() {
                       <p className={`text-2xl font-bold ${liveResolved === liveTotal ? 'text-green-600' : 'text-primary-600'}`}>
                         {liveResolved}/{liveTotal}
                       </p>
-                      <p className="text-xs text-gray-500">Resolved (live)</p>
+                      <p className="text-xs text-gray-500 dark:text-gray-300">Resolved (live)</p>
                     </>
                   ) : (
                     <>
                       <p className="text-2xl font-bold text-gray-300">—</p>
-                      <p className="text-xs text-gray-400">Resolved</p>
+                      <p className="text-xs text-gray-400 dark:text-gray-400">Resolved</p>
                     </>
                   )}
                 </div>
@@ -747,7 +747,7 @@ export default function AgentWorkflow() {
                       View Findings <ExternalLink className="w-3 h-3" />
                     </button>
                   ) : (
-                    <p className="text-xs text-gray-400">—</p>
+                    <p className="text-xs text-gray-400 dark:text-gray-400">—</p>
                   )}
                 </div>
               </div>
@@ -758,8 +758,8 @@ export default function AgentWorkflow() {
 
       {/* ── RULE REVIEW PANEL (shown when awaiting_rule_review) ─────────────── */}
       {isReviewing && activeRunId && (
-        <div className="bg-white rounded-xl shadow overflow-hidden">
-          <div className="px-6 py-4 border-b border-gray-100 bg-purple-50">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 bg-purple-50">
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-base font-semibold text-purple-900 flex items-center gap-2">
@@ -789,17 +789,17 @@ export default function AgentWorkflow() {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100">
+          <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100 dark:divide-gray-700">
             {/* Active Rules column */}
             <div className="p-5">
-              <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
                 Active Rules ({reviewActive.length})
               </h3>
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewActive.map(rule => (
                   <div key={rule.code} className={`rounded-lg border p-3 text-sm ${
-                    rule.is_ai_generated ? 'border-purple-200 bg-purple-50/40' : 'border-gray-200 bg-white'
+                    rule.is_ai_generated ? 'border-purple-200 bg-purple-50/40' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'
                   }`}>
                     {editingRule === rule.code ? (
                       /* Edit form for AI rules */
@@ -807,20 +807,20 @@ export default function AgentWorkflow() {
                         <input
                           value={editForm.name ?? rule.name}
                           onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))}
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs font-medium"
+                          className="w-full px-2 py-1 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium"
                           placeholder="Rule name"
                         />
                         <textarea
                           value={editForm.description ?? rule.description}
                           onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs resize-none"
+                          className="w-full px-2 py-1 border border-gray-300 dark:border-gray-600 rounded text-xs resize-none"
                           rows={2}
                           placeholder="Description"
                         />
                         <select
                           value={editForm.severity ?? rule.severity}
                           onChange={e => setEditForm(f => ({ ...f, severity: e.target.value }))}
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
+                          className="w-full px-2 py-1 border border-gray-300 dark:border-gray-600 rounded text-xs"
                         >
                           {['critical', 'high', 'medium', 'low'].map(s => (
                             <option key={s} value={s}>{s}</option>
@@ -832,7 +832,7 @@ export default function AgentWorkflow() {
                             Save
                           </button>
                           <button onClick={() => { setEditingRule(null); setEditForm({}) }}
-                            className="px-2 py-1 border border-gray-300 rounded text-xs text-gray-600 hover:bg-gray-50">
+                            className="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded text-xs text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/40">
                             Cancel
                           </button>
                         </div>
@@ -841,7 +841,7 @@ export default function AgentWorkflow() {
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
-                            <span className="font-mono text-xs font-bold text-gray-700">{rule.code}</span>
+                            <span className="font-mono text-xs font-bold text-gray-700 dark:text-gray-200">{rule.code}</span>
                             {rule.is_ai_generated && (
                               <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-medium">AI</span>
                             )}
@@ -855,12 +855,12 @@ export default function AgentWorkflow() {
                                                              'bg-blue-100 text-blue-700'
                             }`}>{rule.severity}</span>
                             {rule.severity !== rule.original_severity && rule.original_severity && (
-                              <span className="text-xs text-gray-400 line-through">{rule.original_severity}</span>
+                              <span className="text-xs text-gray-400 dark:text-gray-400 line-through">{rule.original_severity}</span>
                             )}
                           </div>
-                          <p className="text-xs text-gray-600 truncate">{rule.name}</p>
+                          <p className="text-xs text-gray-600 dark:text-gray-300 truncate">{rule.name}</p>
                           {rule.reason && (
-                            <p className="text-xs text-gray-400 mt-0.5 truncate" title={rule.reason}>
+                            <p className="text-xs text-gray-400 dark:text-gray-400 mt-0.5 truncate" title={rule.reason}>
                               {rule.reason}
                             </p>
                           )}
@@ -888,31 +888,31 @@ export default function AgentWorkflow() {
                   </div>
                 ))}
                 {reviewActive.length === 0 && (
-                  <p className="text-xs text-gray-400 text-center py-4">No active rules — activate some from the Skipped column.</p>
+                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No active rules — activate some from the Skipped column.</p>
                 )}
               </div>
             </div>
 
             {/* Skipped Rules column */}
             <div className="p-5">
-              <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />
                 Skipped Rules ({reviewSkipped.length})
               </h3>
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewSkipped.map(rule => (
-                  <div key={rule.code} className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm opacity-75">
+                  <div key={rule.code} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-3 text-sm opacity-75">
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
-                          <span className="font-mono text-xs font-bold text-gray-500">{rule.code}</span>
+                          <span className="font-mono text-xs font-bold text-gray-500 dark:text-gray-300">{rule.code}</span>
                           {rule.is_ai_generated && (
-                            <span className="text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded font-medium">AI</span>
+                            <span className="text-xs bg-gray-200 text-gray-600 dark:text-gray-300 px-1.5 py-0.5 rounded font-medium">AI</span>
                           )}
                         </div>
-                        <p className="text-xs text-gray-500 truncate">{rule.name}</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-300 truncate">{rule.name}</p>
                         {rule.reason && (
-                          <p className="text-xs text-gray-400 mt-0.5 truncate" title={rule.reason}>
+                          <p className="text-xs text-gray-400 dark:text-gray-400 mt-0.5 truncate" title={rule.reason}>
                             {rule.reason}
                           </p>
                         )}
@@ -928,7 +928,7 @@ export default function AgentWorkflow() {
                   </div>
                 ))}
                 {reviewSkipped.length === 0 && (
-                  <p className="text-xs text-gray-400 text-center py-4">No skipped rules.</p>
+                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No skipped rules.</p>
                 )}
               </div>
             </div>
@@ -938,21 +938,21 @@ export default function AgentWorkflow() {
 
       {/* Rule Intelligence summary (shown after it completes) */}
       {intelOutput && getTask('rule_intelligence_agent')?.status === 'completed' && (
-        <div className="bg-white rounded-xl shadow p-6">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
           <div className="flex items-center gap-2 mb-4">
             <BrainCircuit className="w-5 h-5 text-purple-600" />
-            <h2 className="text-base font-semibold text-gray-900">Rule Intelligence Report</h2>
+            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Rule Intelligence Report</h2>
             <span className="text-xs bg-purple-50 border border-purple-200 text-purple-700 px-2 py-0.5 rounded-full font-medium">
               {intelOutput.table_type} · {intelOutput.table_type_confidence}% confidence
             </span>
           </div>
-          <p className="text-sm text-gray-600 mb-4">{intelOutput.table_type_reason}</p>
+          <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">{intelOutput.table_type_reason}</p>
 
           <div className="grid grid-cols-2 gap-6">
             {/* Rules used */}
             {intelOutput.existing_rules_selected > 0 && (
               <div>
-                <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">
+                <h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide mb-2">
                   Rules Used ({intelOutput.existing_rules_selected})
                 </h3>
                 <div className="space-y-1.5 max-h-48 overflow-y-auto">
@@ -960,17 +960,17 @@ export default function AgentWorkflow() {
                     <div key={code} className="flex items-start gap-2 text-xs">
                       <span className="text-green-500 mt-0.5 flex-shrink-0">✓</span>
                       <div>
-                        <span className="font-mono font-medium text-gray-800">{code}</span>
+                        <span className="font-mono font-medium text-gray-800 dark:text-gray-200">{code}</span>
                         {info.severity_override && (
                           <span className="ml-1 text-amber-600 font-medium">→ {info.severity_override}</span>
                         )}
-                        {info.reason && <p className="text-gray-500 mt-0.5">{info.reason}</p>}
+                        {info.reason && <p className="text-gray-500 dark:text-gray-300 mt-0.5">{info.reason}</p>}
                       </div>
                     </div>
                   ))}
                   {/* Show remaining selected without overrides as a count */}
                   {intelOutput.existing_rules_selected - Object.keys(intelOutput.selected_with_overrides || {}).length > 0 && (
-                    <p className="text-xs text-gray-400 mt-1">
+                    <p className="text-xs text-gray-400 dark:text-gray-400 mt-1">
                       + {intelOutput.existing_rules_selected - Object.keys(intelOutput.selected_with_overrides || {}).length} more rules applied without changes
                     </p>
                   )}
@@ -981,7 +981,7 @@ export default function AgentWorkflow() {
             {/* Rules skipped */}
             {Object.keys(intelOutput.skipped || {}).length > 0 && (
               <div>
-                <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">
+                <h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide mb-2">
                   Rules Skipped ({intelOutput.existing_rules_skipped})
                 </h3>
                 <div className="space-y-1.5 max-h-48 overflow-y-auto">
@@ -989,8 +989,8 @@ export default function AgentWorkflow() {
                     <div key={code} className="flex items-start gap-2 text-xs">
                       <span className="text-gray-300 mt-0.5 flex-shrink-0">–</span>
                       <div>
-                        <span className="font-mono font-medium text-gray-500">{code}</span>
-                        {reason && <p className="text-gray-400 mt-0.5">{reason}</p>}
+                        <span className="font-mono font-medium text-gray-500 dark:text-gray-300">{code}</span>
+                        {reason && <p className="text-gray-400 dark:text-gray-400 mt-0.5">{reason}</p>}
                       </div>
                     </div>
                   ))}
@@ -1001,8 +1001,8 @@ export default function AgentWorkflow() {
 
           {/* AI rules generated */}
           {intelOutput.ai_rules && intelOutput.ai_rules.length > 0 && (
-            <div className="mt-4 pt-4 border-t border-gray-100">
-              <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2 flex items-center gap-1">
+            <div className="mt-4 pt-4 border-t border-gray-100 dark:border-gray-700">
+              <h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide mb-2 flex items-center gap-1">
                 <Sparkles className="w-3.5 h-3.5 text-purple-500" />
                 AI Rules Generated ({intelOutput.ai_rules.length})
               </h3>
@@ -1012,13 +1012,13 @@ export default function AgentWorkflow() {
                     className={`text-xs px-2 py-1 rounded-full font-medium border ${
                       r.violated
                         ? 'bg-orange-50 border-orange-300 text-orange-800'
-                        : 'bg-gray-50 border-gray-200 text-gray-600'
+                        : 'bg-gray-50 dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-300'
                     }`}>
                     {r.violated ? '⚠ ' : '✓ '}{r.code}
                   </span>
                 ))}
               </div>
-              <p className="text-xs text-gray-400 mt-2">
+              <p className="text-xs text-gray-400 dark:text-gray-400 mt-2">
                 Orange = violation detected · Gray = rule generated, no current violation
               </p>
             </div>
@@ -1030,38 +1030,38 @@ export default function AgentWorkflow() {
           the active/skipped split, but after findings ran) */}
       {findingsOutput && getTask('findings_agent')?.status === 'completed' &&
        Array.isArray(findingsOutput.rules_used) && (
-        <div className="bg-white rounded-xl shadow overflow-hidden">
-          <div className="px-6 py-4 border-b border-gray-100">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700">
             <div className="flex items-center gap-2">
               <AlertCircle className="w-5 h-5 text-primary-600" />
-              <h2 className="text-base font-semibold text-gray-900">Findings Report</h2>
+              <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Findings Report</h2>
             </div>
-            <p className="text-xs text-gray-500 mt-0.5">
+            <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">
               {findingsOutput.rules_executed} rules executed ·{' '}
-              <span className="text-orange-700 font-medium">{findingsOutput.rules_used_count} fired</span> ·{' '}
-              <span className="text-green-700 font-medium">{findingsOutput.rules_unused_count} clean</span>
+              <span className="text-orange-700 dark:text-orange-300 font-medium">{findingsOutput.rules_used_count} fired</span> ·{' '}
+              <span className="text-green-700 dark:text-green-400 font-medium">{findingsOutput.rules_unused_count} clean</span>
               {findingsOutput.findings_count != null && <> · {findingsOutput.findings_count} findings</>}
             </p>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100">
+          <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100 dark:divide-gray-700">
             {/* Rules that fired */}
             <div className="p-5">
-              <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-orange-500 inline-block" />
                 Rules Used ({findingsOutput.rules_used_count})
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
                 {findingsOutput.rules_used.map((r: any) => (
-                  <div key={r.code} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 bg-orange-50/40 p-2.5">
+                  <div key={r.code} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
                     <div className="min-w-0">
-                      <span className="font-mono text-xs font-bold text-gray-700">{r.code}</span>
-                      <p className="text-xs text-gray-600 truncate">{r.name}</p>
+                      <span className="font-mono text-xs font-bold text-gray-700 dark:text-gray-200">{r.code}</span>
+                      <p className="text-xs text-gray-600 dark:text-gray-300 truncate">{r.name}</p>
                     </div>
                     {activeRun?.scan_id && (
                       <button
                         onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}&rule_code=${encodeURIComponent(r.code)}`)}
-                        className="flex-shrink-0 text-xs px-1.5 py-1 text-orange-700 border border-orange-300 rounded hover:bg-orange-100 font-medium"
+                        className="flex-shrink-0 text-xs px-1.5 py-1 text-orange-700 dark:text-orange-300 border border-orange-300 dark:border-orange-500/40 rounded hover:bg-orange-100 dark:hover:bg-orange-500/20 font-medium"
                         title="View these findings"
                       >
                         {r.findings} finding{r.findings !== 1 ? 's' : ''}
@@ -1070,26 +1070,26 @@ export default function AgentWorkflow() {
                   </div>
                 ))}
                 {findingsOutput.rules_used_count === 0 && (
-                  <p className="text-xs text-gray-400 text-center py-4">No rules fired — the data is clean.</p>
+                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No rules fired — the data is clean.</p>
                 )}
               </div>
             </div>
 
             {/* Rules that ran clean */}
             <div className="p-5">
-              <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
                 Rules Clean ({findingsOutput.rules_unused_count})
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
                 {(findingsOutput.rules_unused || []).map((r: any) => (
-                  <div key={r.code} className="rounded-lg border border-gray-200 bg-gray-50 p-2.5 text-sm">
-                    <span className="font-mono text-xs font-bold text-gray-500">{r.code}</span>
-                    <p className="text-xs text-gray-500 truncate">{r.name}</p>
+                  <div key={r.code} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm">
+                    <span className="font-mono text-xs font-bold text-gray-500 dark:text-gray-300">{r.code}</span>
+                    <p className="text-xs text-gray-500 dark:text-gray-300 truncate">{r.name}</p>
                   </div>
                 ))}
                 {findingsOutput.rules_unused_count === 0 && (
-                  <p className="text-xs text-gray-400 text-center py-4">Every executed rule found at least one issue.</p>
+                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">Every executed rule found at least one issue.</p>
                 )}
               </div>
             </div>
@@ -1196,8 +1196,8 @@ export default function AgentWorkflow() {
 
       {/* Recent runs — always visible so user can switch between runs */}
       {recentRuns && recentRuns.runs.length > 0 && (
-        <div className="bg-white rounded-xl shadow p-6">
-          <h2 className="text-base font-semibold text-gray-900 mb-4">Recent Runs</h2>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
+          <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-4">Recent Runs</h2>
           <div className="space-y-2">
             {recentRuns.runs.slice(0, 8).map(run => {
               const isSelected = run.id === activeRunId
@@ -1215,7 +1215,7 @@ export default function AgentWorkflow() {
                   className={`w-full flex items-center justify-between p-3 rounded-lg border text-left transition-colors ${
                     isSelected
                       ? 'border-primary-300 bg-primary-50'
-                      : 'border-gray-200 hover:bg-gray-50'
+                      : 'border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40'
                   }`}>
                   <div className="flex items-center gap-2 min-w-0">
                     {isSelected && (
@@ -1224,21 +1224,21 @@ export default function AgentWorkflow() {
                         : <ChevronDown  className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
                     )}
                     <div className="min-w-0">
-                      <p className={`text-sm font-medium truncate ${isSelected ? 'text-primary-900' : 'text-gray-900'}`}>
+                      <p className={`text-sm font-medium truncate ${isSelected ? 'text-primary-900' : 'text-gray-900 dark:text-gray-100'}`}>
                         {run.database}.{run.schema_name}.{run.table}
                       </p>
-                      <p className="text-xs text-gray-400 mt-0.5">{new Date(run.created_at).toLocaleString()}</p>
+                      <p className="text-xs text-gray-400 dark:text-gray-400 mt-0.5">{new Date(run.created_at).toLocaleString()}</p>
                     </div>
                   </div>
                   <div className="flex items-center gap-3 flex-shrink-0">
-                    <span className="text-xs text-gray-500">{run.findings_count} findings</span>
+                    <span className="text-xs text-gray-500 dark:text-gray-300">{run.findings_count} findings</span>
                     <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
                       run.status === 'completed'           ? 'bg-green-100 text-green-700' :
                       run.status === 'failed'              ? 'bg-red-100 text-red-700' :
                       run.status === 'running'             ? 'bg-blue-100 text-blue-700' :
                       run.status === 'awaiting_rule_review'? 'bg-purple-100 text-purple-700' :
                       run.status === 'awaiting_fixes'      ? 'bg-primary-100 text-primary-700' :
-                      'bg-gray-100 text-gray-600'
+                      'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300'
                     }`}>{run.status.replace(/_/g, ' ')}</span>
                   </div>
                 </button>

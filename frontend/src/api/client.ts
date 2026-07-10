@@ -334,6 +334,45 @@ export interface ConnectionTestResult {
   detail: string | null;
 }
 
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+export interface SettingMeta {
+  value: number;
+  default: number;
+  type: 'int' | 'float';
+  min: number;
+  max: number;
+  label: string;
+  help: string;
+}
+export type SettingsMap = Record<string, SettingMeta>;
+
+export interface SystemConnectionInfo {
+  id: string;
+  name: string;
+  type: string;
+  host: string | null;
+  database: string | null;
+  username: string | null;
+  warehouse: string | null;
+  role: string | null;
+  connected: boolean;
+  connected_user: string | null;
+  detail: string | null;
+}
+
+export interface SystemInfo {
+  backend: string;
+  connections_count: number;
+  connections: SystemConnectionInfo[];
+}
+
+export const settingsApi = {
+  get: () => api.get<SettingsMap>('/settings'),
+  update: (updates: Record<string, number>) => api.patch<SettingsMap>('/settings', { updates }),
+  systemInfo: () => api.get<SystemInfo>('/settings/system-info'),
+};
+
 export const connectionsApi = {
   list: () => api.get<{ total: number; connections: Connection[] }>('/connections'),
   create: (data: ConnectionCreatePayload) => api.post<Connection>('/connections', data),

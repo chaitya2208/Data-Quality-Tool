@@ -18,7 +18,7 @@ function StatusDot({ connId }: { connId: string }) {
     staleTime: 30_000,
     retry: false,
   })
-  if (isLoading) return <span className="flex items-center gap-1 text-xs text-gray-400"><Loader2 className="w-3 h-3 animate-spin" />checking</span>
+  if (isLoading) return <span className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-400"><Loader2 className="w-3 h-3 animate-spin" />checking</span>
   if (data?.ok) return <span className="flex items-center gap-1 text-xs text-green-600"><CheckCircle2 className="w-3 h-3" />connected</span>
   return <span className="flex items-center gap-1 text-xs text-red-600" title={data?.detail ?? ''}><XCircle className="w-3 h-3" />error</span>
 }
@@ -28,7 +28,7 @@ const EMPTY_FORM: ConnectionCreatePayload = {
   username: '', secret: '', auth_method: '', extra: {},
 }
 
-export default function Connections() {
+export default function Connections({ embedded = false }: { embedded?: boolean }) {
   const qc = useQueryClient()
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<ConnectionCreatePayload>(EMPTY_FORM)
@@ -67,8 +67,10 @@ export default function Connections() {
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">Connections</h1>
-          <p className="mt-1 text-gray-600">Data sources this tool can profile, scan, and fix. Snowflake and Postgres/RDS supported.</p>
+          {!embedded && <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Connections</h1>}
+          <p className={embedded ? 'text-gray-600 dark:text-gray-300 dark:text-gray-200' : 'mt-1 text-gray-600 dark:text-gray-300 dark:text-gray-200'}>
+            Data sources this tool can profile, scan, and fix. Snowflake and Postgres/RDS supported.
+          </p>
         </div>
         <button onClick={() => { setForm(EMPTY_FORM); setShowForm(true) }}
           className="flex items-center gap-2 px-4 py-2 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 flex-shrink-0">
@@ -77,17 +79,17 @@ export default function Connections() {
       </div>
 
       {/* List */}
-      <div className="bg-white rounded-xl shadow overflow-hidden">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
         {isLoading ? (
-          <div className="p-8 text-sm text-gray-400 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />Loading…</div>
+          <div className="p-8 text-sm text-gray-400 dark:text-gray-400 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />Loading…</div>
         ) : !data?.connections.length ? (
           <div className="p-12 text-center">
             <Database className="w-12 h-12 text-gray-200 mx-auto mb-3" />
-            <p className="text-gray-900 font-medium mb-1">No connections yet</p>
-            <p className="text-sm text-gray-400">Add a Snowflake or Postgres/RDS connection to get started.</p>
+            <p className="text-gray-900 dark:text-gray-100 font-medium mb-1">No connections yet</p>
+            <p className="text-sm text-gray-400 dark:text-gray-400">Add a Snowflake or Postgres/RDS connection to get started.</p>
           </div>
         ) : (
-          <ul className="divide-y divide-gray-100">
+          <ul className="divide-y divide-gray-100 dark:divide-gray-700">
             {data.connections.map(c => {
               const meta = TYPE_META[c.type] ?? TYPE_META.postgres
               const Icon = meta.icon
@@ -96,17 +98,17 @@ export default function Connections() {
                   <div className="flex items-center gap-3 min-w-0">
                     <Icon className={`w-5 h-5 flex-shrink-0 ${meta.tone}`} />
                     <div className="min-w-0">
-                      <p className="text-sm font-semibold text-gray-900 truncate">{c.name}</p>
-                      <p className="text-xs text-gray-400 truncate">
+                      <p className="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">{c.name}</p>
+                      <p className="text-xs text-gray-400 dark:text-gray-400 truncate">
                         {meta.label} · {c.host ?? '—'}{c.database ? ` / ${c.database}` : ''}{c.username ? ` · ${c.username}` : ''}
                       </p>
-                      {testResult[c.id] && <p className="text-xs mt-0.5 text-gray-500">{testResult[c.id]}</p>}
+                      {testResult[c.id] && <p className="text-xs mt-0.5 text-gray-500 dark:text-gray-300">{testResult[c.id]}</p>}
                     </div>
                   </div>
                   <div className="flex items-center gap-3 flex-shrink-0">
                     <StatusDot connId={c.id} />
                     <button onClick={() => testMutation.mutate(c.id)} disabled={testMutation.isPending}
-                      className="text-xs px-2.5 py-1 border border-gray-300 rounded-lg text-gray-600 hover:bg-gray-50 disabled:opacity-50">
+                      className="text-xs px-2.5 py-1 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/40 disabled:opacity-50">
                       {testMutation.isPending && testMutation.variables === c.id ? 'Testing…' : 'Test'}
                     </button>
                     <button onClick={() => { if (confirm(`Delete connection "${c.name}"?`)) deleteMutation.mutate(c.id) }}
@@ -124,77 +126,77 @@ export default function Connections() {
       {/* Add form modal */}
       {showForm && (
         <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center p-4" onClick={() => setShowForm(false)}>
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 space-y-4" onClick={e => e.stopPropagation()}>
+          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-lg p-6 space-y-4" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-gray-900">Add Connection</h2>
-              <button onClick={() => setShowForm(false)} className="text-gray-400 hover:text-gray-700"><X className="w-5 h-5" /></button>
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Add Connection</h2>
+              <button onClick={() => setShowForm(false)} className="text-gray-400 dark:text-gray-400 hover:text-gray-700"><X className="w-5 h-5" /></button>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
-              <label className="col-span-2 text-xs font-medium text-gray-500">Name
+              <label className="col-span-2 text-xs font-medium text-gray-500 dark:text-gray-300">Name
                 <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-                  className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" placeholder="analytics-rds" />
+                  className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm" placeholder="analytics-rds" />
               </label>
 
-              <label className="col-span-2 text-xs font-medium text-gray-500">Type
+              <label className="col-span-2 text-xs font-medium text-gray-500 dark:text-gray-300">Type
                 <select value={form.type} onChange={e => {
                     const t = e.target.value as ConnectionType
                     setForm(f => ({ ...f, type: t, port: t === 'postgres' ? 5432 : undefined, auth_method: t === 'snowflake' ? 'externalbrowser' : '' }))
                   }}
-                  className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
+                  className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm">
                   <option value="postgres">Postgres (RDS)</option>
                   <option value="snowflake">Snowflake</option>
                 </select>
               </label>
 
-              <label className="text-xs font-medium text-gray-500 col-span-2">{isSnowflake ? 'Account' : 'Host'}
+              <label className="text-xs font-medium text-gray-500 dark:text-gray-300 col-span-2">{isSnowflake ? 'Account' : 'Host'}
                 <input value={form.host ?? ''} onChange={e => setForm(f => ({ ...f, host: e.target.value }))}
-                  className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                  className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm"
                   placeholder={isSnowflake ? 'xy12345.us-east-1' : 'mydb.abc123.us-east-1.rds.amazonaws.com'} />
               </label>
 
               {!isSnowflake && (
-                <label className="text-xs font-medium text-gray-500">Port
+                <label className="text-xs font-medium text-gray-500 dark:text-gray-300">Port
                   <input type="number" value={form.port ?? 5432} onChange={e => setForm(f => ({ ...f, port: Number(e.target.value) }))}
-                    className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                    className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm" />
                 </label>
               )}
 
-              <label className="text-xs font-medium text-gray-500">Database
+              <label className="text-xs font-medium text-gray-500 dark:text-gray-300">Database
                 <input value={form.database ?? ''} onChange={e => setForm(f => ({ ...f, database: e.target.value }))}
-                  className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" placeholder={isSnowflake ? '(optional)' : 'analytics'} />
+                  className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm" placeholder={isSnowflake ? '(optional)' : 'analytics'} />
               </label>
 
               {!isSnowflake && (
-                <label className="text-xs font-medium text-gray-500">Schema
+                <label className="text-xs font-medium text-gray-500 dark:text-gray-300">Schema
                   <input value={form.schema_name ?? ''} onChange={e => setForm(f => ({ ...f, schema_name: e.target.value }))}
-                    className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" placeholder="public" />
+                    className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm" placeholder="public" />
                 </label>
               )}
 
-              <label className="text-xs font-medium text-gray-500">Username
+              <label className="text-xs font-medium text-gray-500 dark:text-gray-300">Username
                 <input value={form.username ?? ''} onChange={e => setForm(f => ({ ...f, username: e.target.value }))}
-                  className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                  className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm" />
               </label>
 
-              <label className="text-xs font-medium text-gray-500">{isSnowflake ? 'Password (if not SSO)' : 'Password'}
+              <label className="text-xs font-medium text-gray-500 dark:text-gray-300">{isSnowflake ? 'Password (if not SSO)' : 'Password'}
                 <input type="password" value={form.secret ?? ''} onChange={e => setForm(f => ({ ...f, secret: e.target.value }))}
-                  className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                  className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm" />
               </label>
 
               {isSnowflake && (
                 <>
-                  <label className="text-xs font-medium text-gray-500">Warehouse
+                  <label className="text-xs font-medium text-gray-500 dark:text-gray-300">Warehouse
                     <input value={form.extra?.warehouse ?? ''} onChange={e => setForm(f => ({ ...f, extra: { ...f.extra, warehouse: e.target.value } }))}
-                      className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                      className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm" />
                   </label>
-                  <label className="text-xs font-medium text-gray-500">Role
+                  <label className="text-xs font-medium text-gray-500 dark:text-gray-300">Role
                     <input value={form.extra?.role ?? ''} onChange={e => setForm(f => ({ ...f, extra: { ...f.extra, role: e.target.value } }))}
-                      className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                      className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm" />
                   </label>
-                  <label className="col-span-2 text-xs font-medium text-gray-500">Auth method
+                  <label className="col-span-2 text-xs font-medium text-gray-500 dark:text-gray-300">Auth method
                     <select value={form.auth_method ?? 'externalbrowser'} onChange={e => setForm(f => ({ ...f, auth_method: e.target.value }))}
-                      className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
+                      className="mt-1 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm">
                       <option value="externalbrowser">externalbrowser (SSO)</option>
                       <option value="password">password</option>
                     </select>
@@ -208,7 +210,7 @@ export default function Connections() {
             )}
 
             <div className="flex justify-end gap-2 pt-2">
-              <button onClick={() => setShowForm(false)} className="px-4 py-2 text-sm border border-gray-300 rounded-lg text-gray-600 hover:bg-gray-50">Cancel</button>
+              <button onClick={() => setShowForm(false)} className="px-4 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/40">Cancel</button>
               <button onClick={() => createMutation.mutate(form)} disabled={!canSubmit || createMutation.isPending}
                 className="px-4 py-2 text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 flex items-center gap-2">
                 {createMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}Save Connection

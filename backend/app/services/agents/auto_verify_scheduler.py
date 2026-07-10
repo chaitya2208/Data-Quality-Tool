@@ -21,11 +21,18 @@ _lock: threading.Lock = threading.Lock()
 _active_timers: Dict[str, threading.Timer] = {}  # run_id → Timer
 
 
-def schedule(run_id: str, delay: float = AUTO_VERIFY_INTERVAL_SECONDS) -> None:
+def schedule(run_id: str, delay: float = None) -> None:
     """
-    Schedule an auto-verify for run_id after `delay` seconds.
+    Schedule an auto-verify for run_id after `delay` seconds. When `delay` is
+    omitted, use the configured interval (Settings → auto_verify_interval_min).
     Cancels any existing timer for this run first.
     """
+    if delay is None:
+        try:
+            from app.services import settings_service
+            delay = settings_service.get_auto_verify_interval_seconds()
+        except Exception:
+            delay = AUTO_VERIFY_INTERVAL_SECONDS
     cancel(run_id)
     timer = threading.Timer(delay, _fire, args=[run_id])
     timer.daemon = True

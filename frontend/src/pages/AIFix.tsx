@@ -98,7 +98,7 @@ export default function AIFix() {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] gap-3">
         <Loader2 className="w-10 h-10 animate-spin text-primary-600" />
-        <p className="text-gray-600 font-medium">Loading findings...</p>
+        <p className="text-gray-600 dark:text-gray-300 font-medium">Loading findings...</p>
       </div>
     )
   }
@@ -106,9 +106,9 @@ export default function AIFix() {
   if (!findingsData || findingsData.length === 0) {
     return (
       <div className="max-w-4xl mx-auto py-12 text-center">
-        <AlertTriangle className="w-16 h-16 text-gray-400 mx-auto mb-4" />
-        <h2 className="text-2xl font-bold text-gray-900 mb-2">No Findings Selected</h2>
-        <p className="text-gray-600 mb-6">Please select findings from the Findings page.</p>
+        <AlertTriangle className="w-16 h-16 text-gray-400 dark:text-gray-400 mx-auto mb-4" />
+        <h2 className="text-2xl font-bold text-gray-900 dark:text-gray-100 mb-2">No Findings Selected</h2>
+        <p className="text-gray-600 dark:text-gray-300 mb-6">Please select findings from the Findings page.</p>
         <button onClick={() => navigate('/findings')}
           className="px-6 py-3 bg-primary-600 text-white rounded-lg hover:bg-primary-700">
           Go to Findings
@@ -123,13 +123,13 @@ export default function AIFix() {
       {/* ── Header ── */}
       <div>
         <button onClick={() => navigate(returnTo)}
-          className="flex items-center text-gray-500 hover:text-gray-900 text-sm mb-3">
+          className="flex items-center text-gray-500 dark:text-gray-300 hover:text-gray-900 text-sm mb-3">
           <ArrowLeft className="w-4 h-4 mr-1" /> Back to Findings
         </button>
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">AI-Powered Fixes</h1>
-            <p className="mt-1 text-gray-500">
+            <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 dark:text-gray-100">AI-Powered Fixes</h1>
+            <p className="mt-1 text-gray-500 dark:text-gray-300">
               {findingsData.length} finding{findingsData.length !== 1 ? 's' : ''} selected for review
             </p>
           </div>
@@ -138,19 +138,19 @@ export default function AIFix() {
           <div className="flex flex-wrap items-end gap-3">
             {/* Role dropdown */}
             <div className="flex flex-col gap-1">
-              <label className="text-xs font-medium text-gray-500 flex items-center gap-1">
+              <label className="text-xs font-medium text-gray-500 dark:text-gray-300 flex items-center gap-1">
                 <ShieldCheck className="w-3 h-3 text-purple-500" /> Role
               </label>
               <div className="relative">
                 {loadingRoles ? (
-                  <div className="flex items-center gap-2 px-3 py-2 border border-gray-200 rounded-lg bg-white text-sm text-gray-400 w-40">
+                  <div className="flex items-center gap-2 px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-sm text-gray-400 dark:text-gray-400 w-40">
                     <Loader2 className="w-4 h-4 animate-spin" /> Loading...
                   </div>
                 ) : (
                   <select
                     value={effectiveRole}
                     onChange={e => setSelectedRole(e.target.value)}
-                    className="appearance-none w-40 sm:w-52 pl-3 pr-8 py-2 border-2 border-purple-200 rounded-lg bg-white text-sm font-medium text-gray-900 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 cursor-pointer"
+                    className="appearance-none w-40 sm:w-52 pl-3 pr-8 py-2 border-2 border-purple-200 rounded-lg bg-white dark:bg-gray-800 text-sm font-medium text-gray-900 dark:text-gray-100 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 cursor-pointer"
                   >
                     {roles?.map(role => (
                       <option key={role.name} value={role.name}>
@@ -159,25 +159,25 @@ export default function AIFix() {
                     ))}
                   </select>
                 )}
-                <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+                <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 dark:text-gray-400 pointer-events-none" />
               </div>
             </div>
 
             {/* Warehouse dropdown */}
             <div className="flex flex-col gap-1">
-              <label className="text-xs font-medium text-gray-500 flex items-center gap-1">
+              <label className="text-xs font-medium text-gray-500 dark:text-gray-300 flex items-center gap-1">
                 <Server className="w-3 h-3 text-primary-500" /> Warehouse
               </label>
               <div className="relative">
                 {loadingWarehouses ? (
-                  <div className="flex items-center gap-2 px-3 py-2 border border-gray-200 rounded-lg bg-white text-sm text-gray-400 w-40">
+                  <div className="flex items-center gap-2 px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-sm text-gray-400 dark:text-gray-400 w-40">
                     <Loader2 className="w-4 h-4 animate-spin" /> Loading...
                   </div>
                 ) : (
                   <select
                     value={effectiveWarehouse}
                     onChange={e => setSelectedWarehouse(e.target.value)}
-                    className="appearance-none w-40 sm:w-56 pl-3 pr-8 py-2 border-2 border-primary-200 rounded-lg bg-white text-sm font-medium text-gray-900 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 cursor-pointer"
+                    className="appearance-none w-40 sm:w-56 pl-3 pr-8 py-2 border-2 border-primary-200 rounded-lg bg-white dark:bg-gray-800 text-sm font-medium text-gray-900 dark:text-gray-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 cursor-pointer"
                   >
                     {warehouses?.map(wh => (
                       <option key={wh.name} value={wh.name}>
@@ -186,7 +186,7 @@ export default function AIFix() {
                     ))}
                   </select>
                 )}
-                <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+                <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 dark:text-gray-400 pointer-events-none" />
               </div>
             </div>
           </div>
@@ -199,14 +199,14 @@ export default function AIFix() {
           <span className="flex items-center gap-1.5 bg-purple-50 border border-purple-200 text-purple-800 px-3 py-1.5 rounded-full font-medium">
             <ShieldCheck className="w-3.5 h-3.5" /> {effectiveRole}
           </span>
-          <span className="text-gray-400">+</span>
+          <span className="text-gray-400 dark:text-gray-400">+</span>
           <span className="flex items-center gap-1.5 bg-blue-50 border border-blue-200 text-blue-800 px-3 py-1.5 rounded-full font-medium">
             <Server className="w-3.5 h-3.5" /> {effectiveWarehouse}
             {warehouses?.find(w => w.name === effectiveWarehouse)?.state === 'SUSPENDED' && (
               <span className="text-yellow-600 ml-1">(will resume)</span>
             )}
           </span>
-          <span className="text-gray-400 italic hidden sm:inline">— all fixes will run with this context</span>
+          <span className="text-gray-400 dark:text-gray-400 italic hidden sm:inline">— all fixes will run with this context</span>
         </div>
       )}
 
@@ -262,16 +262,16 @@ export default function AIFix() {
 
           return (
             <div key={finding.id}
-              className={`bg-white rounded-xl shadow overflow-hidden transition-all ${
+              className={`bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden transition-all ${
                 isExecuted ? 'ring-2 ring-green-300 opacity-80' : ''
               }`}
             >
               {/* Card header */}
-              <div className="bg-gray-50 px-6 py-4 border-b border-gray-200 flex items-start justify-between gap-4">
+              <div className="bg-gray-50 dark:bg-gray-900 px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex items-start justify-between gap-4">
                 <div className="flex-1 min-w-0">
-                  <h3 className="text-base font-semibold text-gray-900">{finding.title}</h3>
+                  <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">{finding.title}</h3>
                   <div className="flex flex-wrap items-center gap-2 mt-2">
-                    <span className="text-xs font-mono bg-white border border-gray-200 px-2 py-0.5 rounded text-gray-600 truncate max-w-sm">
+                    <span className="text-xs font-mono bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 px-2 py-0.5 rounded text-gray-600 dark:text-gray-300 truncate max-w-sm">
                       {finding.context?.fqn}
                     </span>
                     <span className={`text-xs px-2 py-0.5 rounded font-medium ${
@@ -295,14 +295,14 @@ export default function AIFix() {
 
                 {/* ── Recommendation pending / error / loaded ── */}
                 {!rec && loadingRecommendations && (
-                  <div className="flex items-center gap-2 text-sm text-gray-500">
+                  <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-300">
                     <Loader2 className="w-4 h-4 animate-spin text-purple-500" />
                     Asking Claude for a fix recommendation...
                   </div>
                 )}
 
                 {!rec && !loadingRecommendations && (
-                  <div className="flex items-center gap-2 text-sm text-gray-500 bg-gray-50 rounded-lg p-3">
+                  <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-300 bg-gray-50 dark:bg-gray-900 rounded-lg p-3">
                     <AlertTriangle className="w-4 h-4 text-yellow-500" />
                     No recommendation generated for this finding.
                   </div>
@@ -315,7 +315,7 @@ export default function AIFix() {
                       <div className="flex-1">
                         <div className="flex items-center gap-1.5 mb-1.5">
                           <Sparkles className="w-4 h-4 text-purple-500" />
-                          <span className="text-sm font-semibold text-gray-800">AI Recommendation</span>
+                          <span className="text-sm font-semibold text-gray-800 dark:text-gray-200">AI Recommendation</span>
                           {rec.from_cache ? (
                             <span className="text-xs bg-green-50 border border-green-200 text-green-700 px-1.5 py-0.5 rounded-full font-medium">
                               ⚡ cached
@@ -330,10 +330,10 @@ export default function AIFix() {
                             </span>
                           ) : null}
                         </div>
-                        <p className="text-sm text-gray-600 leading-relaxed">{rec.explanation}</p>
+                        <p className="text-sm text-gray-600 dark:text-gray-300 leading-relaxed">{rec.explanation}</p>
                       </div>
                       <div className="text-center flex-shrink-0">
-                        <p className="text-xs text-gray-400 mb-1">Confidence</p>
+                        <p className="text-xs text-gray-400 dark:text-gray-400 mb-1">Confidence</p>
                         <p className={`text-3xl font-bold leading-none ${
                           rec.confidence >= 90 ? 'text-green-600' :
                           rec.confidence >= 70 ? 'text-yellow-500' : 'text-red-500'
@@ -346,9 +346,9 @@ export default function AIFix() {
                     {/* SQL block */}
                     <div>
                       <div className="flex items-center justify-between mb-1.5">
-                        <span className="text-sm font-medium text-gray-700">Suggested SQL Fix</span>
+                        <span className="text-sm font-medium text-gray-700 dark:text-gray-200">Suggested SQL Fix</span>
                         <button onClick={() => handleCopySQL(sql)}
-                          className="flex items-center gap-1 text-xs text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 transition-colors">
+                          className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
                           {copiedSQL === sql
                             ? <><Check className="w-3.5 h-3.5 text-green-500" /><span className="text-green-600">Copied!</span></>
                             : <><Copy className="w-3.5 h-3.5" />Copy</>
@@ -386,7 +386,7 @@ export default function AIFix() {
                         </button>
                         <button
                           onClick={() => handleReject(finding.id)}
-                          className="flex items-center justify-center gap-2 px-4 py-2.5 bg-gray-100 text-gray-700 font-medium rounded-lg hover:bg-gray-200 transition-colors"
+                          className="flex items-center justify-center gap-2 px-4 py-2.5 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 font-medium rounded-lg hover:bg-gray-200 transition-colors"
                         >
                           <XCircle className="w-4 h-4" /> Reject
                         </button>

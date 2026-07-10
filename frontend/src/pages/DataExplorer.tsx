@@ -25,9 +25,9 @@ function formatBytes(bytes: number | null): string {
 }
 
 function nullPctTone(pct: number | null): string {
-  if (pct === null) return 'text-gray-400'
+  if (pct === null) return 'text-gray-400 dark:text-gray-400'
   if (pct === 0)    return 'text-green-600'
-  if (pct < 5)      return 'text-gray-700'
+  if (pct < 5)      return 'text-gray-700 dark:text-gray-200'
   if (pct < 30)     return 'text-yellow-600'
   return 'text-red-600'
 }
@@ -47,19 +47,19 @@ function SelectorColumn({
   emptyHint: string
 }) {
   return (
-    <div className={`flex-1 min-w-0 border border-gray-200 rounded-xl bg-white flex flex-col ${disabled ? 'opacity-50' : ''}`}>
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100">
+    <div className={`flex-1 min-w-0 border border-gray-200 dark:border-gray-700 rounded-xl bg-white dark:bg-gray-800 flex flex-col ${disabled ? 'opacity-50' : ''}`}>
+      <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 dark:border-gray-700">
         <Icon className="w-4 h-4 text-primary-500 flex-shrink-0" />
-        <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide">{title}</h3>
-        {items.length > 0 && <span className="ml-auto text-xs text-gray-400">{items.length}</span>}
+        <h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide">{title}</h3>
+        {items.length > 0 && <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">{items.length}</span>}
       </div>
       <div className="p-2 max-h-72 overflow-y-auto">
         {loading ? (
-          <p className="text-xs text-gray-400 px-2 py-3 flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" />Loading…</p>
+          <p className="text-xs text-gray-400 dark:text-gray-400 px-2 py-3 flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" />Loading…</p>
         ) : disabled ? (
-          <p className="text-xs text-gray-400 px-2 py-3">{emptyHint}</p>
+          <p className="text-xs text-gray-400 dark:text-gray-400 px-2 py-3">{emptyHint}</p>
         ) : items.length === 0 ? (
-          <p className="text-xs text-gray-400 px-2 py-3">No items found</p>
+          <p className="text-xs text-gray-400 dark:text-gray-400 px-2 py-3">No items found</p>
         ) : (
           <ul className="space-y-0.5">
             {items.map(name => (
@@ -69,7 +69,7 @@ function SelectorColumn({
                   className={`w-full text-left px-2.5 py-1.5 rounded-lg text-sm truncate transition-colors ${
                     name === selected
                       ? 'bg-primary-50 text-primary-700 font-medium'
-                      : 'text-gray-700 hover:bg-gray-50'
+                      : 'text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/40'
                   }`}
                   title={name}
                 >
@@ -85,13 +85,13 @@ function SelectorColumn({
 }
 
 function TopValuesCell({ topValues }: { topValues: TopValue[] }) {
-  if (!topValues || topValues.length === 0) return <span className="text-gray-400">—</span>
+  if (!topValues || topValues.length === 0) return <span className="text-gray-400 dark:text-gray-400">—</span>
   return (
     <ul className="space-y-0.5">
       {topValues.map((tv, i) => (
         <li key={i} className="flex items-center gap-1.5 text-xs">
-          <span className="font-mono text-gray-700 truncate max-w-[10rem]">{formatValue(tv.value)}</span>
-          <span className="text-gray-400">({tv.count.toLocaleString()})</span>
+          <span className="font-mono text-gray-700 dark:text-gray-200 truncate max-w-[10rem]">{formatValue(tv.value)}</span>
+          <span className="text-gray-400 dark:text-gray-400">({tv.count.toLocaleString()})</span>
         </li>
       ))}
     </ul>
@@ -102,8 +102,8 @@ function TopValuesCell({ topValues }: { topValues: TopValue[] }) {
 function MetaItem({ label, value, full = false }: { label: string; value: React.ReactNode; full?: boolean }) {
   return (
     <div className={`flex flex-col gap-0.5 pr-6 ${full ? 'basis-full pr-0' : ''}`}>
-      <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">{label}</span>
-      <span className="text-sm font-semibold text-gray-800 tabular-nums">{value}</span>
+      <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400 dark:text-gray-400">{label}</span>
+      <span className="text-sm font-semibold text-gray-800 dark:text-gray-200 tabular-nums">{value}</span>
     </div>
   )
 }
@@ -113,12 +113,12 @@ function TableMetaStrip({ info }: { info: {
   owner: string | null; comment: string | null;
 } }) {
   return (
-    <div className="flex flex-wrap gap-y-2 px-4 py-3 bg-gray-50 border border-gray-200 rounded-lg">
+    <div className="flex flex-wrap gap-y-2 px-4 py-3 bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg">
       <MetaItem label="Rows"  value={info.row_count != null ? info.row_count.toLocaleString() : '—'} />
       <MetaItem label="Size"  value={formatBytes(info.bytes)} />
       <MetaItem label="Type"  value={info.kind ?? '—'} />
       {info.owner && <MetaItem label="Owner" value={info.owner} />}
-      {info.comment && <MetaItem label="Comment" value={<span className="font-normal text-gray-600">{info.comment}</span>} full />}
+      {info.comment && <MetaItem label="Comment" value={<span className="font-normal text-gray-600 dark:text-gray-300">{info.comment}</span>} full />}
     </div>
   )
 }
@@ -143,9 +143,9 @@ function ProfileProgressBar({ tableName, columnCount }: { tableName: string; col
   }, [tableName, columnCount])
 
   return (
-    <div className="bg-white rounded-xl shadow p-5">
+    <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-5">
       <div className="flex items-center justify-between mb-2.5">
-        <span className="text-sm font-semibold text-gray-800 flex items-center gap-2">
+        <span className="text-sm font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
           <BarChart3 className="w-4 h-4 text-primary-600" />
           Profiling {tableName}
         </span>
@@ -154,7 +154,7 @@ function ProfileProgressBar({ tableName, columnCount }: { tableName: string; col
       <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
         <div className="h-full bg-primary-500 rounded-full transition-[width] duration-300 ease-linear" style={{ width: `${pct}%` }} />
       </div>
-      <p className="text-xs text-gray-400 mt-2">
+      <p className="text-xs text-gray-400 dark:text-gray-400 mt-2">
         Computing per-column stats — null %, distinct count, min/max, top values
         {columnCount ? ` across ${columnCount} columns` : ''}…
       </p>
@@ -208,7 +208,7 @@ const CATEGORY_TONE: Record<string, string> = {
   amount: 'bg-emerald-100 text-emerald-700', measure: 'bg-emerald-100 text-emerald-700',
   status: 'bg-purple-100 text-purple-700', categorical: 'bg-purple-100 text-purple-700',
   email: 'bg-blue-100 text-blue-700', phone: 'bg-blue-100 text-blue-700',
-  text: 'bg-gray-100 text-gray-600',
+  text: 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300',
 }
 
 // One table per category — showing only the stat columns relevant to it.
@@ -222,27 +222,27 @@ function CategoryStatsTable({ profile, category }: { profile: TableProfile; cate
   const label = profile.category_labels[category] ?? category
 
   return (
-    <div className="border border-gray-100 rounded-lg overflow-hidden">
-      <div className="flex items-center gap-2 px-4 py-2 bg-gray-50 border-b border-gray-100">
-        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${CATEGORY_TONE[category] ?? 'bg-gray-100 text-gray-600'}`}>{label}</span>
-        <span className="text-xs text-gray-400">{cols.length} column{cols.length !== 1 ? 's' : ''}</span>
+    <div className="border border-gray-100 dark:border-gray-700 rounded-lg overflow-hidden">
+      <div className="flex items-center gap-2 px-4 py-2 bg-gray-50 dark:bg-gray-900 border-b border-gray-100 dark:border-gray-700">
+        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${CATEGORY_TONE[category] ?? 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300'}`}>{label}</span>
+        <span className="text-xs text-gray-400 dark:text-gray-400">{cols.length} column{cols.length !== 1 ? 's' : ''}</span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
-            <tr className="text-left text-xs text-gray-500 uppercase tracking-wide border-b border-gray-100">
+            <tr className="text-left text-xs text-gray-500 dark:text-gray-300 uppercase tracking-wide border-b border-gray-100 dark:border-gray-700">
               <th className="px-4 py-2 font-medium">Column</th>
               <th className="px-3 py-2 font-medium">Type</th>
               {shown.map(sc => <th key={sc.key} className="px-3 py-2 font-medium">{sc.label}</th>)}
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-50">
+          <tbody className="divide-y divide-gray-50 dark:divide-gray-700/50">
             {cols.map(c => (
-              <tr key={c.column_name} className="hover:bg-gray-50 align-top">
-                <td className="px-4 py-2 font-medium text-gray-800">{c.column_name}</td>
-                <td className="px-3 py-2 text-gray-500 font-mono text-xs">{c.data_type}</td>
+              <tr key={c.column_name} className="hover:bg-gray-50 dark:hover:bg-gray-700/40 align-top">
+                <td className="px-4 py-2 font-medium text-gray-800 dark:text-gray-200">{c.column_name}</td>
+                <td className="px-3 py-2 text-gray-500 dark:text-gray-300 font-mono text-xs">{c.data_type}</td>
                 {shown.map(sc => (
-                  <td key={sc.key} className="px-3 py-2 text-gray-700">{sc.render(c)}</td>
+                  <td key={sc.key} className="px-3 py-2 text-gray-700 dark:text-gray-200">{sc.render(c)}</td>
                 ))}
               </tr>
             ))}
@@ -255,13 +255,13 @@ function CategoryStatsTable({ profile, category }: { profile: TableProfile; cate
 
 function ColumnStatsPanel({ tableName, profile }: { tableName: string; profile: TableProfile }) {
   return (
-    <div className="bg-white rounded-xl shadow overflow-hidden">
-      <div className="px-6 py-4 border-b border-gray-100 bg-primary-50/50">
+    <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
+      <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 bg-primary-50/50">
         <div className="flex items-center gap-2">
           <BarChart3 className="w-5 h-5 text-primary-600" />
-          <h2 className="text-base font-semibold text-gray-900">Column Statistics — {tableName}</h2>
+          <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Column Statistics — {tableName}</h2>
         </div>
-        <p className="text-xs text-gray-600 mt-1 flex items-center gap-1.5 flex-wrap">
+        <p className="text-xs text-gray-600 dark:text-gray-300 mt-1 flex items-center gap-1.5 flex-wrap">
           <Hash className="w-3 h-3" />
           {profile.table.row_count.toLocaleString()} rows · {profile.table.column_count} columns · grouped by inferred category
           {profile.table.is_sampled && (
@@ -379,8 +379,8 @@ export default function DataExplorer() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h1 className="text-3xl font-bold text-gray-900">Data Explorer</h1>
-        <p className="mt-1 text-gray-600">
+        <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Data Explorer</h1>
+        <p className="mt-1 text-gray-600 dark:text-gray-300">
           Browse Snowflake databases, inspect a table's columns, and profile its data — null %,
           distinct counts, ranges, and top values that rule checks alone can't reveal.
         </p>
@@ -388,11 +388,11 @@ export default function DataExplorer() {
 
       {/* Breadcrumb */}
       {selectedDatabase && (
-        <div className="flex items-center gap-1.5 text-sm text-gray-500 flex-wrap">
+        <div className="flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-300 flex-wrap">
           <Database className="w-3.5 h-3.5 text-primary-500" />
-          <span className="font-medium text-gray-700">{selectedDatabase}</span>
-          {selectedSchema && (<><ChevronRight className="w-3.5 h-3.5" /><span className="font-medium text-gray-700">{selectedSchema}</span></>)}
-          {selectedTable && (<><ChevronRight className="w-3.5 h-3.5" /><span className="font-medium text-gray-900">{selectedTable}</span></>)}
+          <span className="font-medium text-gray-700 dark:text-gray-200">{selectedDatabase}</span>
+          {selectedSchema && (<><ChevronRight className="w-3.5 h-3.5" /><span className="font-medium text-gray-700 dark:text-gray-200">{selectedSchema}</span></>)}
+          {selectedTable && (<><ChevronRight className="w-3.5 h-3.5" /><span className="font-medium text-gray-900 dark:text-gray-100">{selectedTable}</span></>)}
         </div>
       )}
 
@@ -439,12 +439,12 @@ export default function DataExplorer() {
 
       {/* Table overview: meta strip + columns table */}
       {selectedTable && (
-        <div className="bg-white rounded-xl shadow overflow-hidden">
-          <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
+          <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100 dark:border-gray-700">
             <div className="flex items-center gap-2 min-w-0">
               <Table2 className="w-4 h-4 text-primary-500 flex-shrink-0" />
-              <h2 className="text-sm font-semibold text-gray-800 truncate">{selectedTable}</h2>
-              {columns.length > 0 && <span className="text-xs text-gray-400">{columns.length} columns</span>}
+              <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200 truncate">{selectedTable}</h2>
+              {columns.length > 0 && <span className="text-xs text-gray-400 dark:text-gray-400">{columns.length} columns</span>}
             </div>
             <button
               onClick={() => profileMutation.mutate()}
@@ -461,12 +461,12 @@ export default function DataExplorer() {
             {tableInfo && <TableMetaStrip info={tableInfo} />}
 
             {loadingColumns ? (
-              <div className="py-8 text-sm text-gray-400 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />Loading columns…</div>
+              <div className="py-8 text-sm text-gray-400 dark:text-gray-400 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />Loading columns…</div>
             ) : (
               <div className="overflow-x-auto mt-4">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="text-left text-xs text-gray-500 uppercase tracking-wide border-b border-gray-100">
+                    <tr className="text-left text-xs text-gray-500 dark:text-gray-300 uppercase tracking-wide border-b border-gray-100 dark:border-gray-700">
                       <th className="py-2.5 pr-4 font-medium">Column</th>
                       <th className="py-2.5 px-4 font-medium">Data Type</th>
                       <th className="py-2.5 px-4 font-medium">Nullable</th>
@@ -474,15 +474,15 @@ export default function DataExplorer() {
                       <th className="py-2.5 px-4 font-medium">Comment</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-gray-50">
+                  <tbody className="divide-y divide-gray-50 dark:divide-gray-700/50">
                     {columns.map(c => (
-                      <tr key={c.column_name} className="hover:bg-gray-50">
-                        <td className="py-2.5 pr-4 font-medium text-gray-800">{c.column_name}</td>
-                        <td className="py-2.5 px-4 text-gray-500 font-mono text-xs">{c.data_type}</td>
+                      <tr key={c.column_name} className="hover:bg-gray-50 dark:hover:bg-gray-700/40">
+                        <td className="py-2.5 pr-4 font-medium text-gray-800 dark:text-gray-200">{c.column_name}</td>
+                        <td className="py-2.5 px-4 text-gray-500 dark:text-gray-300 font-mono text-xs">{c.data_type}</td>
                         <td className="py-2.5 px-4">
                           {c.is_nullable
-                            ? <span className="text-gray-400 text-xs">nullable</span>
-                            : <span className="text-gray-700 text-xs font-medium">NOT NULL</span>}
+                            ? <span className="text-gray-400 dark:text-gray-400 text-xs">nullable</span>
+                            : <span className="text-gray-700 dark:text-gray-200 text-xs font-medium">NOT NULL</span>}
                         </td>
                         <td className="py-2.5 px-4">
                           {c.primary_key ? (
@@ -493,7 +493,7 @@ export default function DataExplorer() {
                             <span className="text-gray-300">—</span>
                           )}
                         </td>
-                        <td className="py-2.5 px-4 text-gray-500 text-xs max-w-xs truncate" title={c.comment ?? ''}>
+                        <td className="py-2.5 px-4 text-gray-500 dark:text-gray-300 text-xs max-w-xs truncate" title={c.comment ?? ''}>
                           {c.comment || <span className="text-gray-300">—</span>}
                         </td>
                       </tr>
@@ -508,10 +508,10 @@ export default function DataExplorer() {
 
       {/* Empty state */}
       {!selectedTable && (
-        <div className="bg-white rounded-xl shadow p-12 text-center">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-12 text-center">
           <Database className="w-12 h-12 text-gray-200 mx-auto mb-3" />
-          <p className="text-gray-900 font-medium mb-1">Pick a table to explore</p>
-          <p className="text-sm text-gray-400">Select a database → schema → table above, then profile its data.</p>
+          <p className="text-gray-900 dark:text-gray-100 font-medium mb-1">Pick a table to explore</p>
+          <p className="text-sm text-gray-400 dark:text-gray-400">Select a database → schema → table above, then profile its data.</p>
         </div>
       )}
     </div>

@@ -397,7 +397,7 @@ def trigger_verification(
                 run2.status = AgentRunStatus.AWAITING_FIXES
                 db2.commit()
                 # Reschedule auto-verify for next cycle
-                schedule_auto_verify(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
+                schedule_auto_verify(run_id)
 
         except Exception as e:
             logger.error(f"Verification failed: {e}")
@@ -415,7 +415,7 @@ def trigger_verification(
             finally:
                 db3.close()
             # Reschedule even after failure
-            schedule_auto_verify(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
+            schedule_auto_verify(run_id)
             return
         finally:
             db2.close()

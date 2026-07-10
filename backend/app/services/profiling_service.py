@@ -108,18 +108,21 @@ def detect_category(
     if any(h in name for h in _STATUS_NAME_HINTS):
         return "status"
 
+    from app.services import settings_service
+    cat_threshold = settings_service.get_categorical_max_distinct()
+
     # Numeric: amount (by name) vs generic measure
     if _is(_NUMERIC_TYPE_PREFIXES):
         if any(h in name for h in _AMOUNT_NAME_HINTS):
             return "amount"
         # A numeric column with very few distinct values is really categorical
-        if distinct_count is not None and distinct_count <= 15:
+        if distinct_count is not None and distinct_count <= cat_threshold:
             return "categorical"
         return "measure"
 
     # Text: low cardinality → categorical, else free text
     if _is(_TEXT_TYPE_PREFIXES):
-        if distinct_count is not None and distinct_count <= 30:
+        if distinct_count is not None and distinct_count <= max(cat_threshold * 2, 30):
             return "categorical"
         return "text"
 
@@ -177,6 +180,10 @@ def profile_table(source: DataSource, database: str, schema: str, table: str) ->
     """
     logger.info(f"[Profiling] Full-dataset profiling {database}.{schema}.{table}")
 
+    from app.services import settings_service
+    top_values_cap = settings_service.get_top_values_max_distinct()
+    outlier_mult = settings_service.get_outlier_stddev_mult()
+
     columns = get_columns_with_pk(source, database, schema, table)
     column_profiles: List[Dict[str, Any]] = []
 
@@ -217,7 +224,7 @@ def profile_table(source: DataSource, database: str, schema: str, table: str) ->
                 if category in ("status", "categorical") or (
                     category == "text"
                     and distinct_count is not None
-                    and distinct_count <= TOP_VALUES_MAX_DISTINCT
+                    and distinct_count <= top_values_cap
                 ):
                     top_values = source.top_values(database, schema, table, column_name)
 
@@ -233,7 +240,7 @@ def profile_table(source: DataSource, database: str, schema: str, table: str) ->
             outlier_hint = None
             if agg["avg_value"] is not None and agg["stddev"]:
                 try:
-                    if abs(float(agg["max_value"]) - float(agg["avg_value"])) > 4 * float(agg["stddev"]):
+                    if abs(float(agg["max_value"]) - float(agg["avg_value"])) > outlier_mult * float(agg["stddev"]):
                         outlier_hint = True
                 except (TypeError, ValueError):
                     pass
