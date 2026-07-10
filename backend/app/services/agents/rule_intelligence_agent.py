@@ -184,6 +184,7 @@ class RuleIntelligenceAgent:
         column_assets: List[Any],
         existing_definitions: List[Any],
         run_id: str,
+        profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Returns a result dict with:
@@ -198,6 +199,10 @@ class RuleIntelligenceAgent:
           - suppressed: list of dicts describing candidates dropped due to
               fingerprint match against active/rejected instances — logged,
               never shown to the human as new.
+
+        When `profile` (from ProfilingAgent) is provided it is accepted for
+        interface compatibility; harsh's architecture derives its own column
+        statistics directly from the live data (see _fetch_column_stats).
         """
         logger.info(f"[RuleIntelligence] Analyzing {table_asset.fqn}")
 
@@ -240,8 +245,16 @@ class RuleIntelligenceAgent:
         raw = self._call_model(prompt)
         parsed = self._extract_json(raw)
 
+        # parse_warning surfaces to the UI (via the coordinator) so a truncated /
+        # unparseable response is visible instead of silently degrading to
+        # "0 AI rules, all rules kept active".
+        parse_warning = None
         if not parsed:
-            logger.warning("[RuleIntelligence] Empty JSON from Claude — using defaults")
+            parse_warning = (
+                f"LLM response unparseable ({len(raw or '')} chars) — kept all rules "
+                f"active, generated no AI rules. Likely a truncated or refused response."
+            )
+            logger.error(f"[RuleIntelligence] {parse_warning}")
             parsed = {}
 
         classification = {
@@ -249,6 +262,7 @@ class RuleIntelligenceAgent:
             "table_type_confidence": parsed.get("table_type_confidence", 50),
             "table_type_reason":     parsed.get("table_type_reason", ""),
             "definitions_evaluated": parsed.get("definitions_evaluated", {}),
+            "parse_warning":         parse_warning,
         }
 
         # Normalize: fill missing decisions with default (keep_running=True)
@@ -657,11 +671,13 @@ class RuleIntelligenceAgent:
         return "\n".join(lines)
 
     def _call_model(self, prompt: str) -> str:
-        try:
-            return sf_session.ask_cortex(prompt, model="claude-opus-4-8")
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] Cortex failed ({e}), using Claude/Bedrock")
-        return ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=4096)
+        # Call Bedrock (Opus 4.8) directly. We deliberately do NOT route through
+        # Snowflake Cortex here: the 2-arg CORTEX.COMPLETE has a low, unraisable
+        # output cap that truncates the large rule-classification response, and
+        # its single-quote-only escaping breaks on the prompt's JSON braces.
+        # ask_claude streams internally with a 32k ceiling, so the full response
+        # comes back intact.
+        return ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=32000)
 
     @staticmethod
     def _extract_json(text: str) -> dict:

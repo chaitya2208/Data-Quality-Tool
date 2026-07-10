@@ -54,13 +54,18 @@ class SnowflakeSession:
         }
         if settings.SNOWFLAKE_ROLE:
             params["role"] = settings.SNOWFLAKE_ROLE
-        if settings.SNOWFLAKE_DATABASE:
-            params["database"] = settings.SNOWFLAKE_DATABASE
+        # A blank SNOWFLAKE_DATABASE in .env overrides the config default with
+        # an empty string, which leaves the session with no current database —
+        # then storage.py's unqualified table names (ASSETS, RULES, ...) fail
+        # with "does not have a current database". Fall back to the default so
+        # the app boots even if .env has the key set empty.
+        database = settings.SNOWFLAKE_DATABASE or "PLAYGROUND_DB"
+        params["database"] = database
         # Default schema = app storage schema, so storage.py's unqualified
         # table names (ASSETS, RULES, ...) resolve without prefixing every
         # query. Source-table queries always use fully-qualified
         # database.schema.table names, so they're unaffected by this.
-        params["schema"] = settings.SNOWFLAKE_APP_SCHEMA
+        params["schema"] = settings.SNOWFLAKE_APP_SCHEMA or "DQ_APP"
 
         auth = getattr(settings, "SNOWFLAKE_AUTH_METHOD", "externalbrowser")
         if auth.lower() == "externalbrowser":

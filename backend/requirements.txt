@@ -8,6 +8,10 @@ pydantic-settings==2.1.0
 # scanning both go through this connector; no ORM layer.
 snowflake-connector-python==3.6.0
 
+# Postgres/RDS source adapter (multi-source connections) — psycopg v3.
+# App state lives in Snowflake; this is only for scanning Postgres sources.
+psycopg[binary]==3.1.18
+
 # Real SQL parser for validating any SQL that reaches an executable
 # RULE_INSTANCES.rule_sql (template-rendered or Claude-drafted) before it
 # ever runs against Snowflake — see app/services/sql_validation.py.

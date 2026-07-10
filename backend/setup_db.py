@@ -6,6 +6,8 @@ the app's Snowflake connection, in order. Every statement is idempotent
 """
 from pathlib import Path
 from app.services.snowflake_session import session as sf_session
+from app.services.rule_engine import initialize_default_rules
+from app.services.connection_seed import seed_default_connection
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -41,10 +43,25 @@ def _run_sql_file(path: Path) -> None:
 
 
 def setup_database():
-    """Create the app schema, all tables, and seed default rules."""
+    """Create the app schema, all tables, then seed default rules + connection."""
     sf_session.connect()
     for sql_file in sorted(SQL_DIR.glob("*.sql")):
+        # Skip throwaway dumps (e.g. _dq_app_dump.sql) — only run numbered DDL.
+        if sql_file.name.startswith("_"):
+            continue
         _run_sql_file(sql_file)
+
+    # Seed default rule definitions and the default Snowflake connection.
+    logger.info("Initializing default rules...")
+    try:
+        initialize_default_rules()
+        logger.info("Default rules initialized successfully")
+        seed_default_connection()
+        logger.info("Default connection seeded")
+    except Exception as e:
+        logger.error(f"Failed to seed defaults: {str(e)}")
+        raise
+
     logger.info("Database setup completed!")
 
 

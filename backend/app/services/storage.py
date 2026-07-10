@@ -236,6 +236,7 @@ def _scan_from_row(row: dict) -> SimpleNamespace:
     return SimpleNamespace(
         id=row["ID"],
         asset_id=row["ASSET_ID"],
+        connection_id=row.get("CONNECTION_ID"),
         scan_type=row["SCAN_TYPE"],
         status=row["STATUS"],
         started_at=row["STARTED_AT"],
@@ -254,16 +255,19 @@ def create_scan(
     scan_type: str = "metadata",
     status: str = "pending",
     started_at: Optional[datetime.datetime] = None,
+    connection_id: Optional[str] = None,
 ) -> SimpleNamespace:
     scan_id = _new_id()
     sf_session.execute(
         """
-        INSERT INTO SCANS (ID, ASSET_ID, SCAN_TYPE, STATUS, STARTED_AT)
-        VALUES (%(id)s, %(asset_id)s, %(scan_type)s, %(status)s, %(started_at)s)
+        INSERT INTO SCANS (ID, ASSET_ID, CONNECTION_ID, SCAN_TYPE, STATUS, STARTED_AT)
+        VALUES (%(id)s, %(asset_id)s, %(connection_id)s, %(scan_type)s, %(status)s,
+                %(started_at)s)
         """,
         {
             "id": scan_id,
             "asset_id": asset_id,
+            "connection_id": connection_id,
             "scan_type": scan_type,
             "status": status,
             "started_at": started_at,
@@ -1040,6 +1044,7 @@ def list_executions_for_instance(instance_id: str, limit: int = 50) -> list[Simp
 def _agent_run_from_row(row: dict, tasks: Optional[list] = None) -> SimpleNamespace:
     return SimpleNamespace(
         id=row["ID"],
+        connection_id=row.get("CONNECTION_ID"),
         batch_id=row["BATCH_ID"],
         batch_index=row["BATCH_INDEX"] or 0,
         database=row["DATABASE_NAME"],
@@ -1080,18 +1085,21 @@ def create_agent_run(
     batch_id: Optional[str] = None,
     batch_index: int = 0,
     run_id: Optional[str] = None,
+    connection_id: Optional[str] = None,
 ) -> SimpleNamespace:
     run_id = run_id or _new_id()
     sf_session.execute(
         """
         INSERT INTO AGENT_RUNS
-            (ID, BATCH_ID, BATCH_INDEX, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, STATUS)
+            (ID, CONNECTION_ID, BATCH_ID, BATCH_INDEX, DATABASE_NAME, SCHEMA_NAME,
+             TABLE_NAME, STATUS)
         VALUES
-            (%(id)s, %(batch_id)s, %(batch_index)s, %(database)s, %(schema_name)s,
-             %(table)s, %(status)s)
+            (%(id)s, %(connection_id)s, %(batch_id)s, %(batch_index)s, %(database)s,
+             %(schema_name)s, %(table)s, %(status)s)
         """,
         {
             "id": run_id,
+            "connection_id": connection_id,
             "batch_id": batch_id,
             "batch_index": batch_index,
             "database": database,
@@ -1275,4 +1283,157 @@ def increment_cache_hit(cache_key: str) -> None:
         WHERE CACHE_KEY = %(cache_key)s
         """,
         {"cache_key": cache_key},
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CONNECTIONS  (ported from old app/models/connection.py)
+# EXTRA is VARIANT. The "SCHEMA" column is reserved so it is quoted; it maps
+# to the .schema_ attribute (old ORM used Column("schema") -> attr schema_).
+# TYPE is stored as the lowercase enum value ("snowflake" / "postgres").
+# ─────────────────────────────────────────────────────────────────────────
+
+def _connection_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        name=row["NAME"],
+        type=row["TYPE"],
+        host=row.get("HOST"),
+        port=row.get("PORT"),
+        database=row.get("DATABASE"),
+        schema_=row.get("SCHEMA"),
+        username=row.get("USERNAME"),
+        secret=row.get("SECRET"),
+        auth_method=row.get("AUTH_METHOD"),
+        extra=_parse_json(row.get("EXTRA")) or {},
+        is_active=row.get("IS_ACTIVE"),
+        created_at=row["CREATED_AT"],
+        updated_at=row["UPDATED_AT"],
+    )
+
+
+def get_connection_record(connection_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM CONNECTIONS WHERE ID = %(id)s", {"id": connection_id})
+    return _connection_from_row(rows[0]) if rows else None
+
+
+def list_connections() -> list[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM CONNECTIONS ORDER BY CREATED_AT ASC")
+    return [_connection_from_row(r) for r in rows]
+
+
+def get_first_connection(prefer_type: Optional[str] = None) -> Optional[SimpleNamespace]:
+    """First connection, optionally preferring a type (used as a fallback when
+    no connection_id is supplied — mirrors the old registry fallback)."""
+    if prefer_type:
+        rows = sf_session.query(
+            "SELECT * FROM CONNECTIONS WHERE TYPE = %(t)s ORDER BY CREATED_AT ASC LIMIT 1",
+            {"t": prefer_type},
+        )
+        if rows:
+            return _connection_from_row(rows[0])
+    rows = sf_session.query("SELECT * FROM CONNECTIONS ORDER BY CREATED_AT ASC LIMIT 1")
+    return _connection_from_row(rows[0]) if rows else None
+
+
+def create_connection(
+    name: str,
+    type: str,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    database: Optional[str] = None,
+    schema_: Optional[str] = None,
+    username: Optional[str] = None,
+    secret: Optional[str] = None,
+    auth_method: Optional[str] = None,
+    extra: Optional[dict] = None,
+    is_active: bool = True,
+) -> SimpleNamespace:
+    connection_id = _new_id()
+    sf_session.execute(
+        """
+        INSERT INTO CONNECTIONS
+            (ID, NAME, TYPE, HOST, PORT, DATABASE, "SCHEMA", USERNAME, SECRET,
+             AUTH_METHOD, EXTRA, IS_ACTIVE)
+        SELECT
+            %(id)s, %(name)s, %(type)s, %(host)s, %(port)s, %(database)s,
+            %(schema_)s, %(username)s, %(secret)s, %(auth_method)s,
+            PARSE_JSON(%(extra)s), %(is_active)s
+        """,
+        {
+            "id": connection_id,
+            "name": name,
+            "type": type,
+            "host": host,
+            "port": port,
+            "database": database,
+            "schema_": schema_,
+            "username": username,
+            "secret": secret,
+            "auth_method": auth_method,
+            "extra": _json_or_null(extra),
+            "is_active": is_active,
+        },
+    )
+    return get_connection_record(connection_id)
+
+
+def update_connection(connection_id: str, **fields: Any) -> Optional[SimpleNamespace]:
+    """Partial update. Accepts schema_ (-> "SCHEMA" column) and extra (VARIANT)."""
+    col_map = {"schema_": '"SCHEMA"'}
+    json_cols = {"extra"}
+    sets, params = [], {"id": connection_id}
+    for key, value in fields.items():
+        col = col_map.get(key, key.upper())
+        if key in json_cols:
+            sets.append(f"{col} = PARSE_JSON(%({key})s)")
+            params[key] = _json_or_null(value)
+        else:
+            sets.append(f"{col} = %({key})s")
+            params[key] = value
+    if "updated_at" not in fields:
+        sets.append("UPDATED_AT = CURRENT_TIMESTAMP()")
+    if sets:
+        sf_session.execute(
+            f"UPDATE CONNECTIONS SET {', '.join(sets)} WHERE ID = %(id)s", params
+        )
+    return get_connection_record(connection_id)
+
+
+def delete_connection(connection_id: str) -> None:
+    sf_session.execute("DELETE FROM CONNECTIONS WHERE ID = %(id)s", {"id": connection_id})
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# APP_SETTINGS  (ported from old app/models/app_setting.py)
+# "KEY"/"VALUE" are reserved words -> quoted. VALUE is VARIANT (holds a
+# JSON-encoded scalar: int/float/bool/str).
+# ─────────────────────────────────────────────────────────────────────────
+
+def get_all_settings() -> dict[str, Any]:
+    """Returns {key: value} for every stored setting (values already parsed)."""
+    rows = sf_session.query('SELECT "KEY" AS K, "VALUE" AS V FROM APP_SETTINGS')
+    return {r["K"]: _parse_json(r.get("V")) for r in rows}
+
+
+def get_setting(key: str) -> Any:
+    rows = sf_session.query(
+        'SELECT "VALUE" AS V FROM APP_SETTINGS WHERE "KEY" = %(k)s', {"k": key}
+    )
+    return _parse_json(rows[0].get("V")) if rows else None
+
+
+def upsert_setting(key: str, value: Any) -> None:
+    """Insert or update one setting. VALUE is VARIANT so uses PARSE_JSON via a
+    MERGE (INSERT ... SELECT for the VARIANT bind, matching the storage
+    convention of never binding raw JSON into VALUES)."""
+    sf_session.execute(
+        """
+        MERGE INTO APP_SETTINGS t
+        USING (SELECT %(k)s AS K, PARSE_JSON(%(v)s) AS V) s
+        ON t."KEY" = s.K
+        WHEN MATCHED THEN UPDATE SET t."VALUE" = s.V, t.UPDATED_AT = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN INSERT ("KEY", "VALUE") VALUES (s.K, s.V)
+        """,
+        {"k": key, "v": _json_or_null(value)},
     )

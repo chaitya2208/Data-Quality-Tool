@@ -14,9 +14,11 @@ class MetadataAgent:
     def __init__(self):
         self.service = ScanService()
 
-    def run(self, database: str, schema: str, table: str) -> Tuple[Any, Any, List[Any]]:
+    def run(self, database: str, schema: str, table: str, connection_id: str = None) -> Tuple[Any, Any, List[Any]]:
         logger.info(f"[MetadataAgent] Starting for {database}.{schema}.{table}")
-        scan, table_asset, column_assets = self.service.scan_metadata_only(database, schema, table)
+        scan, table_asset, column_assets = self.service.scan_metadata_only(
+            database, schema, table, connection_id=connection_id
+        )
         logger.info(
             f"[MetadataAgent] Done — asset {table_asset.fqn}, {len(column_assets)} columns"
         )

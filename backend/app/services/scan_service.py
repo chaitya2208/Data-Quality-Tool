@@ -39,45 +39,24 @@ class ScanService:
         )
 
     def scan_metadata_only(
-        self, database: str, schema: str, table: str
+        self, database: str, schema: str, table: str, source=None, connection_id: str = None
     ) -> Tuple[Any, Any, List[Any]]:
         """
-        Fetch Snowflake metadata and create/update Asset rows WITHOUT running rules.
-        Used by the agent pipeline so MetadataAgent and RulesAgent stay separate.
-        Returns (scan, table_asset, column_assets) with scan in RUNNING status.
+        Fetch metadata via the resolved DataSource and create/update Asset rows
+        WITHOUT running rules. Used by the agent pipeline so MetadataAgent and
+        RulesAgent stay separate. Returns (scan, table_asset, column_assets) with
+        scan in RUNNING status.
         """
         logger.info(f"[MetadataAgent] Fetching metadata for {database}.{schema}.{table}")
 
-        show_rows = sf_session.query(
-            f"SHOW TABLES LIKE '{table}' IN {database}.{schema}"
-        )
-        table_metadata = next(
-            (r for r in show_rows if (r.get("name") or "").upper() == table.upper()),
-            {}
-        )
-        if not table_metadata:
-            raise ValueError(f"Table {database}.{schema}.{table} not found in Snowflake")
+        if source is None:
+            from app.services.datasources import get_source
+            source = get_source(connection_id)
 
-        info_rows = sf_session.query(f"""
-            SELECT last_altered as LAST_ALTERED
-            FROM {database}.INFORMATION_SCHEMA.TABLES
-            WHERE table_schema = '{schema}'
-            AND   table_name   = '{table}'
-        """)
-        info_row = info_rows[0] if info_rows else {}
-
-        columns = sf_session.query(f"""
-            SELECT column_name as COLUMN_NAME,
-                   ordinal_position as ORDINAL_POSITION,
-                   data_type as DATA_TYPE,
-                   is_nullable as IS_NULLABLE,
-                   column_default as COLUMN_DEFAULT,
-                   comment as COMMENT
-            FROM {database}.INFORMATION_SCHEMA.COLUMNS
-            WHERE table_schema = '{schema}'
-            AND table_name = '{table}'
-            ORDER BY ordinal_position
-        """)
+        info = source.table_info(database, schema, table)
+        columns = source.list_columns(database, schema, table)
+        if not columns:
+            raise ValueError(f"Table {database}.{schema}.{table} not found or has no columns")
 
         table_fqn = f"{database}.{schema}.{table}"
         table_asset = self.create_or_update_asset(
@@ -87,18 +66,19 @@ class ScanService:
             schema_name=schema,
             table_name=table,
             metadata={
-                "owner":           table_metadata.get("owner"),
-                "comment":         table_metadata.get("comment"),
-                "row_count":       table_metadata.get("rows"),
-                "size_bytes":      table_metadata.get("bytes"),
-                "created_at":      str(table_metadata.get("created_on", "")),
-                "last_altered_at": str(info_row.get("LAST_ALTERED", "")),
+                "owner":           info.get("owner"),
+                "comment":         info.get("comment"),
+                "row_count":       info.get("row_count"),
+                "size_bytes":      info.get("bytes"),
+                "created_at":      "",
+                "last_altered_at": "",
             }
         )
 
         # Create scan in RUNNING state (RulesAgent will complete it)
         scan = storage.create_scan(
             asset_id=table_asset.id,
+            connection_id=connection_id,
             scan_type="metadata",
             status="running",
             started_at=datetime.utcnow(),
@@ -106,19 +86,19 @@ class ScanService:
 
         column_assets = []
         for col in columns:
-            column_fqn = f"{table_fqn}.{col['COLUMN_NAME']}"
+            cname = col["column_name"]
+            column_fqn = f"{table_fqn}.{cname}"
             col_asset = self.create_or_update_asset(
                 fqn=column_fqn,
                 asset_type="column",
                 database_name=database,
                 schema_name=schema,
                 table_name=table,
-                column_name=col["COLUMN_NAME"],
+                column_name=cname,
                 metadata={
-                    "comment":           col.get("COMMENT"),
-                    "data_type":         col.get("DATA_TYPE"),
-                    "is_nullable":       col.get("IS_NULLABLE"),
-                    "ordinal_position":  col.get("ORDINAL_POSITION"),
+                    "comment":     col.get("comment"),
+                    "data_type":   col.get("data_type"),
+                    "is_nullable": "YES" if col.get("is_nullable") else "NO",
                 }
             )
             column_assets.append(col_asset)
