@@ -156,9 +156,23 @@ def _ensure_rule(
     severity: str,
     applies_to: List[str],
 ) -> Any:
-    """Return the rule for `code`, auto-creating it (as system/active) if missing."""
-    rule = storage.ensure_rule(code, name, description, category, severity, applies_to)
-    return rule
+    """Return the global instance for the python_handler definition keyed by
+    `code` (used as HANDLER_KEY, lowercased), auto-creating the definition +
+    its global instance if missing. Callers use the returned instance like
+    the old Rule object (.severity, .code via .handler_key)."""
+    handler_key = code.lower()
+    definition = storage.ensure_definition(handler_key, name, description, category, severity, applies_to)
+    instance = storage.get_instance_by_fingerprint(_hash(definition.id))
+    if instance is None:
+        instance = storage.ensure_global_instance(definition)
+    instance.code = code
+    instance.definition = definition
+    return instance
+
+
+def _hash(definition_id: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{definition_id}|global".encode("utf-8")).hexdigest()
 
 
 def _finding(
@@ -173,7 +187,7 @@ def _finding(
     return {
         "asset_id": asset_id,
         "scan_id": scan_id,
-        "rule_id": rule.id,
+        "instance_id": rule.id,
         "title": title,
         "description": description,
         "severity": rule.severity,

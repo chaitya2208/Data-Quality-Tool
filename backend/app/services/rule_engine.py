@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional, Set
 from app.services import storage
 from app.services.dynamic_rules import run_dynamic_checks
+from app.services.snowflake_session import session as sf_session
 import logging
 
 logger = logging.getLogger(__name__)
@@ -9,16 +10,45 @@ logger = logging.getLogger(__name__)
 class RuleEngine:
     """
     Rule engine that executes deterministic rules against assets.
-    Phase 0: Simple rule checks (naming, comments, ownership).
+    Dispatches on each active instance's definition.check_kind:
+      - python_handler: calls a Python function keyed by handler_key against
+        already-fetched metadata (no live query).
+      - sql_template: executes instance.rule_sql (already validated at
+        proposal time by RuleIntelligenceAgent) against Snowflake, expecting
+        exactly one row shaped (FAILED_COUNT, TOTAL_COUNT).
     """
+
+    _HANDLERS = {
+        "missing_table_comment": "_check_missing_table_comment",
+        "missing_table_owner": "_check_missing_table_owner",
+        "missing_column_comment": "_check_missing_column_comment",
+    }
 
     def __init__(self):
         pass
 
+    def get_active_instances(self, scope: str) -> List[Any]:
+        """Active instances with a given scope ('table' | 'column'), each
+        annotated with `.handler_key`/`.check_kind` from its definition and a
+        `.code` (HANDLER_KEY upper-cased) for legacy-shaped call sites."""
+        instances = storage.list_active_instances_for_scope(scope)
+        result = []
+        for inst in instances:
+            definition = storage.get_definition(inst.definition_id)
+            if not definition:
+                continue
+            inst.check_kind = definition.check_kind
+            inst.handler_key = definition.handler_key
+            inst.code = (definition.handler_key or "").upper()
+            inst.name = definition.name
+            inst.description = definition.description
+            inst.category = definition.category
+            result.append(inst)
+        return result
+
+    # Backward-shaped alias used by callers still passing a "code" set
     def get_active_rules(self, asset_type: str) -> List[Any]:
-        """Get all active rules that apply to the given asset type"""
-        rules = storage.list_active_rules_for_type(asset_type)
-        return [r for r in rules if asset_type in (r.applies_to or [])]
+        return self.get_active_instances(asset_type)
 
     def execute_rules(
         self,
@@ -27,24 +57,25 @@ class RuleEngine:
         allowed_rule_codes: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Execute static rules against a single asset.
-        If allowed_rule_codes is given, only runs rules in that set.
+        Execute python_handler instances against a single asset.
+        If allowed_rule_codes is given, only runs instances whose HANDLER_KEY
+        (upper-cased) is in that set.
         """
         findings = []
-        rules = self.get_active_rules(asset.asset_type)
+        instances = [i for i in self.get_active_instances(asset.asset_type) if i.check_kind == "python_handler"]
 
         if allowed_rule_codes is not None:
-            rules = [r for r in rules if r.code in allowed_rule_codes]
+            instances = [i for i in instances if i.code in allowed_rule_codes]
 
-        logger.info(f"Executing {len(rules)} static rules against asset {asset.fqn}")
+        logger.info(f"Executing {len(instances)} static instances against asset {asset.fqn}")
 
-        for rule in rules:
+        for instance in instances:
             try:
-                result = self._execute_rule(rule, asset, scan_id)
+                result = self._execute_instance(instance, asset, scan_id)
                 if result:
                     findings.append(result)
             except Exception as e:
-                logger.error(f"Error executing rule {rule.code} on asset {asset.fqn}: {str(e)}")
+                logger.error(f"Error executing instance {instance.code} on asset {asset.fqn}: {str(e)}")
 
         return findings
 
@@ -54,21 +85,25 @@ class RuleEngine:
         column_assets: List[Any],
         scan_id: str,
         allowed_rule_codes: Optional[Set[str]] = None,
+        allowed_instance_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Run static + dynamic rules. If allowed_rule_codes is provided, only
-        rules whose code is in that set will be executed (classifier filter).
+        Run static (python_handler) + dynamic + sql_template instances.
+        allowed_rule_codes filters python_handler instances by HANDLER_KEY
+        (upper-cased); allowed_instance_ids filters sql_template instances by
+        instance id directly, since Claude-authored checks have no stable
+        "code" the way static/dynamic ones do.
         """
         findings: List[Dict[str, Any]] = []
 
-        # Static rules on the table
+        # Static instances on the table
         findings.extend(self.execute_rules(table_asset, scan_id, allowed_rule_codes))
 
-        # Static rules on each column
+        # Static instances on each column
         for col_asset in column_assets:
             findings.extend(self.execute_rules(col_asset, scan_id, allowed_rule_codes))
 
-        # Dynamic pattern-based rules
+        # Dynamic pattern-based checks
         try:
             dynamic = run_dynamic_checks(
                 table_asset, column_assets, scan_id,
@@ -81,27 +116,102 @@ class RuleEngine:
         except Exception as e:
             logger.error(f"Dynamic rule check failed for {table_asset.fqn}: {e}")
 
+        # SQL-template instances (Claude-authored, real executable SQL) —
+        # scoped to this table regardless of column/table target shape,
+        # since the SQL itself already encodes the target.
+        if allowed_instance_ids:
+            findings.extend(
+                self.execute_sql_instances(table_asset, scan_id, allowed_instance_ids)
+            )
+
         return findings
 
-    def _execute_rule(self, rule: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Execute a single rule against an asset.
-        Returns a finding dict if rule is violated, None otherwise.
-        """
-        rule_handlers = {
-            "MISSING_TABLE_COMMENT": self._check_missing_table_comment,
-            "MISSING_TABLE_OWNER": self._check_missing_table_owner,
-            "MISSING_COLUMN_COMMENT": self._check_missing_column_comment,
-        }
+    def execute_sql_instances(
+        self, table_asset: Any, scan_id: str, allowed_instance_ids: Set[str],
+    ) -> List[Dict[str, Any]]:
+        """Run every active sql_template instance in allowed_instance_ids
+        that belongs to this table (global '*'-scoped sql_template instances
+        aren't a thing today, but the check is harmless if that changes)."""
+        findings: List[Dict[str, Any]] = []
+        for instance_id in allowed_instance_ids:
+            instance = storage.get_instance(instance_id)
+            if not instance:
+                continue
+            definition = storage.get_definition(instance.definition_id)
+            if not definition or definition.check_kind != "sql_template":
+                continue
+            if instance.database_name not in (table_asset.database_name, "*"):
+                continue
+            try:
+                result = self._execute_sql_instance(instance, definition, table_asset, scan_id)
+                if result:
+                    findings.append(result)
+            except Exception as e:
+                logger.error(f"Error executing sql_template instance {instance.id}: {e}")
+        return findings
 
-        handler = rule_handlers.get(rule.code)
-        if not handler:
-            logger.warning(f"No handler found for rule code: {rule.code}")
+    def _execute_sql_instance(
+        self, instance: Any, definition: Any, table_asset: Any, scan_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not instance.rule_sql:
+            logger.warning(f"sql_template instance {instance.id} has no rule_sql")
+            return None
+        rows = sf_session.query(instance.rule_sql)
+        if not rows:
+            return None
+        row = rows[0]
+        failed = row.get("FAILED_COUNT")
+        total = row.get("TOTAL_COUNT")
+        if failed is None or total is None:
+            logger.warning(f"sql_template instance {instance.id} SQL did not return FAILED_COUNT/TOTAL_COUNT")
+            return None
+        if int(failed) <= 0:
             return None
 
-        return handler(rule, asset, scan_id)
+        column_name = (instance.target_config or {}).get("column", "")
+        asset = table_asset
+        if column_name:
+            col_fqn = f"{table_asset.fqn}.{column_name}"
+            asset = storage.get_asset_by_fqn(col_fqn) or table_asset
 
-    def _check_missing_table_comment(self, rule: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
+        return {
+            "asset_id": asset.id,
+            "scan_id": scan_id,
+            "instance_id": instance.id,
+            "title": f"{definition.name} violated on {asset.fqn.split('.')[-1]}",
+            "description": f"{failed} of {total} rows fail this check. {definition.description}",
+            "severity": instance.severity,
+            "status": "detected",
+            "context": {
+                "rule_code": definition.name,
+                "fqn": asset.fqn,
+                "table_name": table_asset.table_name,
+                "schema_name": table_asset.schema_name,
+                "database_name": table_asset.database_name,
+                "column_name": column_name,
+                "ai_generated": True,
+            },
+            "evidence": {"failed_count": int(failed), "total_count": int(total)},
+        }
+
+    def _execute_instance(self, instance: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Execute a single python_handler instance against an asset.
+        Returns a finding dict if violated, None otherwise.
+        """
+        if instance.check_kind != "python_handler":
+            logger.warning(f"Instance {instance.id} has unsupported check_kind: {instance.check_kind}")
+            return None
+
+        method_name = self._HANDLERS.get(instance.handler_key)
+        if not method_name:
+            logger.warning(f"No handler found for handler_key: {instance.handler_key}")
+            return None
+
+        handler = getattr(self, method_name)
+        return handler(instance, asset, scan_id)
+
+    def _check_missing_table_comment(self, instance: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
         """Check if table has a comment/description"""
         if asset.asset_type != "table":
             return None
@@ -110,18 +220,18 @@ class RuleEngine:
             return {
                 "asset_id": asset.id,
                 "scan_id": scan_id,
-                "rule_id": rule.id,
+                "instance_id": instance.id,
                 "title": f"Table {asset.table_name} is missing a comment",
                 "description": f"The table {asset.fqn} does not have a description/comment. "
                               f"All tables should be documented with meaningful comments.",
-                "severity": rule.severity,
+                "severity": instance.severity,
                 "status": "detected",
                 "context": {
                     "database_name": asset.database_name,
                     "schema_name": asset.schema_name,
                     "table_name": asset.table_name,
                     "fqn": asset.fqn,
-                    "rule_code": rule.code,
+                    "rule_code": instance.code,
                 },
                 "evidence": {
                     "current_comment": asset.comment,
@@ -129,7 +239,7 @@ class RuleEngine:
             }
         return None
 
-    def _check_missing_table_owner(self, rule: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
+    def _check_missing_table_owner(self, instance: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
         if asset.asset_type != "table":
             return None
 
@@ -137,18 +247,18 @@ class RuleEngine:
             return {
                 "asset_id": asset.id,
                 "scan_id": scan_id,
-                "rule_id": rule.id,
+                "instance_id": instance.id,
                 "title": f"Table {asset.table_name} is missing an owner",
                 "description": f"The table {asset.fqn} does not have an assigned owner. "
                               f"All tables should have a designated owner for accountability.",
-                "severity": rule.severity,
+                "severity": instance.severity,
                 "status": "detected",
                 "context": {
                     "database_name": asset.database_name,
                     "schema_name": asset.schema_name,
                     "table_name": asset.table_name,
                     "fqn": asset.fqn,
-                    "rule_code": rule.code,
+                    "rule_code": instance.code,
                 },
                 "evidence": {
                     "current_owner": asset.owner,
@@ -156,7 +266,7 @@ class RuleEngine:
             }
         return None
 
-    def _check_missing_column_comment(self, rule: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
+    def _check_missing_column_comment(self, instance: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
         if asset.asset_type != "column":
             return None
 
@@ -164,11 +274,11 @@ class RuleEngine:
             return {
                 "asset_id": asset.id,
                 "scan_id": scan_id,
-                "rule_id": rule.id,
+                "instance_id": instance.id,
                 "title": f"Column {asset.column_name} is missing a comment",
                 "description": f"The column {asset.fqn} does not have a description/comment. "
                               f"All columns should be documented with meaningful comments.",
-                "severity": rule.severity,
+                "severity": instance.severity,
                 "status": "detected",
                 "context": {
                     "database_name": asset.database_name,
@@ -176,7 +286,7 @@ class RuleEngine:
                     "column_name": asset.column_name,
                     "table_name": asset.table_name,
                     "fqn": asset.fqn,
-                    "rule_code": rule.code,
+                    "rule_code": instance.code,
                 },
                 "evidence": {
                     "current_comment": asset.comment,
@@ -266,6 +376,6 @@ def initialize_default_rules() -> None:
     ]
 
     for code, name, description, category, severity, applies_to in default_rules:
-        storage.ensure_rule(code, name, description, category, severity, applies_to)
+        storage.ensure_definition(code.lower(), name, description, category, severity, applies_to)
 
     logger.info("Default rules initialized")

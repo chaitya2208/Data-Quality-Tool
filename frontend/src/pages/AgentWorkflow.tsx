@@ -288,11 +288,12 @@ export default function AgentWorkflow() {
   const [activeRunId,      setActiveRunId]       = usePersistedId('dq_active_run_id')
   const [activeBatchId,    setActiveBatchId]     = usePersistedId('dq_active_batch_id')
   const [collapsed,        setCollapsed]         = useState(false)
-  // Local editable copy of rule review state — initialized from server on pause
+  // Local editable copy of instance review state — initialized from server on pause
   const [reviewActive,  setReviewActive]  = useState<RuleReviewEntry[]>([])
   const [reviewSkipped, setReviewSkipped] = useState<RuleReviewEntry[]>([])
-  const [editingRule,   setEditingRule]   = useState<string | null>(null) // rule code being edited
+  const [editingRule,   setEditingRule]   = useState<string | null>(null) // instance_id being edited
   const [editForm,      setEditForm]      = useState<Partial<RuleReviewEntry>>({})
+  const [selectedIds,   setSelectedIds]   = useState<Set<string>>(new Set())
 
   const { data: databases } = useQuery({
     queryKey: ['databases'],
@@ -375,6 +376,11 @@ export default function AgentWorkflow() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['agent-run', activeRunId] }),
   })
 
+  // Bulk actions operate on local review state only (same as single-item
+  // reject/activate) — they're persisted together on "Run Pipeline", not
+  // sent to the server immediately. This avoids clobbering any unsaved
+  // single-item edits with a server round-trip.
+
   const runPipelineMutation = useMutation({
     mutationFn: () => agentRunsApi.runPipeline(activeRunId!),
     onSuccess: () => {
@@ -384,8 +390,8 @@ export default function AgentWorkflow() {
     },
   })
 
-  // Sync server rule_review_state → local editable state when run enters review
-  const serverReviewState = activeRun?.rule_review_state
+  // Sync server instance_review_state → local editable state when run enters review
+  const serverReviewState = activeRun?.instance_review_state
   // Only initialize local state once when we first enter review mode
   const [reviewInitialized, setReviewInitialized] = useState(false)
   if (isReviewing && serverReviewState && !reviewInitialized) {
@@ -397,29 +403,55 @@ export default function AgentWorkflow() {
     setReviewInitialized(false)
   }
 
-  // Move a rule from active → skipped
-  const rejectRule = (code: string) => {
-    const rule = reviewActive.find(r => r.code === code)
+  // Move an instance from active → skipped
+  const rejectRule = (instanceId: string) => {
+    const rule = reviewActive.find(r => r.instance_id === instanceId)
     if (!rule) return
-    setReviewActive(prev => prev.filter(r => r.code !== code))
+    setReviewActive(prev => prev.filter(r => r.instance_id !== instanceId))
     setReviewSkipped(prev => [...prev, { ...rule, reason: rule.reason || 'Rejected by user' }])
+    setSelectedIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
   }
 
-  // Move a rule from skipped → active
-  const activateRule = (code: string) => {
-    const rule = reviewSkipped.find(r => r.code === code)
+  // Move an instance from skipped → active
+  const activateRule = (instanceId: string) => {
+    const rule = reviewSkipped.find(r => r.instance_id === instanceId)
     if (!rule) return
-    setReviewSkipped(prev => prev.filter(r => r.code !== code))
+    setReviewSkipped(prev => prev.filter(r => r.instance_id !== instanceId))
     setReviewActive(prev => [...prev, rule])
   }
 
-  // Save edits to an AI rule
-  const saveEdit = (code: string) => {
+  // Save edits to a new instance/definition
+  const saveEdit = (instanceId: string) => {
     setReviewActive(prev => prev.map(r =>
-      r.code === code ? { ...r, ...editForm } : r
+      r.instance_id === instanceId ? { ...r, ...editForm } : r
     ))
     setEditingRule(null)
     setEditForm({})
+  }
+
+  const toggleSelected = (instanceId: string) => {
+    setSelectedIds(prev => {
+      const n = new Set(prev)
+      if (n.has(instanceId)) n.delete(instanceId)
+      else n.add(instanceId)
+      return n
+    })
+  }
+
+  const bulkReject = (ids: Set<string>) => {
+    const toMove = reviewActive.filter(r => ids.has(r.instance_id))
+    if (toMove.length === 0) return
+    setReviewActive(prev => prev.filter(r => !ids.has(r.instance_id)))
+    setReviewSkipped(prev => [...prev, ...toMove.map(r => ({ ...r, reason: r.reason || 'Bulk-rejected by user' }))])
+    setSelectedIds(new Set())
+  }
+
+  const bulkApprove = (ids: Set<string>) => {
+    const toMove = reviewSkipped.filter(r => ids.has(r.instance_id))
+    if (toMove.length === 0) return
+    setReviewSkipped(prev => prev.filter(r => !ids.has(r.instance_id)))
+    setReviewActive(prev => [...prev, ...toMove])
+    setSelectedIds(new Set())
   }
 
   const getTask = (name: string): AgentTask | undefined =>
@@ -751,11 +783,11 @@ export default function AgentWorkflow() {
               <div>
                 <h2 className="text-base font-semibold text-purple-900 flex items-center gap-2">
                   <BrainCircuit className="w-5 h-5 text-purple-600" />
-                  Review Rules Before Running
+                  Review Instances Before Running
                 </h2>
                 <p className="text-xs text-purple-700 mt-0.5">
-                  Claude has selected {reviewActive.length} active rules and skipped {reviewSkipped.length}.
-                  Reject rules to skip them, activate skipped ones, or edit AI-generated rules. Then click Run Pipeline.
+                  Claude kept {reviewActive.length} active and skipped {reviewSkipped.length}.
+                  Reject to skip, activate skipped ones, edit new instances, or select several and use bulk actions. Then click Run Pipeline.
                 </p>
               </div>
               <button
@@ -770,32 +802,55 @@ export default function AgentWorkflow() {
               >
                 {(saveReviewMutation.isPending || runPipelineMutation.isPending)
                   ? <><Loader2 className="w-4 h-4 animate-spin" />Starting...</>
-                  : <><Play className="w-4 h-4" />Run Pipeline ({reviewActive.length} rules)</>
+                  : <><Play className="w-4 h-4" />Run Pipeline ({reviewActive.length} instances)</>
                 }
               </button>
             </div>
+            {selectedIds.size > 0 && (
+              <div className="mt-3 flex items-center gap-2 bg-white border border-purple-200 rounded-lg px-3 py-2">
+                <span className="text-xs font-medium text-purple-800">{selectedIds.size} selected</span>
+                <button
+                  onClick={() => bulkApprove(selectedIds)}
+                  className="ml-auto flex items-center gap-1 text-xs px-2.5 py-1 bg-green-600 text-white rounded hover:bg-green-700"
+                >
+                  <CheckCircle2 className="w-3 h-3" />Approve Selected
+                </button>
+                <button
+                  onClick={() => bulkReject(selectedIds)}
+                  className="flex items-center gap-1 text-xs px-2.5 py-1 bg-red-600 text-white rounded hover:bg-red-700"
+                >
+                  <AlertTriangle className="w-3 h-3" />Reject Selected
+                </button>
+                <button
+                  onClick={() => setSelectedIds(new Set())}
+                  className="text-xs px-2 py-1 text-purple-500 hover:text-purple-800"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100">
-            {/* Active Rules column */}
+            {/* Active Instances column */}
             <div className="p-5">
               <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
-                Active Rules ({reviewActive.length})
+                Active Instances ({reviewActive.length})
               </h3>
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewActive.map(rule => (
-                  <div key={rule.code} className={`rounded-lg border p-3 text-sm ${
-                    rule.is_ai_generated ? 'border-purple-200 bg-purple-50/40' : 'border-gray-200 bg-white'
+                  <div key={rule.instance_id} className={`rounded-lg border p-3 text-sm ${
+                    rule.is_new_instance ? 'border-purple-200 bg-purple-50/40' : 'border-gray-200 bg-white'
                   }`}>
-                    {editingRule === rule.code ? (
-                      /* Edit form for AI rules */
+                    {editingRule === rule.instance_id ? (
+                      /* Edit form for new instances */
                       <div className="space-y-2">
                         <input
                           value={editForm.name ?? rule.name}
                           onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))}
                           className="w-full px-2 py-1 border border-gray-300 rounded text-xs font-medium"
-                          placeholder="Rule name"
+                          placeholder="Instance name"
                         />
                         <textarea
                           value={editForm.description ?? rule.description}
@@ -814,7 +869,7 @@ export default function AgentWorkflow() {
                           ))}
                         </select>
                         <div className="flex gap-2">
-                          <button onClick={() => saveEdit(rule.code)}
+                          <button onClick={() => saveEdit(rule.instance_id)}
                             className="flex-1 px-2 py-1 bg-purple-600 text-white rounded text-xs font-medium hover:bg-purple-700">
                             Save
                           </button>
@@ -826,11 +881,20 @@ export default function AgentWorkflow() {
                       </div>
                     ) : (
                       <div className="flex items-start justify-between gap-2">
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(rule.instance_id)}
+                          onChange={() => toggleSelected(rule.instance_id)}
+                          className="mt-1 flex-shrink-0"
+                        />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
-                            <span className="font-mono text-xs font-bold text-gray-700">{rule.code}</span>
-                            {rule.is_ai_generated && (
-                              <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-medium">AI</span>
+                            {rule.is_new_definition ? (
+                              <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-medium">New concept</span>
+                            ) : rule.is_new_instance ? (
+                              <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-medium">Reused check, new target</span>
+                            ) : (
+                              <span className="text-xs bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded font-medium">Existing check</span>
                             )}
                             {rule.violated && (
                               <span className="text-xs bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">⚠ violated</span>
@@ -845,7 +909,8 @@ export default function AgentWorkflow() {
                               <span className="text-xs text-gray-400 line-through">{rule.original_severity}</span>
                             )}
                           </div>
-                          <p className="text-xs text-gray-600 truncate">{rule.name}</p>
+                          <p className="text-xs font-semibold text-gray-700 truncate">{rule.name}</p>
+                          <p className="text-xs text-gray-600 truncate">{rule.description}</p>
                           {rule.reason && (
                             <p className="text-xs text-gray-400 mt-0.5 truncate" title={rule.reason}>
                               {rule.reason}
@@ -853,19 +918,19 @@ export default function AgentWorkflow() {
                           )}
                         </div>
                         <div className="flex gap-1 flex-shrink-0">
-                          {rule.is_ai_generated && (
+                          {rule.is_new_instance && (
                             <button
-                              onClick={() => { setEditingRule(rule.code); setEditForm({}) }}
+                              onClick={() => { setEditingRule(rule.instance_id); setEditForm({}) }}
                               className="text-xs px-1.5 py-1 text-purple-600 border border-purple-200 rounded hover:bg-purple-50"
-                              title="Edit this AI rule"
+                              title="Edit this new instance"
                             >
                               Edit
                             </button>
                           )}
                           <button
-                            onClick={() => rejectRule(rule.code)}
+                            onClick={() => rejectRule(rule.instance_id)}
                             className="text-xs px-1.5 py-1 text-red-600 border border-red-200 rounded hover:bg-red-50"
-                            title="Skip this rule"
+                            title="Skip this instance"
                           >
                             Skip
                           </button>
@@ -875,29 +940,32 @@ export default function AgentWorkflow() {
                   </div>
                 ))}
                 {reviewActive.length === 0 && (
-                  <p className="text-xs text-gray-400 text-center py-4">No active rules — activate some from the Skipped column.</p>
+                  <p className="text-xs text-gray-400 text-center py-4">No active instances — activate some from the Skipped column.</p>
                 )}
               </div>
             </div>
 
-            {/* Skipped Rules column */}
+            {/* Skipped Instances column */}
             <div className="p-5">
               <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />
-                Skipped Rules ({reviewSkipped.length})
+                Skipped Instances ({reviewSkipped.length})
               </h3>
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewSkipped.map(rule => (
-                  <div key={rule.code} className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm opacity-75">
+                  <div key={rule.instance_id} className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm opacity-75">
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
-                          <span className="font-mono text-xs font-bold text-gray-500">{rule.code}</span>
-                          {rule.is_ai_generated && (
-                            <span className="text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded font-medium">AI</span>
+                          {rule.is_new_definition ? (
+                            <span className="text-xs bg-purple-200 text-purple-700 px-1.5 py-0.5 rounded font-medium">New concept</span>
+                          ) : rule.is_new_instance ? (
+                            <span className="text-xs bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded font-medium">Reused check, new target</span>
+                          ) : (
+                            <span className="text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded font-medium">Existing check</span>
                           )}
                         </div>
-                        <p className="text-xs text-gray-500 truncate">{rule.name}</p>
+                        <p className="text-xs font-medium text-gray-600 truncate">{rule.name}</p>
                         {rule.reason && (
                           <p className="text-xs text-gray-400 mt-0.5 truncate" title={rule.reason}>
                             {rule.reason}
@@ -905,9 +973,9 @@ export default function AgentWorkflow() {
                         )}
                       </div>
                       <button
-                        onClick={() => activateRule(rule.code)}
+                        onClick={() => activateRule(rule.instance_id)}
                         className="flex-shrink-0 text-xs px-1.5 py-1 text-green-600 border border-green-200 rounded hover:bg-green-50"
-                        title="Activate this rule"
+                        title="Activate this instance"
                       >
                         Activate
                       </button>
@@ -915,7 +983,7 @@ export default function AgentWorkflow() {
                   </div>
                 ))}
                 {reviewSkipped.length === 0 && (
-                  <p className="text-xs text-gray-400 text-center py-4">No skipped rules.</p>
+                  <p className="text-xs text-gray-400 text-center py-4">No skipped instances.</p>
                 )}
               </div>
             </div>
@@ -935,78 +1003,40 @@ export default function AgentWorkflow() {
           </div>
           <p className="text-sm text-gray-600 mb-4">{intelOutput.table_type_reason}</p>
 
-          <div className="grid grid-cols-2 gap-6">
-            {/* Rules used */}
-            {intelOutput.existing_rules_selected > 0 && (
-              <div>
-                <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">
-                  Rules Used ({intelOutput.existing_rules_selected})
-                </h3>
-                <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                  {Object.entries(intelOutput.selected_with_overrides || {}).map(([code, info]: [string, any]) => (
-                    <div key={code} className="flex items-start gap-2 text-xs">
-                      <span className="text-green-500 mt-0.5 flex-shrink-0">✓</span>
-                      <div>
-                        <span className="font-mono font-medium text-gray-800">{code}</span>
-                        {info.severity_override && (
-                          <span className="ml-1 text-amber-600 font-medium">→ {info.severity_override}</span>
-                        )}
-                        {info.reason && <p className="text-gray-500 mt-0.5">{info.reason}</p>}
-                      </div>
-                    </div>
-                  ))}
-                  {/* Show remaining selected without overrides as a count */}
-                  {intelOutput.existing_rules_selected - Object.keys(intelOutput.selected_with_overrides || {}).length > 0 && (
-                    <p className="text-xs text-gray-400 mt-1">
-                      + {intelOutput.existing_rules_selected - Object.keys(intelOutput.selected_with_overrides || {}).length} more rules applied without changes
-                    </p>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Rules skipped */}
-            {Object.keys(intelOutput.skipped || {}).length > 0 && (
-              <div>
-                <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">
-                  Rules Skipped ({intelOutput.existing_rules_skipped})
-                </h3>
-                <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                  {Object.entries(intelOutput.skipped || {}).map(([code, reason]: [string, any]) => (
-                    <div key={code} className="flex items-start gap-2 text-xs">
-                      <span className="text-gray-300 mt-0.5 flex-shrink-0">–</span>
-                      <div>
-                        <span className="font-mono font-medium text-gray-500">{code}</span>
-                        {reason && <p className="text-gray-400 mt-0.5">{reason}</p>}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+          <div className="grid grid-cols-3 gap-6">
+            <div className="text-center">
+              <p className="text-2xl font-bold text-gray-900">{intelOutput.existing_instances_evaluated}</p>
+              <p className="text-xs text-gray-500">Existing checks evaluated</p>
+            </div>
+            <div className="text-center">
+              <p className="text-2xl font-bold text-purple-600 flex items-center justify-center gap-1">
+                <Sparkles className="w-5 h-5" />{intelOutput.new_instances_proposed}
+              </p>
+              <p className="text-xs text-gray-500">New instances proposed</p>
+            </div>
+            <div className="text-center">
+              <p className="text-2xl font-bold text-gray-400">{intelOutput.suppressed_duplicates?.length ?? 0}</p>
+              <p className="text-xs text-gray-500">Duplicates suppressed</p>
+            </div>
           </div>
 
-          {/* AI rules generated */}
-          {intelOutput.ai_rules && intelOutput.ai_rules.length > 0 && (
+          {/* Suppressed duplicates — this is the memory/dedup gap made visible */}
+          {intelOutput.suppressed_duplicates && intelOutput.suppressed_duplicates.length > 0 && (
             <div className="mt-4 pt-4 border-t border-gray-100">
-              <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2 flex items-center gap-1">
-                <Sparkles className="w-3.5 h-3.5 text-purple-500" />
-                AI Rules Generated ({intelOutput.ai_rules.length})
+              <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">
+                Suppressed as duplicates ({intelOutput.suppressed_duplicates.length})
               </h3>
               <div className="flex flex-wrap gap-2">
-                {intelOutput.ai_rules.map((r: any) => (
-                  <span key={r.code}
-                    className={`text-xs px-2 py-1 rounded-full font-medium border ${
-                      r.violated
-                        ? 'bg-orange-50 border-orange-300 text-orange-800'
-                        : 'bg-gray-50 border-gray-200 text-gray-600'
-                    }`}>
-                    {r.violated ? '⚠ ' : '✓ '}{r.code}
+                {intelOutput.suppressed_duplicates.map((s: any, i: number) => (
+                  <span key={i}
+                    className="text-xs px-2 py-1 rounded-full font-medium border bg-gray-50 border-gray-200 text-gray-500"
+                    title={`fingerprint ${s.fingerprint}`}>
+                    {s.reason.replace(/_/g, ' ')}
                   </span>
                 ))}
               </div>
               <p className="text-xs text-gray-400 mt-2">
-                Orange = violation detected · Gray = rule generated, no current violation
+                Claude proposed these again, but they already match an active, pending, or rejected check for this exact target.
               </p>
             </div>
           )}

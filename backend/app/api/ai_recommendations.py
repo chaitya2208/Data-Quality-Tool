@@ -56,7 +56,7 @@ def _call_claude_for_finding(finding: Any, rule_code: str, context: dict):
         )
 
     # ── Cache miss: call Cortex (with live schema) → fallback Claude ──────────
-    rule = storage.get_rule(finding.rule_id) if finding.rule_id else None
+    rule = storage.get_rule_view(finding.instance_id) if finding.instance_id else None
     result = ask_for_recommendation(
         rule_code=rule_code,
         rule_description=rule.description if rule else "",

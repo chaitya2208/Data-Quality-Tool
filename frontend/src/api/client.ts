@@ -239,17 +239,19 @@ export interface AgentTask {
 }
 
 export interface RuleReviewEntry {
-  code: string;
+  instance_id: string;
+  definition_id: string;
   name: string;
   description: string;
   severity: string;
   original_severity: string;
   reason: string;
-  is_ai_generated: boolean;
-  category: string;
-  applies_to: string[];
+  is_new_instance: boolean;
+  is_new_definition: boolean;
+  scope: string;
+  target_config: Record<string, any>;
   violated: boolean;
-  ai_violation_evidence: string;
+  violation_evidence: string;
 }
 
 export interface AgentRun {
@@ -265,7 +267,7 @@ export interface AgentRun {
   completed_at: string | null;
   findings_count: number;
   ai_rules_count: number;
-  rule_review_state: { active: RuleReviewEntry[]; skipped: RuleReviewEntry[] } | null;
+  instance_review_state: { active: RuleReviewEntry[]; skipped: RuleReviewEntry[] } | null;
   error_message: string | null;
   created_at: string;
   tasks: AgentTask[];
@@ -297,6 +299,10 @@ export const agentRunsApi = {
     api.get<{ total: number; runs: AgentRun[] }>('/agent/runs'),
   reviewRules: (id: string, data: { active: RuleReviewEntry[]; skipped: RuleReviewEntry[] }) =>
     api.post<AgentRun>(`/agent/runs/${id}/review-rules`, data),
+  bulkApprove: (id: string, instanceIds: string[]) =>
+    api.post<AgentRun>(`/agent/runs/${id}/review-rules/bulk-approve`, { instance_ids: instanceIds }),
+  bulkReject: (id: string, instanceIds: string[], reason?: string) =>
+    api.post<AgentRun>(`/agent/runs/${id}/review-rules/bulk-reject`, { instance_ids: instanceIds, reason }),
   runPipeline: (id: string) =>
     api.post(`/agent/runs/${id}/run-pipeline`),
   verify: (id: string) =>

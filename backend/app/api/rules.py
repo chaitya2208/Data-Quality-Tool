@@ -21,8 +21,8 @@ MEANINGFUL_FIELDS = {"name", "description", "category", "severity",
 
 @router.get("/stats")
 def get_rule_stats():
-    """Aggregate rule counts by category and severity."""
-    rules = storage.list_all_rules()
+    """Aggregate rule counts by category and severity (view over RULE_INSTANCES)."""
+    _, rules = storage.list_rules_view(limit=5000)
 
     by_category: dict = defaultdict(int)
     by_severity: dict = defaultdict(int)
@@ -39,7 +39,7 @@ def get_rule_stats():
     return {
         "total":       len(rules),
         "active":      active,
-        "pending":     by_status.get("pending", 0) + by_status.get("pending", 0),
+        "pending":     by_status.get("pending", 0),
         "by_category": dict(by_category),
         "by_severity": dict(by_severity),
         "by_status":   dict(by_status),
@@ -57,7 +57,7 @@ def list_rules(
     skip: int = 0,
     limit: int = 500,
 ):
-    total, rules = storage.list_rules(
+    total, rules = storage.list_rules_view(
         category=category, severity=severity, status=status,
         is_active=is_active, skip=skip, limit=limit,
     )
@@ -68,7 +68,7 @@ def list_rules(
 
 @router.get("/{rule_id}", response_model=RuleResponse)
 def get_rule(rule_id: str):
-    rule = storage.get_rule(rule_id)
+    rule = storage.get_rule_view(rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
     return rule
@@ -78,29 +78,65 @@ def get_rule(rule_id: str):
 
 @router.post("", response_model=RuleResponse, status_code=201)
 def create_rule(rule_data: RuleCreate):
-    existing = storage.get_rule_by_code(rule_data.code)
+    existing = storage.get_definition_by_handler_key(rule_data.code.lower())
     if existing:
         raise HTTPException(status_code=400,
                             detail=f"Rule with code '{rule_data.code}' already exists")
 
-    data = rule_data.model_dump()
-    # New user-created rules start PENDING and inactive until approved
-    data["status"]    = "pending"
-    data["is_active"] = False
-    data["version"]   = 1
+    definition = storage.create_definition(
+        name=rule_data.name,
+        category=rule_data.category,
+        description=rule_data.description,
+        check_kind="python_handler",
+        handler_key=rule_data.code.lower(),
+        default_severity=rule_data.severity,
+        allowed_scopes=rule_data.applies_to,
+        source="user",
+        status="proposed",
+        owner=rule_data.owner,
+        created_by=rule_data.created_by,
+    )
+    scope = "table" if "table" in rule_data.applies_to else "column"
+    fingerprint = _global_fingerprint(definition.id)
+    instance = storage.create_instance(
+        definition_id=definition.id,
+        scope=scope,
+        database_name="*",
+        fingerprint=fingerprint,
+        severity=rule_data.severity,
+        target_config={},
+        status="pending",
+        is_active=False,
+        jira_ticket=rule_data.jira_ticket,
+        owner=rule_data.owner,
+        created_by=rule_data.created_by,
+    )
+    return storage.get_rule_view(instance.id)
 
-    return storage.create_rule(**data)
+
+def _global_fingerprint(definition_id: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{definition_id}|global".encode("utf-8")).hexdigest()
 
 
 # ── Update ────────────────────────────────────────────────────────────────────
 
 @router.patch("/{rule_id}", response_model=RuleResponse)
 def update_rule(rule_id: str, update_data: RuleUpdate):
-    rule = storage.get_rule(rule_id)
-    if not rule:
+    instance = storage.get_instance(rule_id)
+    if not instance:
         raise HTTPException(status_code=404, detail="Rule not found")
 
     update_dict = update_data.model_dump(exclude_unset=True)
+
+    definition_fields = {}
+    for f in ("name", "description", "category"):
+        if f in update_dict:
+            definition_fields[f] = update_dict.pop(f)
+    if "applies_to" in update_dict:
+        update_dict.pop("applies_to")  # allowed_scopes lives on the definition, rarely edited post-creation
+    if "rule_config" in update_dict:
+        update_dict.pop("rule_config")  # derived field on the rule view, not stored directly on the instance
 
     # Sync is_active with status if status is being changed
     if "status" in update_dict:
@@ -114,28 +150,37 @@ def update_rule(rule_id: str, update_data: RuleUpdate):
     if "is_active" in update_dict and "status" not in update_dict:
         update_dict["status"] = "active" if update_dict["is_active"] else "disabled"
 
-    # Bump version on meaningful changes
-    if MEANINGFUL_FIELDS & update_dict.keys():
-        update_dict["version"] = (rule.version or 1) + 1
+    if definition_fields:
+        storage.update_definition(instance.definition_id, **definition_fields)
 
-    return storage.update_rule(rule_id, **update_dict)
+    if update_dict:
+        # Bump version on meaningful changes
+        if MEANINGFUL_FIELDS & (update_dict.keys() | definition_fields.keys()):
+            update_dict["version"] = (instance.version or 1) + 1
+        storage.update_instance(rule_id, **update_dict)
+    elif definition_fields and (MEANINGFUL_FIELDS & definition_fields.keys()):
+        storage.update_instance(rule_id, version=(instance.version or 1) + 1)
+
+    return storage.get_rule_view(rule_id)
 
 
 # ── Approve ───────────────────────────────────────────────────────────────────
 
 @router.post("/{rule_id}/approve", response_model=RuleResponse)
 def approve_rule(rule_id: str):
-    """Approve a pending rule — makes it active and starts running on scans."""
-    rule = storage.get_rule(rule_id)
-    if not rule:
+    """Approve a pending rule instance — makes it active and starts running on scans."""
+    instance = storage.get_instance(rule_id)
+    if not instance:
         raise HTTPException(status_code=404, detail="Rule not found")
-    if rule.status != "pending":
+    if instance.status != "pending":
         raise HTTPException(status_code=400,
-                            detail=f"Only PENDING rules can be approved (current: {rule.status})")
+                            detail=f"Only PENDING rules can be approved (current: {instance.status})")
 
-    return storage.update_rule(
-        rule_id, status="active", is_active=True, approved_at=datetime.utcnow(),
-    )
+    storage.approve_instance(rule_id)
+    definition = storage.get_definition(instance.definition_id)
+    if definition and definition.status == "proposed":
+        storage.update_definition(definition.id, status="active")
+    return storage.get_rule_view(rule_id)
 
 
 # ── Reject ────────────────────────────────────────────────────────────────────
@@ -145,18 +190,16 @@ class RejectRequest(BaseModel):
 
 @router.post("/{rule_id}/reject", response_model=RuleResponse)
 def reject_rule(rule_id: str, body: RejectRequest):
-    """Reject a pending rule with a reason."""
-    rule = storage.get_rule(rule_id)
-    if not rule:
+    """Reject a pending rule instance with a reason."""
+    instance = storage.get_instance(rule_id)
+    if not instance:
         raise HTTPException(status_code=404, detail="Rule not found")
-    if rule.status != "pending":
+    if instance.status != "pending":
         raise HTTPException(status_code=400,
-                            detail=f"Only PENDING rules can be rejected (current: {rule.status})")
+                            detail=f"Only PENDING rules can be rejected (current: {instance.status})")
 
-    return storage.update_rule(
-        rule_id, status="rejected", is_active=False,
-        rejection_reason=body.reason, rejected_at=datetime.utcnow(),
-    )
+    storage.reject_instance(rule_id, body.reason)
+    return storage.get_rule_view(rule_id)
 
 
 # ── Generate rule from natural language prompt ───────────────────────────────
@@ -228,7 +271,8 @@ def _find_similar_rule(name: str, description: str, threshold: float = 0.55):
     combined = f"{name} {description}"
     best_score = 0.0
     best_rule = None
-    for rule in storage.list_all_rules():
+    _, rules = storage.list_rules_view(limit=5000)
+    for rule in rules:
         rule_text = f"{rule.name} {rule.description or ''}"
         score = _word_overlap_score(combined, rule_text)
         if score > best_score:
@@ -249,7 +293,7 @@ def generate_rule_from_prompt(request: GenerateRuleRequest):
 
     # Give Claude the full name + description of all existing rules so it can
     # detect semantic duplicates regardless of language/phrasing
-    existing_rules = storage.list_all_rules()
+    _, existing_rules = storage.list_rules_view(limit=5000)
     existing_details = "\n".join(
         f"  - {r.code}: {r.name} — {(r.description or '')[:100]}"
         for r in existing_rules
@@ -303,11 +347,11 @@ Convert this requirement into a data quality rule. Respond with JSON only."""
     # ── Similarity check: catch semantic duplicates Claude may have missed ────
     parsed["duplicate_of"] = None
 
-    # 1. Exact code match
-    exact = storage.get_rule_by_code(parsed["code"])
-    if exact:
-        parsed["duplicate_of"] = {"code": exact.code, "name": exact.name}
-        logger.info(f"[RuleGenerate] Exact code duplicate detected: {exact.code}")
+    # 1. Exact code match (code == HANDLER_KEY upper-cased)
+    exact_def = storage.get_definition_by_handler_key(parsed["code"].lower())
+    if exact_def:
+        parsed["duplicate_of"] = {"code": parsed["code"], "name": exact_def.name}
+        logger.info(f"[RuleGenerate] Exact code duplicate detected: {parsed['code']}")
     else:
         # 2. Word-overlap similarity check
         similar = _find_similar_rule(parsed["name"], parsed["description"])

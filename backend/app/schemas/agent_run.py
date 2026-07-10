@@ -52,7 +52,7 @@ class AgentRunResponse(BaseModel):
     completed_at: Optional[datetime] = None
     findings_count: int = 0
     ai_rules_count: int = 0
-    rule_review_state: Optional[Dict[str, Any]] = None
+    instance_review_state: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
     created_at: datetime
     tasks: List[AgentTaskResponse] = []
@@ -62,24 +62,32 @@ class AgentRunResponse(BaseModel):
 
 
 class RuleReviewEntry(BaseModel):
-    """A single rule entry in the review state (active or skipped)."""
-    code: str
+    """A single instance entry in the review state (active or skipped)."""
+    instance_id: str
+    definition_id: str
     name: str
     description: str
     severity: str
     original_severity: str = ""
     reason: str = ""
-    is_ai_generated: bool = False
-    category: str = "data_quality"
-    applies_to: List[str] = []
+    is_new_instance: bool = False
+    is_new_definition: bool = False
+    scope: str = "table"
+    target_config: Dict[str, Any] = {}
     violated: bool = False
-    ai_violation_evidence: str = ""
+    violation_evidence: str = ""
 
 
 class RuleReviewRequest(BaseModel):
     """Payload for POST /runs/{id}/review-rules."""
     active: List[RuleReviewEntry]
     skipped: List[RuleReviewEntry]
+
+
+class BulkInstanceActionRequest(BaseModel):
+    """Payload for POST /runs/{id}/review-rules/bulk-approve|bulk-reject."""
+    instance_ids: List[str]
+    reason: Optional[str] = None  # used by bulk-reject
 
 
 class AgentRunListResponse(BaseModel):
@@ -98,12 +106,12 @@ class AgentBatchResponse(BaseModel):
 
 
 class AgentRuleSuggestion(BaseModel):
-    rule_id: str
-    code: str
+    instance_id: str
+    definition_id: str
     name: str
     description: str
     category: str
     severity: str
-    applies_to: List[str]
+    scope: str
     rationale: str
-    rule_status: str  # actual status: pending / active / rejected / disabled
+    instance_status: str  # pending / active / rejected / disabled

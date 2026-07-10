@@ -54,10 +54,24 @@ class VerificationAgent:
         rule_engine = RuleEngine()
         still_firing: Set[Tuple[str, str]] = set()  # (rule_code, asset_fqn)
 
+        # Active sql_template instances for this table — without this,
+        # Claude-authored checks would silently stop being re-verified after
+        # their first findings pass (the exact one-time-opinion bug this was
+        # meant to fix).
+        _, active_instances = storage.list_instances(
+            database_name=table_asset.database_name,
+            schema_name=table_asset.schema_name,
+            table_name=table_asset.table_name,
+            status="active",
+            limit=1000,
+        )
+        active_instance_ids = {i.id for i in active_instances}
+
         try:
             # Use a sentinel scan_id so we don't create new Finding rows
             findings_data = rule_engine.execute_all_rules(
-                table_asset, column_assets, scan_id="__verification__"
+                table_asset, column_assets, scan_id="__verification__",
+                allowed_instance_ids=active_instance_ids,
             )
             for fd in findings_data:
                 ctx = fd.get("context") or {}
@@ -82,6 +96,7 @@ class VerificationAgent:
         newly_resolved = 0
         already_resolved = 0
         still_open = 0
+        logged_instance_ids: Set[str] = set()
 
         for finding in all_findings:
             if finding.status in CLOSED_STATUSES:
@@ -94,7 +109,20 @@ class VerificationAgent:
             asset = storage.get_asset(finding.asset_id)
             asset_fqn = asset.fqn if asset else ctx.get("fqn", "")
 
-            if (rule_code, asset_fqn) not in still_firing:
+            still_firing_now = (rule_code, asset_fqn) in still_firing
+
+            # Log one RULE_EXECUTIONS row per instance re-checked this pass
+            # (skip duplicates if multiple findings share the same instance).
+            if finding.instance_id and finding.instance_id not in logged_instance_ids:
+                storage.create_execution(
+                    instance_id=finding.instance_id,
+                    status="failed" if still_firing_now else "passed",
+                    run_id=run.id,
+                    evidence={"source": "verification_agent"},
+                )
+                logged_instance_ids.add(finding.instance_id)
+
+            if not still_firing_now:
                 # Rule no longer fires → issue is resolved
                 storage.update_finding(
                     finding.id,

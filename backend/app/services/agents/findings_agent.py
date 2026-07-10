@@ -1,18 +1,24 @@
 """
-Findings Agent — runs selected existing rules + AI rule violations into Finding rows.
+Findings Agent — runs every approved instance (python_handler, dynamic, and
+sql_template alike) through RuleEngine and persists all findings, logging
+one RULE_EXECUTIONS row per instance evaluated.
+
+sql_template instances (Claude-authored checks with real, validated SQL) are
+executed live here exactly like the built-in checks — there is no separate
+"AI violation" one-time path anymore. A Claude-authored check is re-run on
+every findings pass and every verification pass, same as any other rule.
 
 Receives:
   - scan: Scan (from MetadataAgent)
   - table_asset, column_assets: from MetadataAgent
-  - classification: from RuleIntelligenceAgent (which rules to run, severity overrides)
-  - ai_violations: finding dicts for violated AI rules (from RuleIntelligenceAgent)
-  - ai_rules: Rule objects created by RuleIntelligenceAgent
+  - allowed_instance_ids: the approved RULE_INSTANCES ids to run
+  - severity_overrides: {instance_id: severity} for human/Claude edits
 
 Returns: List[Finding] — all persisted findings for this run.
 """
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Optional
 
 from app.services import storage
 from app.services.rule_engine import RuleEngine
@@ -22,8 +28,8 @@ logger = logging.getLogger(__name__)
 
 class FindingsAgent:
     """
-    Executes selected existing rules (with severity overrides) and
-    persists all findings including AI rule violations.
+    Executes every approved instance (with severity overrides) and persists
+    all resulting findings. Logs a RULE_EXECUTIONS row per instance run.
     """
 
     def __init__(self):
@@ -34,54 +40,89 @@ class FindingsAgent:
         scan: Any,
         table_asset: Any,
         column_assets: List[Any],
-        classification: dict,
-        ai_violations: List[Dict[str, Any]],
-        intelligence_agent,  # RuleIntelligenceAgent instance for severity helpers
-        allowed_codes: set = None,  # if provided, overrides classification selection
+        allowed_instance_ids: Set[str],
+        severity_overrides: Optional[Dict[str, str]] = None,
+        run_id: Optional[str] = None,
     ) -> List[Any]:
+        severity_overrides = severity_overrides or {}
 
-        # Use explicit allowed_codes if provided (post-review), else use classification
-        selected_codes: Set[str] = allowed_codes if allowed_codes is not None else intelligence_agent.get_selected_codes(classification)
-        skipped_codes:  Set[str] = intelligence_agent.get_skipped_codes(classification) if allowed_codes is None else set()
+        allowed_codes = self._resolve_handler_codes(allowed_instance_ids)
 
         logger.info(
-            f"[FindingsAgent] Running {len(selected_codes)} selected rules + "
-            f"{len(ai_violations)} AI violations on {table_asset.fqn}"
+            f"[FindingsAgent] Running {len(allowed_instance_ids)} approved instances on {table_asset.fqn}"
         )
 
-        # Apply severity overrides temporarily
-        intelligence_agent.apply_severity_overrides(classification)
+        self._apply_severity_overrides(severity_overrides)
 
-        # Run existing rules (filtered to selected)
         findings_data = self.rule_engine.execute_all_rules(
             table_asset, column_assets, scan.id,
-            allowed_rule_codes=selected_codes if selected_codes else None,
+            allowed_rule_codes=allowed_codes if allowed_codes else None,
+            allowed_instance_ids=allowed_instance_ids,
         )
 
-        # Restore overrides
-        intelligence_agent.restore_severity_overrides(classification)
+        self._restore_severity_overrides(severity_overrides)
 
-        # Add AI rule violations
-        for vf in ai_violations:
-            vf["scan_id"] = scan.id  # fill scan_id now that we have it
-            findings_data.append(vf)
+        # Log RULE_EXECUTIONS for every instance that actually ran
+        self._log_executions(findings_data, allowed_instance_ids, scan.id, run_id)
 
         # Persist all findings
         storage.create_findings_bulk(findings_data)
 
-        # Complete the scan
         storage.update_scan(
             scan.id,
-            rules_checked=len(selected_codes) + len(ai_violations),
+            rules_checked=len(allowed_instance_ids),
             findings_count=len(findings_data),
             status="completed",
             completed_at=datetime.utcnow(),
         )
 
         findings = storage.list_findings_by_scan(scan.id)
-        logger.info(
-            f"[FindingsAgent] Done — {len(findings)} findings "
-            f"({len(findings) - len(ai_violations)} from existing rules, "
-            f"{len(ai_violations)} from AI rules)"
-        )
+        logger.info(f"[FindingsAgent] Done — {len(findings)} findings")
         return findings
+
+    def _resolve_handler_codes(self, instance_ids: Set[str]) -> Set[str]:
+        codes = set()
+        for instance_id in instance_ids:
+            instance = storage.get_instance(instance_id)
+            if not instance:
+                continue
+            definition = storage.get_definition(instance.definition_id)
+            if definition and definition.check_kind == "python_handler" and definition.handler_key:
+                codes.add(definition.handler_key.upper())
+        return codes
+
+    def _apply_severity_overrides(self, overrides: Dict[str, str]) -> None:
+        self._severity_backup = {}
+        for instance_id, severity in overrides.items():
+            instance = storage.get_instance(instance_id)
+            if instance:
+                self._severity_backup[instance_id] = instance.severity
+                storage.update_instance(instance_id, severity=severity)
+
+    def _restore_severity_overrides(self, overrides: Dict[str, str]) -> None:
+        for instance_id, original in getattr(self, "_severity_backup", {}).items():
+            storage.update_instance(instance_id, severity=original)
+        self._severity_backup = {}
+
+    def _log_executions(
+        self, findings_data: List[dict], allowed_instance_ids: Set[str],
+        scan_id: str, run_id: Optional[str],
+    ) -> None:
+        """One RULE_EXECUTIONS row per instance that ran (python_handler or
+        sql_template): FAILED if it produced at least one finding, PASSED
+        otherwise."""
+        failed_ids = {fd.get("instance_id") for fd in findings_data if fd.get("instance_id")}
+        for instance_id in allowed_instance_ids:
+            instance = storage.get_instance(instance_id)
+            if not instance:
+                continue
+            definition = storage.get_definition(instance.definition_id)
+            if not definition or definition.check_kind not in ("python_handler", "sql_template"):
+                continue  # not actually executed this pass
+            if definition.check_kind == "python_handler" and not definition.handler_key:
+                continue
+            status = "failed" if instance_id in failed_ids else "passed"
+            storage.create_execution(
+                instance_id=instance_id, status=status,
+                scan_id=scan_id, run_id=run_id,
+            )

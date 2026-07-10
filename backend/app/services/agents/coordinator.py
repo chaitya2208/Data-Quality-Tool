@@ -122,11 +122,11 @@ class WorkflowCoordinator:
         def _run_rules_fetch():
             try:
                 from app.services.agents.rules_fetch_agent import RulesFetchAgent
-                rules = RulesFetchAgent().run()
-                rules_result["rule_codes"] = [r.code for r in rules]
+                definitions = RulesFetchAgent().run()
+                rules_result["rule_codes"] = [d.id for d in definitions]
                 self._complete_task(rules_task, output={
-                    "rules_loaded": len(rules),
-                    "rule_codes": rules_result["rule_codes"],
+                    "definitions_loaded": len(definitions),
+                    "definition_ids": rules_result["rule_codes"],
                 })
             except Exception as e:
                 rules_result["error"] = str(e)
@@ -148,147 +148,154 @@ class WorkflowCoordinator:
         table_asset   = storage.get_asset(meta_result["table_asset_id"])
         column_assets = [storage.get_asset(cid) for cid in meta_result["column_ids"]]
 
-        # Re-fetch rules (or load all active if fetch failed)
-        if rules_result["rule_codes"]:
-            existing_rules = [storage.get_rule_by_code(c) for c in rules_result["rule_codes"]]
-            existing_rules = [r for r in existing_rules if r]
+        # Re-fetch the definition library (or load all active if fetch failed)
+        if rules_result["rule_codes"] is not None:
+            existing_definitions = [storage.get_definition(d_id) for d_id in rules_result["rule_codes"]]
+            existing_definitions = [d for d in existing_definitions if d]
         else:
             if rules_result["error"]:
-                logger.warning(f"[Coordinator] Rules fetch failed: {rules_result['error']}, loading all active rules")
-            from app.services.rule_engine import RuleEngine
-            engine = RuleEngine()
-            seen, existing_rules = set(), []
-            for r in engine.get_active_rules("table") + engine.get_active_rules("column"):
-                if r.code not in seen:
-                    seen.add(r.code)
-                    existing_rules.append(r)
+                logger.warning(f"[Coordinator] Rules fetch failed: {rules_result['error']}, loading all active definitions")
+            _, existing_definitions = storage.list_definitions(status="active", limit=1000)
 
         # ── Rule Intelligence Agent ───────────────────────────────────────────
         intel_task = self._get_task("rule_intelligence_agent")
         self._start_task(intel_task)
         intel_result = None
-        agent = None
         try:
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent()
-            intel_result = agent.run(table_asset, column_assets, existing_rules, run.id)
+            intel_result = agent.run(table_asset, column_assets, existing_definitions, run.id)
 
-            classification = intel_result["classification"]
-            ai_rules       = intel_result["ai_rules"]
-            ai_violations  = intel_result["ai_violations"]
-
-            storage.update_agent_run(self.run_id, ai_rules_count=len(ai_rules))
-
-            # Build readable output for UI log
-            selected = agent.get_selected_codes(classification)
-            skipped  = agent.get_skipped_codes(classification)
-            existing_rules_raw = classification.get("existing_rules", {})
+            classification       = intel_result["classification"]
+            proposed_instances   = intel_result["proposed_instances"]
+            suppressed           = intel_result["suppressed"]
 
             self._complete_task(intel_task, output={
                 "table_type":            classification["table_type"],
                 "table_type_confidence": classification["table_type_confidence"],
                 "table_type_reason":     classification["table_type_reason"],
-                "existing_rules_selected": len(selected),
-                "existing_rules_skipped":  len(skipped),
-                "ai_rules_generated":    len(ai_rules),
-                "ai_violations_found":   len(ai_violations),
-                "skipped": {
-                    code: existing_rules_raw.get(code, {}).get("reason", "")
-                    for code in skipped
-                },
-                "selected_with_overrides": {
-                    code: {
-                        "severity_override": existing_rules_raw.get(code, {}).get("severity_override"),
-                        "reason": existing_rules_raw.get(code, {}).get("reason", ""),
-                    }
-                    for code in selected
-                    if existing_rules_raw.get(code, {}).get("severity_override")
-                },
-                "ai_rules": [
-                    {
-                        "code":     r.code,
-                        "name":     r.name,
-                        "violated": any(
-                            v.get("context", {}).get("rule_code") == r.code
-                            for v in ai_violations
-                        ),
-                    }
-                    for r in ai_rules
+                "existing_instances_evaluated": len(intel_result["existing_instances"]),
+                "new_instances_proposed": len(proposed_instances),
+                "suppressed_duplicates": [
+                    {"reason": s["reason"], "fingerprint": s["fingerprint"][:12]}
+                    for s in suppressed
                 ],
             })
         except Exception as e:
             logger.error(f"[Coordinator] RuleIntelligenceAgent failed: {e}")
             self._fail_task(intel_task, str(e))
-            # Non-fatal — run all existing rules with no AI enhancement
             intel_result = {
-                "classification": {"table_type": "unknown", "existing_rules": {}},
-                "ai_rules":       [],
-                "ai_violations":  [],
+                "classification": {"table_type": "unknown", "definitions_evaluated": {}},
+                "existing_instances": [],
+                "proposed_instances": [],
+                "suppressed": [],
             }
-            from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
-            agent = RuleIntelligenceAgent()
 
-        # ── PAUSE: build initial rule_review_state and wait for user review ─────
-        classification     = intel_result["classification"]
-        ai_rules           = intel_result["ai_rules"]
-        ai_violations      = intel_result["ai_violations"]
-        existing_rules_raw = classification.get("existing_rules", {})
+        # ── PAUSE: persist proposals as PENDING, build instance_review_state ────
+        classification      = intel_result["classification"]
+        existing_instances   = intel_result["existing_instances"]
+        proposed_instances   = intel_result["proposed_instances"]
 
-        # Build initial review state from Claude's decisions
-        active_rules = []
-        skipped_rules = []
+        active_entries = []
+        skipped_entries = []
 
-        # Existing rules
-        for rule in existing_rules:
-            decision = existing_rules_raw.get(rule.code, {})
+        # Existing instances — keep_running decision only, never re-approved
+        for inst in existing_instances:
+            decision = classification.get("definitions_evaluated", {}).get(inst.definition_id, {})
+            definition = storage.get_definition(inst.definition_id)
             entry = {
-                "code":             rule.code,
-                "name":             rule.name,
-                "description":      rule.description,
-                "severity":         decision.get("severity_override") or rule.severity,
-                "original_severity": rule.severity,
-                "reason":           decision.get("reason", ""),
-                "is_ai_generated":  False,
-                "category":         rule.category,
-                "applies_to":       rule.applies_to or [],
+                "instance_id":       inst.id,
+                "definition_id":     inst.definition_id,
+                "name":              definition.name if definition else inst.definition_id,
+                "description":       definition.description if definition else "",
+                "severity":          decision.get("severity_override") or inst.severity,
+                "original_severity": inst.severity,
+                "reason":            decision.get("reason", ""),
+                "is_new_instance":   False,
+                "is_new_definition": False,
+                "scope":             inst.scope,
+                "target_config":     inst.target_config,
             }
-            if decision.get("run", True):
-                active_rules.append(entry)
+            if decision.get("keep_running", True):
+                active_entries.append(entry)
             else:
-                skipped_rules.append(entry)
+                skipped_entries.append(entry)
 
-        # AI-generated rules (all start in active by default)
-        for ai_rule in ai_rules:
-            violated = any(
-                v.get("context", {}).get("rule_code") == ai_rule.code
-                for v in ai_violations
+        # Newly proposed instances — persist as PENDING (never auto-active),
+        # new definitions persist as PROPOSED (never auto-active either).
+        # This is the explicit approval gate: nothing here runs until a
+        # human approves it via review-rules + run-pipeline.
+        for proposal in proposed_instances:
+            if proposal["kind"] == "new":
+                nd = proposal["new_definition_data"] or {}
+                category = nd.get("category") if nd.get("category") in {
+                    "naming", "documentation", "ownership", "schema", "data_quality", "security", "performance"
+                } else "data_quality"
+                # rule_sql is always set for a "new" proposal (_process_candidate
+                # discards any candidate that doesn't resolve to validated,
+                # executable SQL) — check_kind is always sql_template here,
+                # never python_handler, since we have no Python function to
+                # bind to a Claude-authored concept.
+                definition = storage.create_definition(
+                    name=nd.get("name", "Untitled Check"),
+                    category=category,
+                    description=nd.get("description", ""),
+                    check_kind="sql_template",
+                    sql_template=proposal["rule_sql"],
+                    default_threshold_config=proposal["threshold_config"],
+                    default_severity=proposal["severity"],
+                    allowed_scopes=[proposal["scope"]],
+                    source="claude",
+                    status="proposed",
+                    owner="rule_intelligence_agent",
+                    created_by="rule_intelligence_agent",
+                )
+            else:
+                definition = proposal["definition"]
+
+            instance = storage.create_instance(
+                definition_id=definition.id,
+                scope=proposal["scope"],
+                database_name=table_asset.database_name,
+                schema_name=table_asset.schema_name,
+                table_name=table_asset.table_name,
+                fingerprint=proposal["fingerprint"],
+                severity=proposal["severity"],
+                target_config=proposal["target_config"],
+                threshold_config=proposal["threshold_config"],
+                rule_sql=proposal["rule_sql"],
+                status="pending",
+                is_active=False,
+                owner="rule_intelligence_agent",
+                created_by="rule_intelligence_agent",
+                source_run_id=run.id,
             )
-            active_rules.append({
-                "code":             ai_rule.code,
-                "name":             ai_rule.name,
-                "description":      ai_rule.description,
-                "severity":         ai_rule.severity,
-                "original_severity": ai_rule.severity,
-                "reason":           "AI-generated rule for this table type",
-                "is_ai_generated":  True,
-                "category":         ai_rule.category,
-                "applies_to":       ai_rule.applies_to or [],
-                "violated":         violated,
-                "ai_violation_evidence": next(
-                    (v.get("evidence", {}).get("ai_evidence", "") for v in ai_violations
-                     if v.get("context", {}).get("rule_code") == ai_rule.code),
-                    ""
-                ),
+
+            active_entries.append({
+                "instance_id":       instance.id,
+                "definition_id":     definition.id,
+                "name":              definition.name,
+                "description":       definition.description,
+                "severity":          proposal["severity"],
+                "original_severity": proposal["severity"],
+                "reason":            proposal["rationale"],
+                "is_new_instance":   True,
+                "is_new_definition": proposal["kind"] == "new",
+                "scope":             proposal["scope"],
+                "target_config":     proposal["target_config"],
+                "violated":          proposal["violated"],
+                "violation_evidence": proposal["evidence"],
             })
 
         storage.update_agent_run(
             self.run_id,
-            rule_review_state={"active": active_rules, "skipped": skipped_rules},
+            ai_rules_count=len([p for p in proposed_instances if p["kind"] == "new"]),
+            instance_review_state={"active": active_entries, "skipped": skipped_entries},
             status="awaiting_rule_review",
         )
         logger.info(
             f"[Coordinator] Run {self.run_id} paused for rule review — "
-            f"{len(active_rules)} active, {len(skipped_rules)} skipped."
+            f"{len(active_entries)} active, {len(skipped_entries)} skipped."
         )
 
         # Rules are ready — advance the batch now so the next table computes its
@@ -312,49 +319,41 @@ class WorkflowCoordinator:
 
         storage.update_agent_run(self.run_id, status="running")
 
-        review_state = run.rule_review_state or {"active": [], "skipped": []}
+        review_state = run.instance_review_state or {"active": [], "skipped": []}
         active_entries = review_state.get("active", [])
+        skipped_entries = review_state.get("skipped", [])
 
-        # ── Persist approved AI rules to the permanent rules library ─────────
-        ai_rules_persisted = []
+        # ── Approve reviewed instances (explicit gate — this is the only ────
+        # place a pending instance becomes active). Newly-approved definitions
+        # flip PROPOSED -> ACTIVE on their first approval.
+        new_instances_approved = 0
         for entry in active_entries:
-            if not entry.get("is_ai_generated"):
+            if not entry.get("is_new_instance"):
                 continue
-            code = entry["code"]
-            existing = storage.get_rule_by_code(code)
-            if existing:
-                # Update name/description/severity with user's edits
-                updated = storage.update_rule(
-                    existing.id,
-                    name=entry["name"],
-                    description=entry["description"],
-                    severity=entry["severity"],
-                    is_active=True,
-                    status="active",
-                    owner=snowflake_user,
-                )
-                ai_rules_persisted.append(updated)
-            else:
-                # New AI rule — create permanently
-                category = entry.get("category", "data_quality")
-                severity = entry["severity"]
-                new_rule = storage.create_rule(
-                    code=code,
-                    name=entry["name"],
-                    description=entry["description"],
-                    category=category,
-                    severity=severity,
-                    applies_to=entry.get("applies_to") or ["table"],
-                    rule_config={"source_run_id": run.id, "ai_generated": True},
-                    is_active=True,
-                    status="active",
-                    owner=snowflake_user,
-                    created_by="rule_intelligence_agent",
-                    version=1,
-                )
-                ai_rules_persisted.append(new_rule)
+            instance = storage.get_instance(entry["instance_id"])
+            if not instance:
+                continue
+            storage.update_instance(
+                instance.id,
+                severity=entry.get("severity", instance.severity),
+                owner=snowflake_user,
+            )
+            storage.approve_instance(instance.id)
+            definition = storage.get_definition(instance.definition_id)
+            if definition and definition.status == "proposed":
+                storage.update_definition(definition.id, status="active")
+            new_instances_approved += 1
 
-        storage.update_agent_run(self.run_id, ai_rules_count=len(ai_rules_persisted))
+        # Explicitly rejected instances (skipped by the human) get marked so
+        # the fingerprint-rejection path suppresses them on future scans.
+        for entry in skipped_entries:
+            if not entry.get("is_new_instance"):
+                continue
+            instance = storage.get_instance(entry["instance_id"])
+            if instance and instance.status == "pending":
+                storage.reject_instance(instance.id, reason=entry.get("reason") or "Skipped at review")
+
+        storage.update_agent_run(self.run_id, ai_rules_count=new_instances_approved)
 
         # ── Re-fetch assets ───────────────────────────────────────────────────
         scan = storage.get_scan(run.scan_id)
@@ -367,74 +366,34 @@ class WorkflowCoordinator:
 
         column_assets = storage.list_column_assets(run.database, run.schema_name, run.table)
 
-        # ── Build approved set for FindingsAgent ─────────────────────────────
-        approved_codes = {e["code"] for e in active_entries}
+        # ── Build approved instance set for FindingsAgent ────────────────────
+        # Existing (non-new) instances carry their instance_id directly.
+        # Newly-approved instances are now active with the same instance_id.
+        approved_instance_ids = {e["instance_id"] for e in active_entries}
 
-        # Build a classification dict from approved entries for severity overrides
-        existing_rules_overrides = {}
-        for entry in active_entries:
-            if not entry.get("is_ai_generated"):
-                existing_rules_overrides[entry["code"]] = {
-                    "run": True,
-                    "severity_override": (
-                        entry["severity"]
-                        if entry["severity"] != entry.get("original_severity")
-                        else None
-                    ),
-                    "reason": entry.get("reason", ""),
-                }
-
-        classification = {
-            "table_type":      (run.rule_review_state or {}).get("table_type", "unknown"),
-            "existing_rules":  existing_rules_overrides,
+        # Severity overrides for existing instances (human/Claude changed the
+        # severity from what's currently stored)
+        severity_overrides = {
+            e["instance_id"]: e["severity"]
+            for e in active_entries
+            if not e.get("is_new_instance") and e["severity"] != e.get("original_severity")
         }
 
-        # AI violations from active AI rules only
-        ai_violations = []
-        for entry in active_entries:
-            if entry.get("is_ai_generated") and entry.get("violated"):
-                rule_obj = storage.get_rule_by_code(entry["code"])
-                if rule_obj and table_asset:
-                    col_name = ""
-                    if "column" in (entry.get("applies_to") or []):
-                        col_name = entry.get("column_name", "")
-                    asset = table_asset
-                    if col_name:
-                        col_fqn = f"{table_asset.fqn}.{col_name}"
-                        asset = storage.get_asset_by_fqn(col_fqn) or table_asset
-
-                    ai_violations.append({
-                        "asset_id":    asset.id,
-                        "scan_id":     None,
-                        "rule_id":     rule_obj.id,
-                        "title":       f"{entry['name']} violated",
-                        "description": entry.get("ai_violation_evidence") or entry["description"],
-                        "severity":    entry["severity"],
-                        "status":      "detected",
-                        "context": {
-                            "rule_code":     entry["code"],
-                            "fqn":           table_asset.fqn,
-                            "table_name":    run.table,
-                            "schema_name":   run.schema_name,
-                            "database_name": run.database,
-                            "column_name":   col_name,
-                            "ai_generated":  True,
-                        },
-                        "evidence": {"ai_evidence": entry.get("ai_violation_evidence", "")},
-                    })
-
         # ── Findings Agent ────────────────────────────────────────────────────
+        # Newly-approved instances (Claude-authored, sql_template) run through
+        # RuleEngine exactly like every other instance — they have real,
+        # validated SQL (see rule_intelligence_agent.py), so there is no
+        # separate "one-time AI violation" path anymore.
         findings_task = self._get_task("findings_agent")
         self._start_task(findings_task)
         try:
             from app.services.agents.findings_agent import FindingsAgent
-            from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
 
-            _ria = RuleIntelligenceAgent()
             findings = FindingsAgent().run(
                 scan, table_asset, column_assets,
-                classification, ai_violations, _ria,
-                allowed_codes=approved_codes,
+                allowed_instance_ids=approved_instance_ids,
+                severity_overrides=severity_overrides,
+                run_id=run.id,
             )
             storage.update_agent_run(self.run_id, findings_count=len(findings))
 
@@ -444,10 +403,9 @@ class WorkflowCoordinator:
 
             self._complete_task(findings_task, output={
                 "findings_count":     len(findings),
-                "ai_rule_findings":   len(ai_violations),
                 "severity_breakdown": sev_breakdown,
                 "scan_id":            scan.id,
-                "ai_rules_persisted": len(ai_rules_persisted),
+                "new_instances_approved": new_instances_approved,
             })
         except Exception as e:
             self._fail_task(findings_task, str(e))

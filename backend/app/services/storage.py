@@ -39,6 +39,11 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
+def _sha256(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
         return value.isoformat()
@@ -309,7 +314,7 @@ def _finding_from_row(row: dict) -> SimpleNamespace:
         id=row["ID"],
         asset_id=row["ASSET_ID"],
         scan_id=row["SCAN_ID"],
-        rule_id=row["RULE_ID"],
+        instance_id=row["INSTANCE_ID"],
         title=row["TITLE"],
         description=row["DESCRIPTION"],
         status=row["STATUS"],
@@ -329,7 +334,7 @@ def _finding_from_row(row: dict) -> SimpleNamespace:
 def create_finding(
     asset_id: str,
     scan_id: str,
-    rule_id: Optional[str],
+    instance_id: Optional[str],
     title: str,
     description: str,
     severity: str,
@@ -341,17 +346,17 @@ def create_finding(
     sf_session.execute(
         """
         INSERT INTO FINDINGS
-            (ID, ASSET_ID, SCAN_ID, RULE_ID, TITLE, DESCRIPTION, STATUS, SEVERITY,
+            (ID, ASSET_ID, SCAN_ID, INSTANCE_ID, TITLE, DESCRIPTION, STATUS, SEVERITY,
              CONTEXT, EVIDENCE)
         SELECT
-            %(id)s, %(asset_id)s, %(scan_id)s, %(rule_id)s, %(title)s, %(description)s,
+            %(id)s, %(asset_id)s, %(scan_id)s, %(instance_id)s, %(title)s, %(description)s,
             %(status)s, %(severity)s, PARSE_JSON(%(context)s), PARSE_JSON(%(evidence)s)
         """,
         {
             "id": finding_id,
             "asset_id": asset_id,
             "scan_id": scan_id,
-            "rule_id": rule_id,
+            "instance_id": instance_id,
             "title": title,
             "description": description,
             "status": status,
@@ -372,7 +377,7 @@ def create_findings_bulk(findings_data: list[dict]) -> list[SimpleNamespace]:
             create_finding(
                 asset_id=fd["asset_id"],
                 scan_id=fd["scan_id"],
-                rule_id=fd.get("rule_id"),
+                instance_id=fd.get("instance_id"),
                 title=fd["title"],
                 description=fd["description"],
                 severity=fd["severity"],
@@ -484,180 +489,173 @@ def findings_summary() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# RULES
+# RULE_DEFINITIONS — the rule library (the concept: what a check means)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _rule_from_row(row: dict) -> SimpleNamespace:
+def _definition_from_row(row: dict) -> SimpleNamespace:
     return SimpleNamespace(
         id=row["ID"],
-        code=row["CODE"],
         name=row["NAME"],
-        description=row["DESCRIPTION"],
         category=row["CATEGORY"],
-        severity=row["SEVERITY"],
-        applies_to=_parse_json(row.get("APPLIES_TO")) or [],
-        rule_config=_parse_json(row.get("RULE_CONFIG")),
+        description=row["DESCRIPTION"],
+        check_kind=row["CHECK_KIND"],
+        handler_key=row["HANDLER_KEY"],
+        sql_template=row["SQL_TEMPLATE"],
+        parameters_schema=_parse_json(row.get("PARAMETERS_SCHEMA")),
+        default_threshold_config=_parse_json(row.get("DEFAULT_THRESHOLD_CONFIG")),
+        default_severity=row["DEFAULT_SEVERITY"],
+        allowed_scopes=_parse_json(row.get("ALLOWED_SCOPES")) or [],
+        source=row["SOURCE"],
         status=row["STATUS"],
-        jira_ticket=row["JIRA_TICKET"],
-        rejection_reason=row["REJECTION_REASON"],
+        instance_count=row["INSTANCE_COUNT"] or 0,
+        approval_count=row["APPROVAL_COUNT"] or 0,
         owner=row["OWNER"],
         created_by=row["CREATED_BY"],
-        version=row["VERSION"],
-        is_active=row["IS_ACTIVE"],
         created_at=row["CREATED_AT"],
         updated_at=row["UPDATED_AT"],
-        approved_at=row["APPROVED_AT"],
-        rejected_at=row["REJECTED_AT"],
     )
 
 
-def get_rule(rule_id: str) -> Optional[SimpleNamespace]:
-    rows = sf_session.query("SELECT * FROM RULES WHERE ID = %(id)s", {"id": rule_id})
-    return _rule_from_row(rows[0]) if rows else None
+def get_definition(definition_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM RULE_DEFINITIONS WHERE ID = %(id)s", {"id": definition_id})
+    return _definition_from_row(rows[0]) if rows else None
 
 
-def get_rule_by_code(code: str) -> Optional[SimpleNamespace]:
-    rows = sf_session.query("SELECT * FROM RULES WHERE CODE = %(code)s", {"code": code})
-    return _rule_from_row(rows[0]) if rows else None
+def get_definition_by_handler_key(handler_key: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM RULE_DEFINITIONS WHERE HANDLER_KEY = %(handler_key)s",
+        {"handler_key": handler_key},
+    )
+    return _definition_from_row(rows[0]) if rows else None
 
 
-def list_rules(
-    category: Optional[str] = None,
-    severity: Optional[str] = None,
+def get_definition_by_name(name: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM RULE_DEFINITIONS WHERE NAME = %(name)s", {"name": name})
+    return _definition_from_row(rows[0]) if rows else None
+
+
+def list_definitions(
+    source: Optional[str] = None,
     status: Optional[str] = None,
-    is_active: Optional[bool] = None,
-    created_by: Optional[str] = None,
+    category: Optional[str] = None,
     skip: int = 0,
     limit: int = 500,
 ) -> tuple[int, list[SimpleNamespace]]:
     where, params = [], {}
-    if category:
-        where.append("CATEGORY = %(category)s")
-        params["category"] = category
-    if severity:
-        where.append("SEVERITY = %(severity)s")
-        params["severity"] = severity
+    if source:
+        where.append("SOURCE = %(source)s")
+        params["source"] = source
     if status:
         where.append("STATUS = %(status)s")
         params["status"] = status
-    if is_active is not None:
-        where.append("IS_ACTIVE = %(is_active)s")
-        params["is_active"] = is_active
-    if created_by:
-        where.append("CREATED_BY = %(created_by)s")
-        params["created_by"] = created_by
+    if category:
+        where.append("CATEGORY = %(category)s")
+        params["category"] = category
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
 
-    total_rows = sf_session.query(f"SELECT COUNT(*) AS CNT FROM RULES {where_sql}", params)
+    total_rows = sf_session.query(f"SELECT COUNT(*) AS CNT FROM RULE_DEFINITIONS {where_sql}", params)
     total = total_rows[0]["CNT"] if total_rows else 0
 
     rows = sf_session.query(
         f"""
-        SELECT * FROM RULES {where_sql}
-        ORDER BY CREATED_AT DESC
+        SELECT * FROM RULE_DEFINITIONS {where_sql}
+        ORDER BY APPROVAL_COUNT DESC, CREATED_AT DESC
         LIMIT %(limit)s OFFSET %(skip)s
         """,
         {**params, "limit": limit, "skip": skip},
     )
-    return total, [_rule_from_row(r) for r in rows]
+    return total, [_definition_from_row(r) for r in rows]
 
 
-def list_all_rules() -> list[SimpleNamespace]:
-    rows = sf_session.query("SELECT * FROM RULES")
-    return [_rule_from_row(r) for r in rows]
+def list_all_definitions() -> list[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM RULE_DEFINITIONS")
+    return [_definition_from_row(r) for r in rows]
 
 
-def list_active_rules_for_type(applies_to_type: str) -> list[SimpleNamespace]:
-    """Active rules whose APPLIES_TO array contains applies_to_type ('table' | 'column')."""
-    rows = sf_session.query(
-        """
-        SELECT * FROM RULES
-        WHERE IS_ACTIVE = TRUE
-          AND ARRAY_CONTAINS(%(t)s::VARIANT, APPLIES_TO)
-        """,
-        {"t": applies_to_type},
-    )
-    return [_rule_from_row(r) for r in rows]
-
-
-def create_rule(
-    code: str,
+def create_definition(
     name: str,
-    description: str,
     category: str,
-    severity: str,
-    applies_to: list[str],
-    rule_config: Optional[dict] = None,
+    description: str,
+    check_kind: str,
+    default_severity: str,
+    allowed_scopes: list[str],
+    handler_key: Optional[str] = None,
+    sql_template: Optional[str] = None,
+    parameters_schema: Optional[dict] = None,
+    default_threshold_config: Optional[dict] = None,
+    source: str = "system",
     status: str = "active",
-    jira_ticket: Optional[str] = None,
-    owner: str = "data-governance-team",
+    owner: Optional[str] = None,
     created_by: Optional[str] = None,
-    version: int = 1,
-    is_active: bool = True,
 ) -> SimpleNamespace:
-    rule_id = _new_id()
+    definition_id = _new_id()
     sf_session.execute(
         """
-        INSERT INTO RULES
-            (ID, CODE, NAME, DESCRIPTION, CATEGORY, SEVERITY, APPLIES_TO, RULE_CONFIG,
-             STATUS, JIRA_TICKET, OWNER, CREATED_BY, VERSION, IS_ACTIVE)
+        INSERT INTO RULE_DEFINITIONS
+            (ID, NAME, CATEGORY, DESCRIPTION, CHECK_KIND, HANDLER_KEY, SQL_TEMPLATE,
+             PARAMETERS_SCHEMA, DEFAULT_THRESHOLD_CONFIG, DEFAULT_SEVERITY, ALLOWED_SCOPES,
+             SOURCE, STATUS, OWNER, CREATED_BY)
         SELECT
-            %(id)s, %(code)s, %(name)s, %(description)s, %(category)s, %(severity)s,
-            PARSE_JSON(%(applies_to)s), PARSE_JSON(%(rule_config)s), %(status)s,
-            %(jira_ticket)s, %(owner)s, %(created_by)s, %(version)s, %(is_active)s
+            %(id)s, %(name)s, %(category)s, %(description)s, %(check_kind)s, %(handler_key)s,
+            %(sql_template)s, PARSE_JSON(%(parameters_schema)s), PARSE_JSON(%(default_threshold_config)s),
+            %(default_severity)s, PARSE_JSON(%(allowed_scopes)s), %(source)s, %(status)s,
+            %(owner)s, %(created_by)s
         """,
         {
-            "id": rule_id,
-            "code": code,
+            "id": definition_id,
             "name": name,
-            "description": description,
             "category": category,
-            "severity": severity,
-            "applies_to": _json_or_null(applies_to),
-            "rule_config": _json_or_null(rule_config),
+            "description": description,
+            "check_kind": check_kind,
+            "handler_key": handler_key,
+            "sql_template": sql_template,
+            "parameters_schema": _json_or_null(parameters_schema),
+            "default_threshold_config": _json_or_null(default_threshold_config),
+            "default_severity": default_severity,
+            "allowed_scopes": _json_or_null(allowed_scopes),
+            "source": source,
             "status": status,
-            "jira_ticket": jira_ticket,
             "owner": owner,
             "created_by": created_by,
-            "version": version,
-            "is_active": is_active,
         },
     )
-    return get_rule(rule_id)
+    return get_definition(definition_id)
 
 
-def ensure_rule(
-    code: str,
+def ensure_definition(
+    handler_key: str,
     name: str,
     description: str,
     category: str,
     severity: str,
-    applies_to: list[str],
+    allowed_scopes: list[str],
 ) -> SimpleNamespace:
-    """Return the rule for `code`, auto-creating it (as system/active) if missing."""
-    existing = get_rule_by_code(code)
-    if existing:
-        return existing
-    return create_rule(
-        code=code,
-        name=name,
-        description=description,
-        category=category,
-        severity=severity,
-        applies_to=applies_to,
-        rule_config={},
-        status="active",
-        owner="data-governance-team",
-        created_by="system",
-        version=1,
-        is_active=True,
-    )
+    """Return the python_handler definition for `handler_key`, auto-creating it
+    (as system/active) if missing. Also ensures one global instance exists."""
+    existing = get_definition_by_handler_key(handler_key)
+    if not existing:
+        existing = create_definition(
+            name=name,
+            category=category,
+            description=description,
+            check_kind="python_handler",
+            handler_key=handler_key,
+            default_severity=severity,
+            allowed_scopes=allowed_scopes,
+            source="system",
+            status="active",
+            owner="data-governance-team",
+            created_by="system",
+        )
+    ensure_global_instance(existing)
+    return existing
 
 
-def update_rule(rule_id: str, **fields: Any) -> SimpleNamespace:
-    """Partial update. JSON fields (applies_to, rule_config) are auto-detected."""
-    json_cols = {"applies_to", "rule_config"}
-    sets, params = [], {"id": rule_id}
+def update_definition(definition_id: str, **fields: Any) -> SimpleNamespace:
+    """Partial update. JSON fields (parameters_schema, default_threshold_config,
+    allowed_scopes) are auto-detected."""
+    json_cols = {"parameters_schema", "default_threshold_config", "allowed_scopes"}
+    sets, params = [], {"id": definition_id}
     for key, value in fields.items():
         col = key.upper()
         if key in json_cols:
@@ -669,8 +667,370 @@ def update_rule(rule_id: str, **fields: Any) -> SimpleNamespace:
     if "updated_at" not in fields:
         sets.append("UPDATED_AT = CURRENT_TIMESTAMP()")
     if sets:
-        sf_session.execute(f"UPDATE RULES SET {', '.join(sets)} WHERE ID = %(id)s", params)
-    return get_rule(rule_id)
+        sf_session.execute(f"UPDATE RULE_DEFINITIONS SET {', '.join(sets)} WHERE ID = %(id)s", params)
+    return get_definition(definition_id)
+
+
+def increment_definition_instance_count(definition_id: str, delta: int = 1) -> None:
+    sf_session.execute(
+        "UPDATE RULE_DEFINITIONS SET INSTANCE_COUNT = INSTANCE_COUNT + %(delta)s WHERE ID = %(id)s",
+        {"id": definition_id, "delta": delta},
+    )
+
+
+def increment_definition_approval_count(definition_id: str, delta: int = 1) -> None:
+    sf_session.execute(
+        "UPDATE RULE_DEFINITIONS SET APPROVAL_COUNT = APPROVAL_COUNT + %(delta)s WHERE ID = %(id)s",
+        {"id": definition_id, "delta": delta},
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RULE_INSTANCES — a specific application of a definition to a target
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _instance_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        definition_id=row["DEFINITION_ID"],
+        scope=row["SCOPE"],
+        database_name=row["DATABASE_NAME"],
+        schema_name=row["SCHEMA_NAME"],
+        table_name=row["TABLE_NAME"],
+        target_config=_parse_json(row.get("TARGET_CONFIG")) or {},
+        threshold_config=_parse_json(row.get("THRESHOLD_CONFIG")),
+        severity=row["SEVERITY"],
+        rule_sql=row["RULE_SQL"],
+        status=row["STATUS"],
+        fingerprint=row["FINGERPRINT"],
+        is_active=row["IS_ACTIVE"],
+        edited_by_human=row["EDITED_BY_HUMAN"],
+        jira_ticket=row["JIRA_TICKET"],
+        rejection_reason=row["REJECTION_REASON"],
+        owner=row["OWNER"],
+        created_by=row["CREATED_BY"],
+        source_run_id=row["SOURCE_RUN_ID"],
+        version=row["VERSION"],
+        created_at=row["CREATED_AT"],
+        updated_at=row["UPDATED_AT"],
+        approved_at=row["APPROVED_AT"],
+        rejected_at=row["REJECTED_AT"],
+    )
+
+
+def get_instance(instance_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM RULE_INSTANCES WHERE ID = %(id)s", {"id": instance_id})
+    return _instance_from_row(rows[0]) if rows else None
+
+
+def get_instance_by_fingerprint(fingerprint: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM RULE_INSTANCES WHERE FINGERPRINT = %(fp)s", {"fp": fingerprint}
+    )
+    return _instance_from_row(rows[0]) if rows else None
+
+
+def list_instances(
+    definition_id: Optional[str] = None,
+    status: Optional[str] = None,
+    scope: Optional[str] = None,
+    database_name: Optional[str] = None,
+    schema_name: Optional[str] = None,
+    table_name: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    skip: int = 0,
+    limit: int = 500,
+) -> tuple[int, list[SimpleNamespace]]:
+    where, params = [], {}
+    if definition_id:
+        where.append("DEFINITION_ID = %(definition_id)s")
+        params["definition_id"] = definition_id
+    if status:
+        where.append("STATUS = %(status)s")
+        params["status"] = status
+    if scope:
+        where.append("SCOPE = %(scope)s")
+        params["scope"] = scope
+    if database_name:
+        where.append("DATABASE_NAME = %(database_name)s")
+        params["database_name"] = database_name
+    if schema_name:
+        where.append("SCHEMA_NAME = %(schema_name)s")
+        params["schema_name"] = schema_name
+    if table_name:
+        where.append("TABLE_NAME = %(table_name)s")
+        params["table_name"] = table_name
+    if is_active is not None:
+        where.append("IS_ACTIVE = %(is_active)s")
+        params["is_active"] = is_active
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+    total_rows = sf_session.query(f"SELECT COUNT(*) AS CNT FROM RULE_INSTANCES {where_sql}", params)
+    total = total_rows[0]["CNT"] if total_rows else 0
+
+    rows = sf_session.query(
+        f"""
+        SELECT * FROM RULE_INSTANCES {where_sql}
+        ORDER BY CREATED_AT DESC
+        LIMIT %(limit)s OFFSET %(skip)s
+        """,
+        {**params, "limit": limit, "skip": skip},
+    )
+    return total, [_instance_from_row(r) for r in rows]
+
+
+def list_all_instances() -> list[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM RULE_INSTANCES")
+    return [_instance_from_row(r) for r in rows]
+
+
+def _instance_as_rule_view(instance: SimpleNamespace, definition: SimpleNamespace) -> SimpleNamespace:
+    """Joins an instance + its definition into the flat `Rule`-shaped object
+    the `rules.py` API / frontend still expects (code/name/description/
+    category/severity/applies_to/...). `code` is synthesized from
+    HANDLER_KEY (upper-cased) for python_handler definitions, or the
+    definition id for sql_template ones. This is a read view only — writes
+    go through the definition/instance functions above, never this shape."""
+    code = (definition.handler_key or definition.id).upper()
+    return SimpleNamespace(
+        id=instance.id,
+        code=code,
+        name=definition.name,
+        description=definition.description,
+        category=definition.category,
+        severity=instance.severity,
+        applies_to=definition.allowed_scopes or [],
+        rule_config={"definition_id": definition.id, "check_kind": definition.check_kind},
+        status=instance.status,
+        jira_ticket=instance.jira_ticket,
+        rejection_reason=instance.rejection_reason,
+        owner=instance.owner,
+        created_by=instance.created_by,
+        version=instance.version,
+        is_active=instance.is_active,
+        created_at=instance.created_at,
+        updated_at=instance.updated_at,
+        approved_at=instance.approved_at,
+        rejected_at=instance.rejected_at,
+    )
+
+
+def list_rules_view(
+    category: Optional[str] = None,
+    severity: Optional[str] = None,
+    status: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    skip: int = 0,
+    limit: int = 500,
+) -> tuple[int, list[SimpleNamespace]]:
+    """Rule-shaped view over RULE_INSTANCES joined to RULE_DEFINITIONS, for
+    the rules.py API / frontend Rules page. category filters on the
+    definition's category."""
+    definitions_by_id = {d.id: d for d in list_all_definitions()}
+
+    _, instances = list_instances(status=status, is_active=is_active, skip=0, limit=5000)
+    views = []
+    for inst in instances:
+        definition = definitions_by_id.get(inst.definition_id)
+        if not definition:
+            continue
+        if category and definition.category != category:
+            continue
+        if severity and inst.severity != severity:
+            continue
+        views.append(_instance_as_rule_view(inst, definition))
+
+    views.sort(key=lambda v: v.created_at, reverse=True)
+    total = len(views)
+    return total, views[skip:skip + limit]
+
+
+def get_rule_view(instance_id: str) -> Optional[SimpleNamespace]:
+    instance = get_instance(instance_id)
+    if not instance:
+        return None
+    definition = get_definition(instance.definition_id)
+    if not definition:
+        return None
+    return _instance_as_rule_view(instance, definition)
+
+
+def list_active_instances_for_scope(scope: str) -> list[SimpleNamespace]:
+    """Active instances with a given scope ('table' | 'column' | ...), globally
+    (DATABASE_NAME='*') or for a specific target — callers filter further by
+    database/schema/table as needed."""
+    rows = sf_session.query(
+        "SELECT * FROM RULE_INSTANCES WHERE IS_ACTIVE = TRUE AND SCOPE = %(scope)s",
+        {"scope": scope},
+    )
+    return [_instance_from_row(r) for r in rows]
+
+
+def create_instance(
+    definition_id: str,
+    scope: str,
+    database_name: str,
+    fingerprint: str,
+    severity: str,
+    schema_name: Optional[str] = None,
+    table_name: Optional[str] = None,
+    target_config: Optional[dict] = None,
+    threshold_config: Optional[dict] = None,
+    rule_sql: Optional[str] = None,
+    status: str = "active",
+    is_active: bool = True,
+    jira_ticket: Optional[str] = None,
+    owner: str = "data-governance-team",
+    created_by: Optional[str] = None,
+    source_run_id: Optional[str] = None,
+) -> SimpleNamespace:
+    instance_id = _new_id()
+    sf_session.execute(
+        """
+        INSERT INTO RULE_INSTANCES
+            (ID, DEFINITION_ID, SCOPE, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME,
+             TARGET_CONFIG, THRESHOLD_CONFIG, SEVERITY, RULE_SQL, STATUS, FINGERPRINT,
+             IS_ACTIVE, JIRA_TICKET, OWNER, CREATED_BY, SOURCE_RUN_ID)
+        SELECT
+            %(id)s, %(definition_id)s, %(scope)s, %(database_name)s, %(schema_name)s,
+            %(table_name)s, PARSE_JSON(%(target_config)s), PARSE_JSON(%(threshold_config)s),
+            %(severity)s, %(rule_sql)s, %(status)s, %(fingerprint)s, %(is_active)s,
+            %(jira_ticket)s, %(owner)s, %(created_by)s, %(source_run_id)s
+        """,
+        {
+            "id": instance_id,
+            "definition_id": definition_id,
+            "scope": scope,
+            "database_name": database_name,
+            "schema_name": schema_name,
+            "table_name": table_name,
+            "target_config": _json_or_null(target_config if target_config is not None else {}),
+            "threshold_config": _json_or_null(threshold_config),
+            "severity": severity,
+            "rule_sql": rule_sql,
+            "status": status,
+            "fingerprint": fingerprint,
+            "is_active": is_active,
+            "jira_ticket": jira_ticket,
+            "owner": owner,
+            "created_by": created_by,
+            "source_run_id": source_run_id,
+        },
+    )
+    increment_definition_instance_count(definition_id)
+    return get_instance(instance_id)
+
+
+def ensure_global_instance(definition: SimpleNamespace) -> SimpleNamespace:
+    """Static/dynamic python_handler checks have no per-table target — one
+    degenerate instance (DATABASE_NAME='*', TARGET_CONFIG={}) represents
+    'runs everywhere'. Auto-creates it if the definition doesn't have one yet."""
+    existing_rows = sf_session.query(
+        "SELECT * FROM RULE_INSTANCES WHERE DEFINITION_ID = %(id)s AND DATABASE_NAME = '*'",
+        {"id": definition.id},
+    )
+    if existing_rows:
+        return _instance_from_row(existing_rows[0])
+
+    scope = "table" if "table" in (definition.allowed_scopes or []) else "column"
+    fingerprint = _sha256(f"{definition.id}|global")
+    return create_instance(
+        definition_id=definition.id,
+        scope=scope,
+        database_name="*",
+        fingerprint=fingerprint,
+        severity=definition.default_severity,
+        target_config={},
+        status="active",
+        is_active=True,
+        owner=definition.owner or "data-governance-team",
+        created_by=definition.created_by,
+    )
+
+
+def update_instance(instance_id: str, **fields: Any) -> SimpleNamespace:
+    """Partial update. JSON fields (target_config, threshold_config) are
+    auto-detected."""
+    json_cols = {"target_config", "threshold_config"}
+    sets, params = [], {"id": instance_id}
+    for key, value in fields.items():
+        col = key.upper()
+        if key in json_cols:
+            sets.append(f"{col} = PARSE_JSON(%({key})s)")
+            params[key] = _json_or_null(value)
+        else:
+            sets.append(f"{col} = %({key})s")
+            params[key] = value
+    if "updated_at" not in fields:
+        sets.append("UPDATED_AT = CURRENT_TIMESTAMP()")
+    if sets:
+        sf_session.execute(f"UPDATE RULE_INSTANCES SET {', '.join(sets)} WHERE ID = %(id)s", params)
+    return get_instance(instance_id)
+
+
+def approve_instance(instance_id: str) -> SimpleNamespace:
+    instance = update_instance(
+        instance_id, status="active", is_active=True, approved_at=datetime.datetime.utcnow(),
+    )
+    increment_definition_approval_count(instance.definition_id)
+    return instance
+
+
+def reject_instance(instance_id: str, reason: str) -> SimpleNamespace:
+    return update_instance(
+        instance_id, status="rejected", is_active=False,
+        rejection_reason=reason, rejected_at=datetime.datetime.utcnow(),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RULE_EXECUTIONS — one row per instance per run (pass/fail/error log)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _execution_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        instance_id=row["INSTANCE_ID"],
+        scan_id=row["SCAN_ID"],
+        run_id=row["RUN_ID"],
+        status=row["STATUS"],
+        evidence=_parse_json(row.get("EVIDENCE")),
+        executed_at=row["EXECUTED_AT"],
+    )
+
+
+def create_execution(
+    instance_id: str,
+    status: str,
+    scan_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    evidence: Optional[dict] = None,
+) -> SimpleNamespace:
+    execution_id = _new_id()
+    sf_session.execute(
+        """
+        INSERT INTO RULE_EXECUTIONS (ID, INSTANCE_ID, SCAN_ID, RUN_ID, STATUS, EVIDENCE)
+        SELECT %(id)s, %(instance_id)s, %(scan_id)s, %(run_id)s, %(status)s, PARSE_JSON(%(evidence)s)
+        """,
+        {
+            "id": execution_id,
+            "instance_id": instance_id,
+            "scan_id": scan_id,
+            "run_id": run_id,
+            "status": status,
+            "evidence": _json_or_null(evidence),
+        },
+    )
+    rows = sf_session.query("SELECT * FROM RULE_EXECUTIONS WHERE ID = %(id)s", {"id": execution_id})
+    return _execution_from_row(rows[0])
+
+
+def list_executions_for_instance(instance_id: str, limit: int = 50) -> list[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM RULE_EXECUTIONS WHERE INSTANCE_ID = %(id)s ORDER BY EXECUTED_AT DESC LIMIT %(limit)s",
+        {"id": instance_id, "limit": limit},
+    )
+    return [_execution_from_row(r) for r in rows]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -691,7 +1051,7 @@ def _agent_run_from_row(row: dict, tasks: Optional[list] = None) -> SimpleNamesp
         completed_at=row["COMPLETED_AT"],
         findings_count=row["FINDINGS_COUNT"] or 0,
         ai_rules_count=row["AI_RULES_COUNT"] or 0,
-        rule_review_state=_parse_json(row.get("RULE_REVIEW_STATE")),
+        instance_review_state=_parse_json(row.get("INSTANCE_REVIEW_STATE")),
         error_message=row["ERROR_MESSAGE"],
         created_at=row["CREATED_AT"],
         tasks=tasks if tasks is not None else [],
@@ -792,8 +1152,8 @@ def get_next_pending_batch_run(batch_id: str) -> Optional[SimpleNamespace]:
 
 def update_agent_run(run_id: str, **fields: Any) -> SimpleNamespace:
     """Partial update. Supports: status, scan_id, started_at, completed_at,
-    findings_count, ai_rules_count, rule_review_state, error_message."""
-    json_cols = {"rule_review_state"}
+    findings_count, ai_rules_count, instance_review_state, error_message."""
+    json_cols = {"instance_review_state"}
     sets, params = [], {"id": run_id}
     for key, value in fields.items():
         col = key.upper()

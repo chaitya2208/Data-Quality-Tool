@@ -8,7 +8,7 @@ from app.services import storage
 from app.schemas.agent_run import (
     AgentRunCreateRequest, AgentRunResponse, AgentRunListResponse,
     AgentRuleSuggestion, AgentTaskResponse, RuleReviewRequest,
-    AgentBatchCreateRequest, AgentBatchResponse,
+    AgentBatchCreateRequest, AgentBatchResponse, BulkInstanceActionRequest,
 )
 from app.services.agents.coordinator import WorkflowCoordinator, DB_AGENT_ORDER
 from app.services.snowflake_session import session as sf_session
@@ -52,7 +52,7 @@ def _build_run_response(run) -> AgentRunResponse:
         completed_at=run.completed_at,
         findings_count=run.findings_count,
         ai_rules_count=getattr(run, "ai_rules_count", 0) or 0,
-        rule_review_state=getattr(run, "rule_review_state", None),
+        instance_review_state=getattr(run, "instance_review_state", None),
         error_message=run.error_message,
         created_at=run.created_at,
         tasks=[_build_task_response(t) for t in run.tasks],
@@ -202,8 +202,10 @@ def get_run(run_id: str):
 @router.post("/runs/{run_id}/review-rules", response_model=AgentRunResponse)
 def save_rule_review(run_id: str, request: RuleReviewRequest):
     """
-    Save the user's rule review decisions (active/skipped lists with edits).
-    Does not trigger pipeline — call /run-pipeline after this.
+    Save the user's instance review decisions (active/skipped lists with edits).
+    Does not trigger pipeline — call /run-pipeline after this. Any severity/name
+    edit on an existing (non-new) instance is persisted immediately and marks
+    the instance edited_by_human, so future recommendation refreshes respect it.
     """
     run = storage.get_agent_run(run_id)
     if not run:
@@ -214,22 +216,72 @@ def save_rule_review(run_id: str, request: RuleReviewRequest):
             detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'"
         )
 
+    for entry in request.active + request.skipped:
+        if entry.is_new_instance:
+            continue
+        instance = storage.get_instance(entry.instance_id)
+        if instance and entry.severity != instance.severity:
+            storage.update_instance(entry.instance_id, severity=entry.severity, edited_by_human=True)
+
     run = storage.update_agent_run(
         run_id,
-        rule_review_state={
+        instance_review_state={
             "active":  [e.model_dump() for e in request.active],
             "skipped": [e.model_dump() for e in request.skipped],
         },
     )
-    logger.info(f"[API] Saved rule review for run {run_id}: {len(request.active)} active, {len(request.skipped)} skipped")
+    logger.info(f"[API] Saved instance review for run {run_id}: {len(request.active)} active, {len(request.skipped)} skipped")
+    return _build_run_response(run)
+
+
+@router.post("/runs/{run_id}/review-rules/bulk-approve", response_model=AgentRunResponse)
+def bulk_approve_instances(run_id: str, request: BulkInstanceActionRequest):
+    """Move a set of PENDING instances from skipped to active in one call,
+    without needing to resend the full active/skipped lists."""
+    run = storage.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if run.status != "awaiting_rule_review":
+        raise HTTPException(status_code=400, detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'")
+
+    state = run.instance_review_state or {"active": [], "skipped": []}
+    ids = set(request.instance_ids)
+    moved = [e for e in state.get("skipped", []) if e.get("instance_id") in ids]
+    state["skipped"] = [e for e in state.get("skipped", []) if e.get("instance_id") not in ids]
+    state["active"] = state.get("active", []) + moved
+
+    run = storage.update_agent_run(run_id, instance_review_state=state)
+    logger.info(f"[API] Bulk-approved {len(moved)} instances for run {run_id}")
+    return _build_run_response(run)
+
+
+@router.post("/runs/{run_id}/review-rules/bulk-reject", response_model=AgentRunResponse)
+def bulk_reject_instances(run_id: str, request: BulkInstanceActionRequest):
+    """Move a set of PENDING instances from active to skipped in one call."""
+    run = storage.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if run.status != "awaiting_rule_review":
+        raise HTTPException(status_code=400, detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'")
+
+    state = run.instance_review_state or {"active": [], "skipped": []}
+    ids = set(request.instance_ids)
+    moved = [e for e in state.get("active", []) if e.get("instance_id") in ids]
+    for e in moved:
+        e["reason"] = request.reason or e.get("reason") or "Bulk-rejected at review"
+    state["active"] = [e for e in state.get("active", []) if e.get("instance_id") not in ids]
+    state["skipped"] = state.get("skipped", []) + moved
+
+    run = storage.update_agent_run(run_id, instance_review_state=state)
+    logger.info(f"[API] Bulk-rejected {len(moved)} instances for run {run_id}")
     return _build_run_response(run)
 
 
 @router.post("/runs/{run_id}/run-pipeline", status_code=202)
 def run_pipeline(run_id: str, background_tasks: BackgroundTasks):
     """
-    Trigger FindingsAgent using the approved rule set from rule_review_state.
-    Persists approved AI rules permanently to the rules library.
+    Trigger FindingsAgent using the approved instance set from instance_review_state.
+    Approves new instances (and their new definitions) permanently in the library.
     """
     run = storage.get_agent_run(run_id)
     if not run:
@@ -239,8 +291,8 @@ def run_pipeline(run_id: str, background_tasks: BackgroundTasks):
             status_code=400,
             detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'"
         )
-    if not run.rule_review_state:
-        raise HTTPException(status_code=400, detail="No rule review state found. Call /review-rules first.")
+    if not run.instance_review_state:
+        raise HTTPException(status_code=400, detail="No instance review state found. Call /review-rules first.")
 
     # Get current Snowflake user for rule ownership
     ctx = sf_session.get_cached_context()
@@ -256,29 +308,32 @@ def run_pipeline(run_id: str, background_tasks: BackgroundTasks):
 
 @router.get("/runs/{run_id}/rule-suggestions", response_model=List[AgentRuleSuggestion])
 def get_rule_suggestions(run_id: str):
-    """Get AI-suggested rules created during this run."""
+    """Get AI-suggested instances proposed during this run, regardless of
+    their current approval status."""
     run = storage.get_agent_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Agent run not found")
 
-    # Return ALL rules from this run regardless of their current approval status
-    _, rules = storage.list_rules(created_by="rule_suggestion_agent", limit=50)
-    run_rules = [r for r in rules if (r.rule_config or {}).get("source_run_id") == run_id]
+    _, instances = storage.list_instances(limit=5000)
+    run_instances = [i for i in instances if i.source_run_id == run_id]
 
-    return [
-        AgentRuleSuggestion(
-            rule_id=r.id,
-            code=r.code,
-            name=r.name,
-            description=r.description,
-            category=r.category,
-            severity=r.severity,
-            applies_to=r.applies_to or [],
-            rationale=_extract_rationale(r.description),
-            rule_status=r.status,
-        )
-        for r in run_rules
-    ]
+    result = []
+    for inst in run_instances:
+        definition = storage.get_definition(inst.definition_id)
+        if not definition:
+            continue
+        result.append(AgentRuleSuggestion(
+            instance_id=inst.id,
+            definition_id=definition.id,
+            name=definition.name,
+            description=definition.description,
+            category=definition.category,
+            severity=inst.severity,
+            scope=inst.scope,
+            rationale=definition.description,
+            instance_status=inst.status,
+        ))
+    return result
 
 
 @router.post("/runs/{run_id}/verify", status_code=202)
@@ -342,10 +397,3 @@ def trigger_verification(run_id: str, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_run_verification)
     return {"message": "Verification started", "run_id": run_id}
-
-
-def _extract_rationale(description: str) -> str:
-    marker = "[AI Rationale]"
-    if marker in description:
-        return description.split(marker, 1)[1].strip()
-    return ""

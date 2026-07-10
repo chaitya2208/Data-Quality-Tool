@@ -8,6 +8,11 @@ pydantic-settings==2.1.0
 # scanning both go through this connector; no ORM layer.
 snowflake-connector-python==3.6.0
 
+# Real SQL parser for validating any SQL that reaches an executable
+# RULE_INSTANCES.rule_sql (template-rendered or Claude-drafted) before it
+# ever runs against Snowflake — see app/services/sql_validation.py.
+sqlglot>=23.0.0
+
 # Anthropic Claude API (via AWS Bedrock)
 anthropic[bedrock]>=0.116.0
 boto3>=1.34.0

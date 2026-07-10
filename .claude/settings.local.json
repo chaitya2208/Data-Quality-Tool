@@ -24,7 +24,25 @@
       "Bash(sed -i 's/from app\\\\.models\\\\.scan import ScanStatus, ScanType/from app.core.enums import ScanStatus, ScanType/' app/schemas/scan.py)",
       "Bash(./.venv/Scripts/python.exe -m pip show snowflake-connector-python)",
       "Bash(./.venv/Scripts/python.exe setup_db.py)",
-      "Bash(git log *)"
+      "Bash(git log *)",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(grep -rn \"FindingsAgent\\(\\)\" app/)",
+      "Bash(grep -rn \"FindingsAgent\\\\b\" app/)",
+      "Bash(curl -s http://localhost:8001/api/v1/rules/stats)",
+      "Bash(curl *)",
+      "Bash(npx tsc *)",
+      "Bash(git stash *)",
+      "Bash(./.venv/Scripts/python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload)",
+      "Bash(tee /tmp/backend.log)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('status:', d['status']\\); print\\('irs active:', len\\(\\(d.get\\('instance_review_state'\\) or {}\\).get\\('active', []\\)\\)\\); print\\('irs skipped:', len\\(\\(d.get\\('instance_review_state'\\) or {}\\).get\\('skipped', []\\)\\)\\)\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('status:', d['status']\\); irs=d.get\\('instance_review_state'\\) or {}; print\\('active:', len\\(irs.get\\('active', []\\)\\)\\); print\\('skipped:', len\\(irs.get\\('skipped', []\\)\\)\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(taskkill //F //FI \"WINDOWTITLE eq *uvicorn*\")",
+      "Bash(pkill -f \"uvicorn app.main\")",
+      "Bash(grep -i sqlglot requirements.txt)",
+      "Bash(./.venv/Scripts/python.exe -c \"import sqlglot; print\\(sqlglot.__version__\\)\")",
+      "Bash(./.venv/Scripts/python.exe -m pip install sqlglot)",
+      "Bash(python -c ' *)"
     ]
   }
 }
