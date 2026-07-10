@@ -173,11 +173,15 @@ export const scansApi = {
 
 export const assetsApi = {
   list: (params?: any) => api.get<{ total: number; assets: Asset[] }>('/assets', { params }),
-  discoverDatabases: () => api.get<{ databases: string[]; count: number }>('/assets/discover/databases'),
-  discoverSchemas: (database: string) =>
-    api.get<{ schemas: string[]; count: number }>(`/assets/discover/schemas/${database}`),
-  discoverTables: (database: string, schema: string) =>
-    api.get<{ tables: string[]; count: number }>(`/assets/discover/tables/${database}/${schema}`),
+  discoverDatabases: (connectionId?: string | null) =>
+    api.get<{ databases: string[]; count: number }>('/assets/discover/databases',
+      connectionId ? { params: { connection_id: connectionId } } : undefined),
+  discoverSchemas: (database: string, connectionId?: string | null) =>
+    api.get<{ schemas: string[]; count: number }>(`/assets/discover/schemas/${database}`,
+      connectionId ? { params: { connection_id: connectionId } } : undefined),
+  discoverTables: (database: string, schema: string, connectionId?: string | null) =>
+    api.get<{ tables: string[]; count: number }>(`/assets/discover/tables/${database}/${schema}`,
+      connectionId ? { params: { connection_id: connectionId } } : undefined),
 };
 
 // ── Data Explorer / Profiling ─────────────────────────────────────────────────
@@ -247,13 +251,16 @@ export interface TableProfile {
   category_stats: Record<string, string[]>;
 }
 
+const connParam = (connectionId?: string | null) =>
+  connectionId ? { params: { connection_id: connectionId } } : undefined;
+
 export const profilingApi = {
-  tableInfo: (database: string, schema: string, table: string) =>
-    api.get<TableInfo>(`/profiling/table-info/${database}/${schema}/${table}`),
-  columns: (database: string, schema: string, table: string) =>
-    api.get<{ columns: ColumnMeta[] }>(`/profiling/columns/${database}/${schema}/${table}`),
-  profile: (database: string, schema: string, table: string) =>
-    api.post<TableProfile>(`/profiling/profile/${database}/${schema}/${table}`),
+  tableInfo: (database: string, schema: string, table: string, connectionId?: string | null) =>
+    api.get<TableInfo>(`/profiling/table-info/${database}/${schema}/${table}`, connParam(connectionId)),
+  columns: (database: string, schema: string, table: string, connectionId?: string | null) =>
+    api.get<{ columns: ColumnMeta[] }>(`/profiling/columns/${database}/${schema}/${table}`, connParam(connectionId)),
+  profile: (database: string, schema: string, table: string, connectionId?: string | null) =>
+    api.post<TableProfile>(`/profiling/profile/${database}/${schema}/${table}`, null, connParam(connectionId)),
 };
 
 // AI API
@@ -286,6 +293,55 @@ export interface SnowflakeContext {
   warehouses: WarehouseInfo[];
   databases: string[];
 }
+
+// ── Connections (multi-source) ────────────────────────────────────────────────
+
+export type ConnectionType = 'snowflake' | 'postgres';
+
+export interface Connection {
+  id: string;
+  name: string;
+  type: ConnectionType;
+  host: string | null;
+  port: number | null;
+  database: string | null;
+  schema_name: string | null;
+  username: string | null;
+  has_secret: boolean;
+  auth_method: string | null;
+  extra: Record<string, any> | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface ConnectionCreatePayload {
+  name: string;
+  type: ConnectionType;
+  host?: string;
+  port?: number;
+  database?: string;
+  schema_name?: string;
+  username?: string;
+  secret?: string;
+  auth_method?: string;
+  extra?: Record<string, any>;
+  is_active?: boolean;
+}
+
+export interface ConnectionTestResult {
+  ok: boolean;
+  user: string | null;
+  detail: string | null;
+}
+
+export const connectionsApi = {
+  list: () => api.get<{ total: number; connections: Connection[] }>('/connections'),
+  create: (data: ConnectionCreatePayload) => api.post<Connection>('/connections', data),
+  update: (id: string, data: Partial<ConnectionCreatePayload>) => api.patch<Connection>(`/connections/${id}`, data),
+  remove: (id: string) => api.delete(`/connections/${id}`),
+  test: (id: string) => api.post<ConnectionTestResult>(`/connections/${id}/test`),
+  status: (id: string) => api.get<ConnectionTestResult>(`/connections/${id}/status`),
+};
 
 export const aiApi = {
   getContext: () => api.get<SnowflakeContext>('/ai/context'),
@@ -330,6 +386,7 @@ export interface RuleReviewEntry {
 
 export interface AgentRun {
   id: string;
+  connection_id: string | null;
   batch_id: string | null;
   batch_index: number;
   database: string;
@@ -361,9 +418,9 @@ export interface AgentBatch {
 }
 
 export const agentRunsApi = {
-  start: (data: { database: string; schema_name: string; table: string }) =>
+  start: (data: { database: string; schema_name: string; table: string; connection_id?: string | null }) =>
     api.post<AgentRun>('/agent/runs', data),
-  startBatch: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string }) =>
+  startBatch: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string; connection_id?: string | null }) =>
     api.post<AgentBatch>('/agent/runs/batch', data),
   getBatch: (batchId: string) =>
     api.get<AgentBatch>(`/agent/runs/batch/${batchId}`),

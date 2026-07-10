@@ -4,7 +4,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.models.asset import Asset
 from app.schemas.asset import AssetResponse, AssetListResponse
-from app.services.snowflake_session import session as sf_session
+from app.services.datasources import get_source
 
 router = APIRouter()
 
@@ -44,35 +44,30 @@ def get_asset(asset_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/discover/databases")
-def discover_databases():
-    """Serves from startup cache — instant, no SSO."""
-    ctx = sf_session.get_cached_context()
-    if ctx:
-        dbs = ctx["databases"]
-        return {"databases": dbs, "count": len(dbs)}
+def discover_databases(connection_id: Optional[str] = None, db: Session = Depends(get_db)):
     try:
-        rows = sf_session.query("SHOW DATABASES")
-        dbs = [r.get("name") or r.get("NAME") for r in rows if r.get("name") or r.get("NAME")]
+        source = get_source(connection_id, db=db)
+        dbs = source.list_databases()
         return {"databases": dbs, "count": len(dbs)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/discover/schemas/{database}")
-def discover_schemas(database: str):
+def discover_schemas(database: str, connection_id: Optional[str] = None, db: Session = Depends(get_db)):
     try:
-        rows = sf_session.query(f"SHOW SCHEMAS IN DATABASE {database}")
-        schemas = [r.get("name") or r.get("NAME") for r in rows if r.get("name") or r.get("NAME")]
+        source = get_source(connection_id, db=db)
+        schemas = source.list_schemas(database)
         return {"schemas": schemas, "count": len(schemas)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/discover/tables/{database}/{schema}")
-def discover_tables(database: str, schema: str):
+def discover_tables(database: str, schema: str, connection_id: Optional[str] = None, db: Session = Depends(get_db)):
     try:
-        rows = sf_session.query(f"SHOW TABLES IN {database}.{schema}")
-        tables = [r.get("name") or r.get("NAME") for r in rows if r.get("name") or r.get("NAME")]
+        source = get_source(connection_id, db=db)
+        tables = [t["name"] for t in source.list_tables(database, schema)]
         return {"tables": tables, "count": len(tables)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

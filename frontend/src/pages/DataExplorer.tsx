@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { assetsApi, profilingApi } from '../api/client'
 import type { ColumnMeta, TableProfile, TopValue, ColumnProfile } from '../api/client'
+import { useConnection } from '../ConnectionContext'
 import {
   Database, Table2, Columns3, BarChart3, Loader2, ChevronRight,
   KeyRound, Hash, AlertCircle,
@@ -313,39 +314,48 @@ export default function DataExplorer() {
     () => profileCache.get(fqnKey(selectedDatabase, selectedSchema, selectedTable)) ?? null
   )
 
+  const { selectedId: connId } = useConnection()
+
+  // Reset the drill-down when the active connection changes — a DB/schema/table
+  // from one source is meaningless on another.
+  useEffect(() => {
+    setSelectedDatabase(null); setSelectedSchema(null); setSelectedTable(null); setProfile(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connId])
+
   const { data: databases, isLoading: loadingDbs } = useQuery({
-    queryKey: ['databases'],
-    queryFn: () => assetsApi.discoverDatabases().then(r => r.data),
+    queryKey: ['databases', connId],
+    queryFn: () => assetsApi.discoverDatabases(connId).then(r => r.data),
     staleTime: 5 * 60 * 1000,
   })
   const { data: schemas, isLoading: loadingSchemas } = useQuery({
-    queryKey: ['schemas', selectedDatabase],
-    queryFn: () => assetsApi.discoverSchemas(selectedDatabase!).then(r => r.data),
+    queryKey: ['schemas', connId, selectedDatabase],
+    queryFn: () => assetsApi.discoverSchemas(selectedDatabase!, connId).then(r => r.data),
     enabled: !!selectedDatabase,
     staleTime: 5 * 60 * 1000,
   })
   const { data: tables, isLoading: loadingTables } = useQuery({
-    queryKey: ['tables', selectedDatabase, selectedSchema],
-    queryFn: () => assetsApi.discoverTables(selectedDatabase!, selectedSchema!).then(r => r.data),
+    queryKey: ['tables', connId, selectedDatabase, selectedSchema],
+    queryFn: () => assetsApi.discoverTables(selectedDatabase!, selectedSchema!, connId).then(r => r.data),
     enabled: !!selectedDatabase && !!selectedSchema,
     staleTime: 5 * 60 * 1000,
   })
   const { data: tableInfo } = useQuery({
-    queryKey: ['table-info', selectedDatabase, selectedSchema, selectedTable],
-    queryFn: () => profilingApi.tableInfo(selectedDatabase!, selectedSchema!, selectedTable!).then(r => r.data),
+    queryKey: ['table-info', connId, selectedDatabase, selectedSchema, selectedTable],
+    queryFn: () => profilingApi.tableInfo(selectedDatabase!, selectedSchema!, selectedTable!, connId).then(r => r.data),
     enabled: !!selectedDatabase && !!selectedSchema && !!selectedTable,
     staleTime: 5 * 60 * 1000,
   })
   const { data: columnsData, isLoading: loadingColumns } = useQuery({
-    queryKey: ['columns', selectedDatabase, selectedSchema, selectedTable],
-    queryFn: () => profilingApi.columns(selectedDatabase!, selectedSchema!, selectedTable!).then(r => r.data),
+    queryKey: ['columns', connId, selectedDatabase, selectedSchema, selectedTable],
+    queryFn: () => profilingApi.columns(selectedDatabase!, selectedSchema!, selectedTable!, connId).then(r => r.data),
     enabled: !!selectedDatabase && !!selectedSchema && !!selectedTable,
     staleTime: 5 * 60 * 1000,
   })
   const columns: ColumnMeta[] = columnsData?.columns ?? []
 
   const profileMutation = useMutation({
-    mutationFn: () => profilingApi.profile(selectedDatabase!, selectedSchema!, selectedTable!).then(r => r.data),
+    mutationFn: () => profilingApi.profile(selectedDatabase!, selectedSchema!, selectedTable!, connId).then(r => r.data),
     onSuccess: (data) => {
       // Re-profile always brings fresh stats and refreshes the in-memory cache.
       profileCache.set(fqnKey(selectedDatabase, selectedSchema, selectedTable), data)

@@ -19,7 +19,6 @@ from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
 from app.models.agent_run import AgentRun, AgentTask, AgentRunStatus, AgentTaskStatus
-from app.services.snowflake_session import session as sf_session
 
 logger = logging.getLogger(__name__)
 
@@ -82,20 +81,18 @@ class WorkflowCoordinator:
         coord_task = self._get_task(db, "coordinator")
         self._start_task(db, coord_task)
         try:
-            rows = sf_session.query(
-                f"SHOW TABLES LIKE '{run.table}' IN {run.database}.{run.schema_name}"
-            )
-            match = next(
-                (r for r in rows if (r.get("name") or "").upper() == run.table.upper()),
-                None,
-            )
-            if not match:
+            from app.services.datasources import get_source
+            source = get_source(run.connection_id, db=db)
+            info = source.table_info(run.database, run.schema_name, run.table)
+            tables = source.list_tables(run.database, run.schema_name)
+            exists = any((t.get("name") or "").upper() == run.table.upper() for t in tables)
+            if not exists:
                 raise ValueError(
-                    f"Table {run.database}.{run.schema_name}.{run.table} not found in Snowflake"
+                    f"Table {run.database}.{run.schema_name}.{run.table} not found in the data source"
                 )
             self._complete_task(db, coord_task, output={
                 "target":    f"{run.database}.{run.schema_name}.{run.table}",
-                "row_count": match.get("rows"),
+                "row_count": info.get("row_count"),
             })
         except Exception as e:
             self._fail_task(db, coord_task, str(e))
@@ -123,7 +120,7 @@ class WorkflowCoordinator:
             try:
                 from app.services.agents.metadata_agent import MetadataAgent
                 scan, table_asset, column_assets = MetadataAgent(dbt).run(
-                    run.database, run.schema_name, run.table
+                    run.database, run.schema_name, run.table, run.connection_id
                 )
                 # Store only IDs — ORM objects must not cross session boundaries
                 meta_result["scan_id"]        = scan.id
@@ -171,7 +168,7 @@ class WorkflowCoordinator:
             dbt = SessionLocal()
             try:
                 from app.services.agents.profiling_agent import ProfilingAgent
-                prof = ProfilingAgent(dbt).run(run.database, run.schema_name, run.table)
+                prof = ProfilingAgent(dbt).run(run.database, run.schema_name, run.table, run.connection_id)
                 profile_result["profile"] = prof
                 anomalies = prof.get("anomalies", [])
                 self._complete_task_in(dbt, profile_task.id, output={

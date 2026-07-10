@@ -26,21 +26,17 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from app.services.snowflake_session import session as sf_session
+from app.services.datasources.base import DataSource
 
 logger = logging.getLogger(__name__)
 
-# Types for which MIN/MAX is meaningful (numeric, text-lexicographic, date/time).
-_MIN_MAX_TYPE_PREFIXES = (
-    "NUMBER", "DECIMAL", "INT", "FLOAT", "DOUBLE",
-    "VARCHAR", "CHAR", "STRING", "TEXT",
-    "DATE", "TIME", "TIMESTAMP",
-)
-
-# Numeric types where AVG/STDDEV are meaningful.
-_NUMERIC_TYPE_PREFIXES = ("NUMBER", "DECIMAL", "INT", "FLOAT", "DOUBLE")
+# Type-prefix families for category detection. Union of Snowflake + Postgres
+# spellings so detect_category() is dialect-agnostic (Snowflake: NUMBER/VARCHAR/
+# TIMESTAMP_NTZ; Postgres: integer/character varying/timestamp without time zone).
+_NUMERIC_TYPE_PREFIXES = ("NUMBER", "DECIMAL", "INT", "FLOAT", "DOUBLE",
+                          "SMALLINT", "INTEGER", "BIGINT", "NUMERIC", "REAL", "SERIAL", "MONEY")
 _DATE_TYPE_PREFIXES    = ("DATE", "TIME", "TIMESTAMP")
-_TEXT_TYPE_PREFIXES    = ("VARCHAR", "CHAR", "STRING", "TEXT")
+_TEXT_TYPE_PREFIXES    = ("VARCHAR", "CHAR", "STRING", "TEXT", "CHARACTER")
 
 # Max distinct count for which top-values is worth a full-table GROUP BY scan.
 # Above this a column is high-cardinality (IDs, free text) where top-5 is noise —
@@ -134,179 +130,9 @@ def detect_category(
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?[0-9][0-9\-\s().]{6,}$")
 
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
-
-
-def _safe_identifier(name: str) -> str:
-    """
-    Quote an identifier for safe interpolation. Snowflake identifiers that are
-    plain (letters/digits/underscore) can be used as-is; anything else is
-    double-quoted with internal quotes escaped. Rejects nothing — quoting makes
-    arbitrary names safe — but guards against SQL injection via table/column
-    names coming from the API path.
-    """
-    if _IDENT_RE.match(name):
-        return name
-    escaped = name.replace('"', '""')
-    return f'"{escaped}"'
-
-
-def _fqn(database: str, schema: str, table: str) -> str:
-    return f"{_safe_identifier(database)}.{_safe_identifier(schema)}.{_safe_identifier(table)}"
-
-
-def get_table_columns(database: str, schema: str, table: str) -> List[Dict[str, Any]]:
-    """Column list via INFORMATION_SCHEMA — name, data_type, nullable, default, comment."""
-    rows = sf_session.query(f"""
-        SELECT column_name    AS COLUMN_NAME,
-               data_type      AS DATA_TYPE,
-               is_nullable    AS IS_NULLABLE,
-               column_default AS COLUMN_DEFAULT,
-               comment        AS COMMENT,
-               ordinal_position AS ORDINAL_POSITION
-        FROM {database}.INFORMATION_SCHEMA.COLUMNS
-        WHERE table_schema = '{schema}'
-        AND   table_name   = '{table}'
-        ORDER BY ordinal_position
-    """)
-    return [
-        {
-            "column_name": r.get("COLUMN_NAME"),
-            "data_type":   r.get("DATA_TYPE"),
-            "is_nullable": str(r.get("IS_NULLABLE", "YES")).upper() in ("Y", "YES"),
-            "primary_key": False,  # INFORMATION_SCHEMA.COLUMNS has no key flags; enriched below
-            "unique_key":  False,
-            "comment":     r.get("COMMENT"),
-        }
-        for r in rows
-    ]
-
-
-def get_columns_with_pk(database: str, schema: str, table: str) -> List[Dict[str, Any]]:
-    """
-    Columns plus key detection via DESCRIBE TABLE, which reports 'primary key'
-    and 'unique key' per column (raw 'Y'/'N'). Many Snowflake tables — raw /
-    bronze ingestion tables especially — declare no keys at all, in which case
-    both flags stay False and the UI shows '—'.
-    """
-    columns = get_table_columns(database, schema, table)
-    try:
-        described = sf_session.describe_table(database, schema, table)
-
-        def _truthy(row, *keys) -> bool:
-            for k in keys:
-                if str(row.get(k, "")).upper() in ("Y", "YES", "TRUE"):
-                    return True
-            return False
-
-        pk_names     = {(r.get("name") or "").upper() for r in described if _truthy(r, "primary key", "PRIMARY KEY")}
-        unique_names = {(r.get("name") or "").upper() for r in described if _truthy(r, "unique key", "UNIQUE KEY")}
-        for c in columns:
-            name = (c["column_name"] or "").upper()
-            if name in pk_names:
-                c["primary_key"] = True
-            if name in unique_names:
-                c["unique_key"] = True
-    except Exception as e:
-        logger.warning(f"[Profiling] key detection failed for {database}.{schema}.{table}: {e}")
-    return columns
-
-
-# Max columns' worth of aggregates to fold into a single SELECT. Every column
-# contributes up to ~7 aggregate expressions; batching keeps the projection
-# width reasonable while still collapsing many full-table scans into one each.
-_AGG_BATCH_SIZE = 40
-
-
-def _profile_all_columns_agg(fqn: str, columns: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Compute scalar stats (total, non-null, distinct, min/max, avg/stddev) for
-    EVERY column in as few full-table scans as possible: one aggregate SELECT
-    covering a batch of columns per scan (batched to cap projection width).
-
-    Exactly equivalent to the previous per-column queries — same aggregate
-    functions over the same full dataset — just folded together so Snowflake
-    scans the table once per batch instead of once per column. No sampling, no
-    approximation.
-
-    Returns {column_name: {total, non_null, distinct_count, min_value,
-    max_value, avg_value, stddev}}. A column whose batch query fails is retried
-    on its own; if it still fails it's returned with an "error" marker so the
-    caller can record it without aborting the whole table.
-    """
-    results: Dict[str, Dict[str, Any]] = {}
-
-    # Alias per column by index — column names can be long/duplicate-cased, so
-    # positional aliases (C0_*, C1_*) keep the result keys unambiguous.
-    def _exprs_for(idx: int, col: str, type_prefix: str) -> List[str]:
-        p = [
-            f"COUNT(*) AS C{idx}_TOTAL",
-            f"COUNT({col}) AS C{idx}_NON_NULL",
-            f"COUNT(DISTINCT {col}) AS C{idx}_DISTINCT",
-        ]
-        if type_prefix in _MIN_MAX_TYPE_PREFIXES:
-            p += [f"MIN({col}) AS C{idx}_MIN", f"MAX({col}) AS C{idx}_MAX"]
-        if type_prefix in _NUMERIC_TYPE_PREFIXES:
-            p += [f"AVG({col}) AS C{idx}_AVG", f"STDDEV({col}) AS C{idx}_STDDEV"]
-        return p
-
-    def _unpack(row: Dict[str, Any], idx: int, type_prefix: str) -> Dict[str, Any]:
-        want_mm = type_prefix in _MIN_MAX_TYPE_PREFIXES
-        want_num = type_prefix in _NUMERIC_TYPE_PREFIXES
-        return {
-            "total":          row.get(f"C{idx}_TOTAL", 0) or 0,
-            "non_null":       row.get(f"C{idx}_NON_NULL", 0) or 0,
-            "distinct_count": row.get(f"C{idx}_DISTINCT", 0) or 0,
-            "min_value":      row.get(f"C{idx}_MIN") if want_mm else None,
-            "max_value":      row.get(f"C{idx}_MAX") if want_mm else None,
-            "avg_value":      row.get(f"C{idx}_AVG") if want_num else None,
-            "stddev":         row.get(f"C{idx}_STDDEV") if want_num else None,
-        }
-
-    for start in range(0, len(columns), _AGG_BATCH_SIZE):
-        batch = columns[start:start + _AGG_BATCH_SIZE]
-        select_parts: List[str] = []
-        meta: List[tuple] = []  # (idx, column_name, type_prefix)
-        for i, col_meta in enumerate(batch):
-            name = col_meta["column_name"]
-            prefix = (col_meta["data_type"] or "").split("(")[0].upper()
-            select_parts += _exprs_for(i, _safe_identifier(name), prefix)
-            meta.append((i, name, prefix))
-
-        try:
-            row = sf_session.query(f"SELECT {', '.join(select_parts)} FROM {fqn}")[0]
-            for idx, name, prefix in meta:
-                results[name] = _unpack(row, idx, prefix)
-        except Exception as e:
-            # One column's expression can poison the whole batch (e.g. STDDEV on
-            # a semi-structured type). Fall back to per-column queries for this
-            # batch only — still full-dataset, just not folded.
-            logger.warning(f"[Profiling] batch agg failed ({e}); retrying columns individually")
-            for idx, name, prefix in meta:
-                col = _safe_identifier(name)
-                try:
-                    single = sf_session.query(f"SELECT {', '.join(_exprs_for(idx, col, prefix))} FROM {fqn}")[0]
-                    results[name] = _unpack(single, idx, prefix)
-                except Exception as e2:
-                    logger.warning(f"[Profiling] column {name} agg failed: {e2}")
-                    results[name] = {"error": str(e2), "total": 0, "non_null": 0,
-                                     "distinct_count": 0, "min_value": None, "max_value": None,
-                                     "avg_value": None, "stddev": None}
-    return results
-
-
-def _duplicate_count(fqn: str, col: str) -> Optional[int]:
-    """Rows sharing a non-null value on this column (candidate-key dup check)."""
-    try:
-        rows = sf_session.query(f"""
-            SELECT COUNT(*) AS DUP_ROWS FROM (
-                SELECT {col} FROM {fqn} WHERE {col} IS NOT NULL
-                GROUP BY {col} HAVING COUNT(*) > 1
-            )
-        """)
-        return rows[0].get("DUP_ROWS", 0) or 0
-    except Exception:
-        return None
+def get_columns_with_pk(source: DataSource, database: str, schema: str, table: str) -> List[Dict[str, Any]]:
+    """Column list + key flags, delegated to the resolved DataSource adapter."""
+    return source.list_columns(database, schema, table)
 
 
 def _freshness_days(max_value: Any) -> Optional[float]:
@@ -324,12 +150,12 @@ def _freshness_days(max_value: Any) -> Optional[float]:
         return None
 
 
-def _pattern_match_pct(fqn: str, col: str, kind: str) -> Optional[float]:
-    """% of non-null values matching an email/phone shape, via a sample of top values."""
+def _pattern_match_pct(source: DataSource, database: str, schema: str, table: str,
+                       column: str, kind: str) -> Optional[float]:
+    """% of non-null values matching an email/phone shape, via a value sample."""
     rx = _EMAIL_RE if kind == "email" else _PHONE_RE
     try:
-        rows = sf_session.query(f"SELECT {col} AS V FROM {fqn} WHERE {col} IS NOT NULL LIMIT 200")
-        vals = [str(r.get("V")) for r in rows if r.get("V") is not None]
+        vals = [str(v) for v in source.sample_values(database, schema, table, column, limit=200) if v is not None]
         if not vals:
             return None
         matched = sum(1 for v in vals if rx.match(v.strip()))
@@ -338,64 +164,30 @@ def _pattern_match_pct(fqn: str, col: str, kind: str) -> Optional[float]:
         return None
 
 
-def get_table_info(database: str, schema: str, table: str) -> Dict[str, Any]:
-    """
-    Table-level metadata (no data) so users understand a table at a glance:
-    row count, size, kind (TABLE/VIEW), owner, comment.
-    """
-    try:
-        rows = sf_session.query(f"SHOW TABLES LIKE '{table}' IN {database}.{schema}")
-        match = next((r for r in rows if (r.get("name") or "").upper() == table.upper()), {})
-    except Exception as e:
-        logger.warning(f"[Profiling] table-info failed for {database}.{schema}.{table}: {e}")
-        match = {}
-    return {
-        "name":      table,
-        "row_count": match.get("rows"),
-        "bytes":     match.get("bytes"),
-        "kind":      match.get("kind"),
-        "owner":     match.get("owner"),
-        "comment":   match.get("comment"),
-    }
+def get_table_info(source: DataSource, database: str, schema: str, table: str) -> Dict[str, Any]:
+    """Table-level metadata (row count, size, kind, owner, comment) via the adapter."""
+    return source.table_info(database, schema, table)
 
 
-def _profile_top_values(fqn: str, col: str, limit: int = 5) -> List[Dict[str, Any]]:
-    rows = sf_session.query(f"""
-        SELECT {col} AS VALUE, COUNT(*) AS OCCURRENCES
-        FROM {fqn}
-        WHERE {col} IS NOT NULL
-        GROUP BY {col}
-        ORDER BY OCCURRENCES DESC
-        LIMIT {int(limit)}
-    """)
-    return [{"value": r.get("VALUE"), "count": r.get("OCCURRENCES")} for r in rows]
-
-
-def profile_table(database: str, schema: str, table: str) -> Dict[str, Any]:
+def profile_table(source: DataSource, database: str, schema: str, table: str) -> Dict[str, Any]:
     """
     Profile every column of one table over the FULL dataset — every row, exact
-    stats, no sampling. This is a data-quality tool: rules must be grounded in
-    the true distribution (a sampled MIN/MAX could miss the very outlier a rule
-    should catch). Profiling is part of a scheduled workflow, so a longer full
-    scan is an acceptable trade for uncompromised accuracy.
+    stats, no sampling. Dialect-specific SQL lives in the DataSource adapter; the
+    orchestration (category detection, top-values gating, anomaly hints) is here.
     """
     logger.info(f"[Profiling] Full-dataset profiling {database}.{schema}.{table}")
 
-    columns = get_columns_with_pk(database, schema, table)
-    fqn = _fqn(database, schema, table)  # no SAMPLE clause — full scan
+    columns = get_columns_with_pk(source, database, schema, table)
     column_profiles: List[Dict[str, Any]] = []
 
-    # One batched full-table scan per ~40 columns covers every scalar stat for
-    # every column (null/distinct/min/max/avg/stddev) — no per-column scans.
-    all_aggs = _profile_all_columns_agg(fqn, columns)
-    # COUNT(*) is identical across columns; take it from any agg result.
+    # One batched full-table scan per ~40 columns covers every scalar stat.
+    all_aggs = source.column_stats(database, schema, table, columns)
     row_count = next((a["total"] for a in all_aggs.values() if a.get("total")), 0)
 
     for col_meta in columns:
         column_name = col_meta["column_name"]
         data_type = col_meta["data_type"] or ""
-        col = _safe_identifier(column_name)
-        type_prefix = data_type.split("(")[0].upper()
+        type_prefix = data_type.split("(")[0].strip().upper()
 
         try:
             agg = all_aggs.get(column_name) or {}
@@ -427,15 +219,15 @@ def profile_table(database: str, schema: str, table: str) -> Dict[str, Any]:
                     and distinct_count is not None
                     and distinct_count <= TOP_VALUES_MAX_DISTINCT
                 ):
-                    top_values = _profile_top_values(fqn, col)
+                    top_values = source.top_values(database, schema, table, column_name)
 
             # Category-specific extras (kept cheap — only when relevant)
             duplicate_count = None
             if category == "id":
-                duplicate_count = _duplicate_count(fqn, col)
+                duplicate_count = source.duplicate_count(database, schema, table, column_name)
             pattern_match_pct = None
             if category in ("email", "phone"):
-                pattern_match_pct = _pattern_match_pct(fqn, col, category)
+                pattern_match_pct = _pattern_match_pct(source, database, schema, table, column_name, category)
 
             # Outlier hint for numerics: max is many stddevs above the mean.
             outlier_hint = None
@@ -478,7 +270,7 @@ def profile_table(database: str, schema: str, table: str) -> Dict[str, Any]:
                 "top_values": [], "is_sampled": False, "error": str(e),
             })
 
-    info = get_table_info(database, schema, table)
+    info = get_table_info(source, database, schema, table)
 
     # Category summary for the UI grouping
     category_order = ["id", "date", "amount", "measure", "status", "categorical", "email", "phone", "text"]

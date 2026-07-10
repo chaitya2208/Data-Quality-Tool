@@ -34,6 +34,7 @@ class Scan(Base):
 
     # What was scanned
     asset_id = Column(String(36), ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True)
+    connection_id = Column(String(36), nullable=True, index=True)  # data source this scan targeted
 
     # Scan configuration
     scan_type = Column(Enum(ScanType), nullable=False, default=ScanType.METADATA)

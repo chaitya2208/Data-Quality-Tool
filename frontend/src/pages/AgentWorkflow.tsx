@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { assetsApi, agentRunsApi, findingsApi } from '../api/client'
 import type { AgentRun, AgentTask, RuleReviewEntry } from '../api/client'
+import { useConnection } from '../ConnectionContext'
 import {
   GitBranch, Database, BrainCircuit, Shield, AlertCircle,
   Wrench, CheckCircle2, Loader2, ChevronDown, ChevronRight,
@@ -288,6 +289,7 @@ const SCOPE_OPTIONS: { value: WorkflowScope; label: string; hint: string }[] = [
 export default function AgentWorkflow() {
   const navigate    = useNavigate()
   const queryClient = useQueryClient()
+  const { selectedId: connId } = useConnection()
 
   const [scope,            setScope]            = useState<WorkflowScope>('table')
   const [selectedDatabase, setSelectedDatabase] = useState('')
@@ -303,19 +305,19 @@ export default function AgentWorkflow() {
   const [editForm,      setEditForm]      = useState<Partial<RuleReviewEntry>>({})
 
   const { data: databases } = useQuery({
-    queryKey: ['databases'],
-    queryFn: () => assetsApi.discoverDatabases().then(r => r.data),
+    queryKey: ['databases', connId],
+    queryFn: () => assetsApi.discoverDatabases(connId).then(r => r.data),
     staleTime: 5 * 60 * 1000,
   })
   const { data: schemas } = useQuery({
-    queryKey: ['schemas', selectedDatabase],
-    queryFn: () => assetsApi.discoverSchemas(selectedDatabase).then(r => r.data),
+    queryKey: ['schemas', connId, selectedDatabase],
+    queryFn: () => assetsApi.discoverSchemas(selectedDatabase, connId).then(r => r.data),
     enabled: !!selectedDatabase,
     staleTime: 5 * 60 * 1000,
   })
   const { data: tables } = useQuery({
-    queryKey: ['tables', selectedDatabase, selectedSchema],
-    queryFn: () => assetsApi.discoverTables(selectedDatabase, selectedSchema).then(r => r.data),
+    queryKey: ['tables', connId, selectedDatabase, selectedSchema],
+    queryFn: () => assetsApi.discoverTables(selectedDatabase, selectedSchema, connId).then(r => r.data),
     enabled: !!selectedDatabase && !!selectedSchema,
     staleTime: 5 * 60 * 1000,
   })
@@ -357,7 +359,7 @@ export default function AgentWorkflow() {
   })
 
   const startMutation = useMutation({
-    mutationFn: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string }) =>
+    mutationFn: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string; connection_id?: string | null }) =>
       agentRunsApi.startBatch(data).then(r => r.data),
     onSuccess: (batch) => {
       // Focus the first run; track the batch when it spans multiple tables
@@ -551,6 +553,7 @@ export default function AgentWorkflow() {
                   database: selectedDatabase,
                   schema_name: scope === 'database' ? undefined : selectedSchema,
                   table: scope === 'table' ? selectedTable : undefined,
+                  connection_id: connId,
                 })}
                 disabled={!canRun || startMutation.isPending}
                 className="flex items-center gap-2 px-5 py-2.5 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm">

@@ -24,9 +24,11 @@ class ProfilingAgent:
     def __init__(self, db: Session):
         self.db = db  # not used for reads, kept for interface symmetry with other agents
 
-    def run(self, database: str, schema: str, table: str) -> Dict[str, Any]:
+    def run(self, database: str, schema: str, table: str, connection_id: str = None) -> Dict[str, Any]:
         logger.info(f"[ProfilingAgent] Profiling {database}.{schema}.{table}")
-        profile = profile_table(database, schema, table)
+        from app.services.datasources import get_source
+        source = get_source(connection_id, db=self.db)
+        profile = profile_table(source, database, schema, table)
         profile["anomalies"] = self._summarize_anomalies(profile)
         logger.info(
             f"[ProfilingAgent] Done — {len(profile.get('columns', []))} columns, "

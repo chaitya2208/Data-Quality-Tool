@@ -48,15 +48,16 @@ def ask_for_recommendation(
     column_name: str,
     data_type: str,
     evidence: dict,
+    source=None,
 ) -> dict:
     """
-    Build a rich prompt including live DESCRIBE TABLE output and call Cortex.
-    Falls back to Claude/Bedrock on any Cortex error.
-    Returns dict: {explanation, sql_query, confidence, impact, source}
-    where source is 'cortex' or 'claude'.
+    Build a rich prompt including live schema context and call the model.
+    Uses Snowflake Cortex only when the source is Snowflake (Cortex is
+    Snowflake-native); for any other source (e.g. Postgres) goes straight to
+    Bedrock. Returns {explanation, sql_query, confidence, impact, source}.
     """
-    # Fetch live schema so Cortex has real column context
-    schema_context = _get_schema_context(database, schema, table)
+    # Fetch live schema so the model has real column context
+    schema_context = _get_schema_context(database, schema, table, source)
 
     prompt = _build_prompt(
         rule_code=rule_code,
@@ -69,17 +70,20 @@ def ask_for_recommendation(
         schema_context=schema_context,
     )
 
-    # Try Cortex first
-    try:
-        raw = sf_session.ask_cortex(prompt, model=CORTEX_MODEL)
-        parsed = _extract_json(raw)
-        if parsed.get("sql_query") and parsed.get("explanation"):
-            logger.info(f"[Cortex] Recommendation generated for {rule_code} on {fqn}")
-            parsed["sql_query"] = _sanitize_sql(parsed["sql_query"])
-            return {**parsed, "source": "cortex"}
-        raise ValueError(f"Cortex returned incomplete JSON: {parsed}")
-    except Exception as e:
-        logger.warning(f"[Cortex] Failed ({e}), falling back to Claude/Bedrock")
+    # Try Cortex first — but only when the source natively supports it (Snowflake).
+    from app.services.datasources.snowflake_source import SnowflakeSource
+    cortex_ok = source is None or isinstance(source, SnowflakeSource)
+    if cortex_ok:
+        try:
+            raw = sf_session.ask_cortex(prompt, model=CORTEX_MODEL)
+            parsed = _extract_json(raw)
+            if parsed.get("sql_query") and parsed.get("explanation"):
+                logger.info(f"[Cortex] Recommendation generated for {rule_code} on {fqn}")
+                parsed["sql_query"] = _sanitize_sql(parsed["sql_query"])
+                return {**parsed, "source": "cortex"}
+            raise ValueError(f"Cortex returned incomplete JSON: {parsed}")
+        except Exception as e:
+            logger.warning(f"[Cortex] Failed ({e}), falling back to Claude/Bedrock")
 
     # Fallback: Claude via Bedrock
     try:
@@ -99,17 +103,28 @@ def ask_for_recommendation(
         }
 
 
-def _get_schema_context(database: str, schema: str, table: str) -> str:
+def _get_schema_context(database: str, schema: str, table: str, source=None) -> str:
     """
-    Returns a compact schema summary from DESCRIBE TABLE.
-    Example:
-      CUSTOMER_ID NUMBER NOT NULL (primary key)
-      FIRST_NAME  VARCHAR nullable
-      CREATED_AT  TIMESTAMP_NTZ NOT NULL
+    Returns a compact schema summary for the model prompt. Uses the resolved
+    DataSource (dialect-agnostic list_columns) when available; otherwise falls
+    back to the Snowflake session's DESCRIBE TABLE.
     """
     if not database or not schema or not table:
         return ""
     try:
+        if source is not None:
+            cols = source.list_columns(database, schema, table)
+            if not cols:
+                return ""
+            lines = []
+            for c in cols:
+                null_str = "nullable" if c.get("is_nullable") else "NOT NULL"
+                pk_str = " (primary key)" if c.get("primary_key") else ""
+                comment = c.get("comment") or ""
+                comment_str = f" -- {comment}" if comment else ""
+                lines.append(f"  {c.get('column_name')}  {c.get('data_type')}  {null_str}{pk_str}{comment_str}")
+            return "Table schema:\n" + "\n".join(lines)
+
         rows = sf_session.describe_table(database, schema, table)
         if not rows:
             return ""

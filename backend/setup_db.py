@@ -3,8 +3,9 @@ Database setup script.
 Creates tables and initializes default rules.
 """
 from app.core.database import engine, Base, SessionLocal
-from app.models import Asset, Scan, Finding, Rule
+from app.models import Asset, Scan, Finding, Rule, Connection
 from app.services.rule_engine import initialize_default_rules
+from app.services.connection_seed import seed_default_connection
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +24,8 @@ def setup_database():
     try:
         initialize_default_rules(db)
         logger.info("Default rules initialized successfully")
+        seed_default_connection(db)
+        logger.info("Default connection seeded")
     except Exception as e:
         logger.error(f"Failed to initialize rules: {str(e)}")
         raise

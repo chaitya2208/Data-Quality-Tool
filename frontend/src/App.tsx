@@ -1,8 +1,6 @@
 import { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Loader2, CheckCircle, XCircle, ShieldCheck, Menu, X, Compass } from 'lucide-react'
-import { useQuery } from '@tanstack/react-query'
-import { aiApi, healthApi } from './api/client'
+import { Home, Database, AlertCircle, GitBranch, ShieldCheck, Menu, Compass, Plug } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Assets from './pages/Assets'
 import Findings from './pages/Findings'
@@ -10,54 +8,23 @@ import AgentWorkflow from './pages/AgentWorkflow'
 import AIFix from './pages/AIFix'
 import Rules from './pages/Rules'
 import DataExplorer from './pages/DataExplorer'
+import Connections from './pages/Connections'
+import { useConnection } from './ConnectionContext'
 
 function App() {
   const location = useLocation()
   const [sidebarOpen, setSidebarOpen] = useState(false)
-
-  const { data: sfContext, isLoading: connectingSnowflake } = useQuery({
-    queryKey: ['sf-context'],
-    queryFn: () => aiApi.getContext().then(res => res.data),
-    retry: 3,
-    retryDelay: 2000,
-    staleTime: Infinity,
-  })
-
-  // Live Snowflake connection status — polled so the sidebar badge reflects the
-  // real session state, not just whether the app finished loading once.
-  const { data: sfHealth } = useQuery({
-    queryKey: ['sf-health'],
-    queryFn: () => healthApi.checkSnowflake().then(res => res.data),
-    refetchInterval: 30_000,           // re-check every 30s
-    refetchOnWindowFocus: true,        // and when the user returns to the tab
-    retry: false,                      // a failed poll = disconnected, don't mask it
-  })
-  const sfConnected = sfHealth?.status === 'connected'
+  const { connections, selectedId, setSelectedId, selected } = useConnection()
 
   const navigation = [
-    { name: 'Dashboard',     href: '/',         icon: Home        },
-    { name: 'Data Explorer', href: '/explorer', icon: Compass     },
-    { name: 'Assets',        href: '/assets',   icon: Database    },
-    { name: 'Findings',      href: '/findings', icon: AlertCircle },
-    { name: 'Rules',         href: '/rules',    icon: ShieldCheck },
-    { name: 'Workflow',      href: '/workflow', icon: GitBranch   },
+    { name: 'Dashboard',     href: '/',            icon: Home        },
+    { name: 'Data Explorer', href: '/explorer',    icon: Compass     },
+    { name: 'Connections',   href: '/connections', icon: Plug        },
+    { name: 'Assets',        href: '/assets',      icon: Database    },
+    { name: 'Findings',      href: '/findings',    icon: AlertCircle },
+    { name: 'Rules',         href: '/rules',       icon: ShieldCheck },
+    { name: 'Workflow',      href: '/workflow',    icon: GitBranch   },
   ]
-
-  if (connectingSnowflake) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
-        <div className="text-center">
-          <Loader2 className="w-12 h-12 text-primary-600 animate-spin mx-auto mb-4" />
-          <h2 className="text-xl font-semibold text-gray-900 mb-2">Connecting to Snowflake...</h2>
-          <p className="text-gray-600 mb-4">Please complete SSO authentication in your browser</p>
-          <div className="text-sm text-gray-500 space-y-1">
-            <p>✓ Opening browser for SSO login</p>
-            <p className="animate-pulse">⏳ Waiting for authentication...</p>
-          </div>
-        </div>
-      </div>
-    )
-  }
 
   const SidebarContent = ({ onNavClick }: { onNavClick?: () => void }) => (
     <div className="flex flex-col h-full">
@@ -89,24 +56,33 @@ function App() {
         })}
       </nav>
 
-      {/* Footer — live Snowflake connection status */}
+      {/* Footer — active data-source selector */}
       <div className="p-4 border-t border-gray-200 flex-shrink-0">
-        <div className="flex items-center text-xs mb-1">
-          {sfConnected ? (
-            <>
-              <CheckCircle className="w-3 h-3 text-green-500 mr-1 flex-shrink-0" />
-              <span className="text-gray-500">Snowflake Connected</span>
-            </>
-          ) : (
-            <>
-              <XCircle className="w-3 h-3 text-red-500 mr-1 flex-shrink-0" />
-              <span className="text-red-600">Snowflake Disconnected</span>
-            </>
-          )}
-        </div>
-        <p className="text-xs text-gray-400 truncate">
-          {sfHealth?.user ?? sfContext?.user}
-        </p>
+        <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400 mb-1">Data Source</p>
+        {connections.length === 0 ? (
+          <Link to="/connections" onClick={onNavClick}
+            className="flex items-center gap-1.5 text-xs text-primary-600 hover:text-primary-800">
+            <Plug className="w-3.5 h-3.5" /> Add a connection
+          </Link>
+        ) : (
+          <>
+            <select
+              value={selectedId ?? ''}
+              onChange={e => setSelectedId(e.target.value)}
+              className="w-full text-sm border border-gray-300 rounded-lg px-2 py-1.5 bg-white focus:ring-2 focus:ring-primary-500"
+            >
+              {connections.map(c => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
+            {selected && (
+              <p className="text-xs text-gray-400 truncate mt-1 flex items-center gap-1">
+                {selected.type === 'snowflake' ? '❄' : '🐘'} {selected.type}
+                {selected.host ? ` · ${selected.host}` : ''}
+              </p>
+            )}
+          </>
+        )}
       </div>
     </div>
   )
@@ -160,8 +136,9 @@ function App() {
         <main className="flex-1 p-4 sm:p-6 lg:p-8">
           <Routes>
             <Route path="/"         element={<Dashboard />}     />
-            <Route path="/explorer" element={<DataExplorer />}  />
-            <Route path="/assets"   element={<Assets />}        />
+            <Route path="/explorer"    element={<DataExplorer />}  />
+            <Route path="/connections" element={<Connections />}   />
+            <Route path="/assets"      element={<Assets />}        />
             <Route path="/findings" element={<Findings />}      />
             <Route path="/workflow" element={<AgentWorkflow />} />
             <Route path="/ai-fix"   element={<AIFix />}         />

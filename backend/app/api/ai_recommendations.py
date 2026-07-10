@@ -64,6 +64,17 @@ def _call_claude_for_finding(finding: Finding, rule_code: str, context: dict, db
         db.query(Rule).filter(Rule.id == finding.rule_id).first()
         if finding.rule_id else None
     )
+    # Resolve the finding's data source (via its scan) so recommendations use
+    # the right dialect and skip Cortex for non-Snowflake sources.
+    from app.models.scan import Scan
+    from app.services.datasources import get_source
+    scan = db.query(Scan).filter(Scan.id == finding.scan_id).first()
+    source = None
+    try:
+        source = get_source(scan.connection_id if scan else None, db=db)
+    except Exception:
+        source = None
+
     result = ask_for_recommendation(
         rule_code=rule_code,
         rule_description=rule.description if rule else "",
@@ -75,6 +86,7 @@ def _call_claude_for_finding(finding: Finding, rule_code: str, context: dict, db
         column_name=full_context["column_name"],
         data_type=data_type,
         evidence=finding.evidence or {},
+        source=source,
     )
 
     explanation = result.get("explanation", "No explanation provided")
@@ -242,8 +254,16 @@ def execute_sql_fix(request: ExecuteSQLRequest, db: Session = Depends(get_db)):
         )
 
     try:
-        sf_session.execute_with_context(
-            sql=request.sql_query,
+        # Resolve the data source this finding belongs to (via its scan's
+        # connection_id) and execute against it. Snowflake honors role/warehouse;
+        # Postgres runs the statement plainly (ignores them).
+        from app.models.scan import Scan
+        from app.services.datasources import get_source
+        scan = db.query(Scan).filter(Scan.id == finding.scan_id).first()
+        connection_id = scan.connection_id if scan else None
+        source = get_source(connection_id, db=db)
+        source.execute_sql(
+            request.sql_query,
             role=request.role,
             warehouse=request.warehouse,
         )
