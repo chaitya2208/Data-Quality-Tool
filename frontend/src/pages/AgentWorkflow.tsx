@@ -7,7 +7,7 @@ import {
   GitBranch, Database, BrainCircuit, Shield, AlertCircle,
   Wrench, CheckCircle2, Loader2, ChevronDown, ChevronRight,
   AlertTriangle, ArrowRight, Clock, Play, ExternalLink,
-  RefreshCw, Sparkles,
+  RefreshCw, Sparkles, Network, LineChart,
 } from 'lucide-react'
 
 // ── Pipeline definition ───────────────────────────────────────────────────────
@@ -37,10 +37,25 @@ const AGENTS = [
     parallelGroup: 'A',
   },
   {
+    name: 'relationship_discovery_agent',
+    label: 'Relationships',
+    icon: Network,
+    desc: 'Finds and verifies cross-table FK relationships (cached per schema)',
+    parallel: true,
+    parallelGroup: 'A',
+  },
+  {
+    name: 'profiler_agent',
+    label: 'Profiler',
+    icon: LineChart,
+    desc: 'Computes deterministic stats — uniqueness, freshness, closed value sets',
+    parallel: false,
+  },
+  {
     name: 'rule_intelligence_agent',
     label: 'Rule Intelligence',
     icon: BrainCircuit,
-    desc: 'Claude selects rules, tunes severity, generates AI rules',
+    desc: 'Deterministic + Claude-proposed rules, tunes severity',
     parallel: false,
   },
   {
@@ -67,10 +82,30 @@ const AGENTS = [
   },
 ] as const
 
+function getAgentDef(name: typeof AGENTS[number]['name']): typeof AGENTS[number] {
+  return AGENTS.find(a => a.name === name)!
+}
+
+function sourceBadge(source: RuleReviewEntry['source']) {
+  if (source !== 'deterministic') return null
+  return (
+    <span className="text-xs bg-teal-100 text-teal-700 px-1.5 py-0.5 rounded font-medium"
+      title="Objective fact verified against live data — not an LLM guess">
+      Auto-detected
+    </span>
+  )
+}
+
 type RunStatus = 'pending' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes' | 'completed' | 'failed'
 
 function isPolling(status: RunStatus) {
-  return status === 'running' || status === 'awaiting_rule_review' || status === 'awaiting_fixes'
+  // 'pending' MUST be here: a freshly-created run is always 'pending' for the
+  // moment before the background coordinator flips it to 'running'. If the UI
+  // catches that first 'pending' and pending isn't polled, refetchInterval
+  // returns false and the view freezes on 'pending' forever even though the
+  // backend advances normally.
+  return status === 'pending' || status === 'running' ||
+         status === 'awaiting_rule_review' || status === 'awaiting_fixes'
 }
 
 function fixIssuesStatus(runStatus: RunStatus): string {
@@ -403,6 +438,13 @@ export default function AgentWorkflow() {
     setReviewInitialized(false)
   }
 
+  // Signals the model never addressed (freshness has no deterministic
+  // backstop, so an omission means no check was proposed) and whether the
+  // model's response was unparseable — both surfaced from the server review
+  // state so the reviewer isn't misled by a clean-looking "0 proposals".
+  const signalsMissed = serverReviewState?.signals_missed ?? []
+  const parseFailed   = serverReviewState?.parse_failed ?? false
+
   // Move an instance from active → skipped
   const rejectRule = (instanceId: string) => {
     const rule = reviewActive.find(r => r.instance_id === instanceId)
@@ -716,21 +758,25 @@ export default function AgentWorkflow() {
           {!collapsed && (
             <div className="px-6 pb-6">
               <div className="flex items-start overflow-x-auto pb-2 gap-0">
-                <AgentNode agentDef={AGENTS[0]} task={getTask('coordinator')}
+                <AgentNode agentDef={getAgentDef('coordinator')} task={getTask('coordinator')}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 <ParallelGroup>
-                  <AgentNode agentDef={AGENTS[1]} task={getTask('metadata_agent')}
+                  <AgentNode agentDef={getAgentDef('metadata_agent')} task={getTask('metadata_agent')}
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-                  <AgentNode agentDef={AGENTS[2]} task={getTask('rules_fetch_agent')}
+                  <AgentNode agentDef={getAgentDef('rules_fetch_agent')} task={getTask('rules_fetch_agent')}
+                    isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                  <AgentNode agentDef={getAgentDef('relationship_discovery_agent')} task={getTask('relationship_discovery_agent')}
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 </ParallelGroup>
-                <AgentNode agentDef={AGENTS[3]} task={getTask('rule_intelligence_agent')}
+                <AgentNode agentDef={getAgentDef('profiler_agent')} task={getTask('profiler_agent')}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-                <AgentNode agentDef={AGENTS[4]} task={getTask('findings_agent')}
+                <AgentNode agentDef={getAgentDef('rule_intelligence_agent')} task={getTask('rule_intelligence_agent')}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-                <AgentNode agentDef={AGENTS[5]} task={undefined}
+                <AgentNode agentDef={getAgentDef('findings_agent')} task={getTask('findings_agent')}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-                <AgentNode agentDef={AGENTS[6]} task={getTask('verification_agent')}
+                <AgentNode agentDef={getAgentDef('fix_issues')} task={undefined}
+                  isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
+                <AgentNode agentDef={getAgentDef('verification_agent')} task={getTask('verification_agent')}
                   isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
               </div>
               <div className="mt-5 pt-4 border-t border-gray-100 grid grid-cols-2 sm:grid-cols-4 gap-4">
@@ -831,6 +877,40 @@ export default function AgentWorkflow() {
             )}
           </div>
 
+          {/* Parse-failure warning — "0 proposals" may be a broken response, not full coverage */}
+          {parseFailed && (
+            <div className="px-6 py-3 bg-red-50 border-b border-red-200 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5" />
+              <p className="text-xs text-red-800">
+                <span className="font-semibold">Rule Intelligence response could not be parsed</span>{' '}
+                (even after a retry). Any missing proposals below may be due to a broken or truncated
+                model response — treat this list as incomplete rather than as confirmation the table is
+                fully covered. Consider re-running the workflow for this table.
+              </p>
+            </div>
+          )}
+
+          {/* Unaddressed-signals warning — deterministic signals with no proposed check */}
+          {signalsMissed.length > 0 && (
+            <div className="px-6 py-3 bg-amber-50 border-b border-amber-200 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+              <div className="text-xs text-amber-800">
+                <span className="font-semibold">
+                  {signalsMissed.length} signal{signalsMissed.length !== 1 ? 's' : ''} unaddressed
+                </span>{' '}
+                — the model did not propose a check for these, and freshness signals have no automatic
+                fallback:
+                <div className="flex flex-wrap gap-1.5 mt-1.5">
+                  {signalsMissed.map(sig => (
+                    <span key={sig} className="font-mono bg-amber-100 border border-amber-200 text-amber-800 px-1.5 py-0.5 rounded">
+                      {sig}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100">
             {/* Active Instances column */}
             <div className="p-5">
@@ -896,6 +976,7 @@ export default function AgentWorkflow() {
                             ) : (
                               <span className="text-xs bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded font-medium">Existing check</span>
                             )}
+                            {sourceBadge(rule.source)}
                             {rule.violated && (
                               <span className="text-xs bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">⚠ violated</span>
                             )}
@@ -964,6 +1045,7 @@ export default function AgentWorkflow() {
                           ) : (
                             <span className="text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded font-medium">Existing check</span>
                           )}
+                          {sourceBadge(rule.source)}
                         </div>
                         <p className="text-xs font-medium text-gray-600 truncate">{rule.name}</p>
                         {rule.reason && (

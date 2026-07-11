@@ -52,15 +52,21 @@ class FindingsAgent:
             f"[FindingsAgent] Running {len(allowed_instance_ids)} approved instances on {table_asset.fqn}"
         )
 
-        self._apply_severity_overrides(severity_overrides)
-
         findings_data = self.rule_engine.execute_all_rules(
             table_asset, column_assets, scan.id,
             allowed_rule_codes=allowed_codes if allowed_codes else None,
             allowed_instance_ids=allowed_instance_ids,
         )
 
-        self._restore_severity_overrides(severity_overrides)
+        # Severity overrides are applied to the produced findings in memory —
+        # NEVER by mutating the shared instance row. The old approach wrote the
+        # override onto RULE_INSTANCES, ran the check, then restored it; if
+        # execute_all_rules raised, the restore never happened and the instance
+        # was left permanently overridden. Worse, batch tables advance in
+        # parallel threads (coordinator._advance_batch) and can share a global
+        # ('*'-scoped) instance, so one run's temporary mutation was visible to
+        # another run mid-scan. Rewriting the finding dict here avoids both.
+        self._apply_severity_overrides(findings_data, severity_overrides)
 
         # Log RULE_EXECUTIONS for every instance that actually ran
         self._log_executions(findings_data, allowed_instance_ids, scan.id, run_id)
@@ -91,18 +97,19 @@ class FindingsAgent:
                 codes.add(definition.handler_key.upper())
         return codes
 
-    def _apply_severity_overrides(self, overrides: Dict[str, str]) -> None:
-        self._severity_backup = {}
-        for instance_id, severity in overrides.items():
-            instance = storage.get_instance(instance_id)
-            if instance:
-                self._severity_backup[instance_id] = instance.severity
-                storage.update_instance(instance_id, severity=severity)
-
-    def _restore_severity_overrides(self, overrides: Dict[str, str]) -> None:
-        for instance_id, original in getattr(self, "_severity_backup", {}).items():
-            storage.update_instance(instance_id, severity=original)
-        self._severity_backup = {}
+    def _apply_severity_overrides(
+        self, findings_data: List[dict], overrides: Dict[str, str],
+    ) -> None:
+        """Rewrite each finding's severity from the human/Claude override map,
+        keyed by instance_id. In-memory only — the shared RULE_INSTANCES row is
+        never touched, so there is nothing to restore and nothing another
+        concurrent run can observe."""
+        if not overrides:
+            return
+        for fd in findings_data:
+            override = overrides.get(fd.get("instance_id"))
+            if override:
+                fd["severity"] = override
 
     def _log_executions(
         self, findings_data: List[dict], allowed_instance_ids: Set[str],

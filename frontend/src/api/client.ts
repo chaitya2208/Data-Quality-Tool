@@ -144,6 +144,73 @@ export const rulesApi = {
     api.post<GeneratedRule>('/rules/generate', { prompt, owner }),
 };
 
+// ── Rule Library: Definitions / Instances / Executions ────────────────────────
+
+export interface RuleDefinition {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  check_kind: 'python_handler' | 'sql_template';
+  handler_key: string | null;
+  template_shape: string | null;
+  sql_template: string | null;
+  default_severity: string;
+  allowed_scopes: string[];
+  source: 'system' | 'claude' | 'user';
+  status: 'proposed' | 'active' | 'disabled';
+  instance_count: number;
+  approval_count: number;
+  owner: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RuleInstance {
+  id: string;
+  definition_id: string;
+  scope: string;
+  database_name: string;
+  schema_name: string | null;
+  table_name: string | null;
+  target_config: Record<string, any>;
+  threshold_config: Record<string, any> | null;
+  severity: string;
+  rule_sql: string | null;
+  status: string;
+  is_active: boolean;
+  rationale: string | null;
+  rejection_reason: string | null;
+  owner: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  approved_at: string | null;
+  rejected_at: string | null;
+}
+
+export interface RuleExecution {
+  id: string;
+  instance_id: string;
+  scan_id: string | null;
+  run_id: string | null;
+  status: 'passed' | 'failed' | 'error';
+  evidence: Record<string, any> | null;
+  executed_at: string;
+}
+
+export const ruleLibraryApi = {
+  listDefinitions: (params?: { status?: string; category?: string; check_kind?: string }) =>
+    api.get<{ total: number; definitions: RuleDefinition[] }>('/rules/definitions', { params }),
+  getDefinition: (id: string) =>
+    api.get<RuleDefinition>(`/rules/definitions/${id}`),
+  listInstances: (definitionId: string) =>
+    api.get<{ total: number; instances: RuleInstance[] }>(`/rules/definitions/${definitionId}/instances`),
+  listExecutions: (instanceId: string) =>
+    api.get<{ total: number; executions: RuleExecution[] }>(`/rules/instances/${instanceId}/executions`),
+};
+
 // API functions
 export interface TableFindingSummary {
   table_name: string;
@@ -248,6 +315,7 @@ export interface RuleReviewEntry {
   reason: string;
   is_new_instance: boolean;
   is_new_definition: boolean;
+  source: 'existing' | 'llm' | 'deterministic';
   scope: string;
   target_config: Record<string, any>;
   violated: boolean;
@@ -267,7 +335,17 @@ export interface AgentRun {
   completed_at: string | null;
   findings_count: number;
   ai_rules_count: number;
-  instance_review_state: { active: RuleReviewEntry[]; skipped: RuleReviewEntry[] } | null;
+  instance_review_state: {
+    active: RuleReviewEntry[];
+    skipped: RuleReviewEntry[];
+    // Deterministic profiler signals the model never addressed. Freshness has
+    // no deterministic backstop, so an omitted freshness signal here means no
+    // check was proposed for it — surfaced so the reviewer sees the gap.
+    signals_missed?: string[];
+    // True when the model's JSON was unparseable even after a retry: "0
+    // proposals" should be treated as suspect, not as full coverage.
+    parse_failed?: boolean;
+  } | null;
   error_message: string | null;
   created_at: string;
   tasks: AgentTask[];

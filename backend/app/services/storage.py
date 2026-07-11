@@ -30,7 +30,7 @@ import decimal
 import json
 import uuid
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from app.services.snowflake_session import session as sf_session
 
@@ -500,6 +500,7 @@ def _definition_from_row(row: dict) -> SimpleNamespace:
         description=row["DESCRIPTION"],
         check_kind=row["CHECK_KIND"],
         handler_key=row["HANDLER_KEY"],
+        template_shape=row.get("TEMPLATE_SHAPE"),
         sql_template=row["SQL_TEMPLATE"],
         parameters_schema=_parse_json(row.get("PARAMETERS_SCHEMA")),
         default_threshold_config=_parse_json(row.get("DEFAULT_THRESHOLD_CONFIG")),
@@ -521,6 +522,23 @@ def get_definition(definition_id: str) -> Optional[SimpleNamespace]:
     return _definition_from_row(rows[0]) if rows else None
 
 
+def get_definitions_by_ids(definition_ids: list[str]) -> Dict[str, SimpleNamespace]:
+    """Batch-fetch definitions in ONE query, keyed by id. Callers resolving a
+    definition per instance in a loop (RuleEngine.get_active_instances) used
+    to call get_definition() once per instance — an N+1 pattern that turned a
+    24-instance scan into 24+ sequential Snowflake round-trips. Empty input
+    short-circuits without a query (an empty SQL IN-list is invalid)."""
+    if not definition_ids:
+        return {}
+    unique_ids = list(dict.fromkeys(definition_ids))
+    placeholders = ", ".join(f"%(id_{i})s" for i in range(len(unique_ids)))
+    params = {f"id_{i}": d_id for i, d_id in enumerate(unique_ids)}
+    rows = sf_session.query(
+        f"SELECT * FROM RULE_DEFINITIONS WHERE ID IN ({placeholders})", params,
+    )
+    return {row["ID"]: _definition_from_row(row) for row in rows}
+
+
 def get_definition_by_handler_key(handler_key: str) -> Optional[SimpleNamespace]:
     rows = sf_session.query(
         "SELECT * FROM RULE_DEFINITIONS WHERE HANDLER_KEY = %(handler_key)s",
@@ -531,6 +549,23 @@ def get_definition_by_handler_key(handler_key: str) -> Optional[SimpleNamespace]
 
 def get_definition_by_name(name: str) -> Optional[SimpleNamespace]:
     rows = sf_session.query("SELECT * FROM RULE_DEFINITIONS WHERE NAME = %(name)s", {"name": name})
+    return _definition_from_row(rows[0]) if rows else None
+
+
+def get_definition_by_template_shape(template_shape: str) -> Optional[SimpleNamespace]:
+    """Exact lookup for the canonical, system-wide definition backing a
+    sql_template shape (not_null, uniqueness, ...) — the fix for definition-
+    library explosion: callers check this BEFORE falling back to fuzzy
+    name/description similarity or creating a brand-new definition, so every
+    table/column proposing the same shape reuses one definition via its own
+    TARGET_CONFIG/THRESHOLD_CONFIG/SEVERITY/RATIONALE instead of spawning a
+    duplicate. Prefers the highest-approval-count match if more than one
+    exists (e.g. a pre-canonicalization duplicate that's still active)."""
+    rows = sf_session.query(
+        "SELECT * FROM RULE_DEFINITIONS WHERE TEMPLATE_SHAPE = %(shape)s AND STATUS != 'disabled' "
+        "ORDER BY APPROVAL_COUNT DESC, CREATED_AT ASC LIMIT 1",
+        {"shape": template_shape},
+    )
     return _definition_from_row(rows[0]) if rows else None
 
 
@@ -572,6 +607,18 @@ def list_all_definitions() -> list[SimpleNamespace]:
     return [_definition_from_row(r) for r in rows]
 
 
+def get_real_instance_counts() -> dict[str, int]:
+    """Actual RULE_INSTANCES row count per definition_id, computed live.
+    RULE_DEFINITIONS.INSTANCE_COUNT is only ever incremented on create — it
+    has no decrement, so any row removed by something other than the normal
+    app flow (e.g. a manual cleanup) leaves it stale. Callers that display
+    instance counts to a human should use this, not the stored column."""
+    rows = sf_session.query(
+        "SELECT DEFINITION_ID, COUNT(*) AS CNT FROM RULE_INSTANCES GROUP BY DEFINITION_ID"
+    )
+    return {r["DEFINITION_ID"]: r["CNT"] for r in rows}
+
+
 def create_definition(
     name: str,
     category: str,
@@ -581,6 +628,7 @@ def create_definition(
     allowed_scopes: list[str],
     handler_key: Optional[str] = None,
     sql_template: Optional[str] = None,
+    template_shape: Optional[str] = None,
     parameters_schema: Optional[dict] = None,
     default_threshold_config: Optional[dict] = None,
     source: str = "system",
@@ -593,13 +641,13 @@ def create_definition(
         """
         INSERT INTO RULE_DEFINITIONS
             (ID, NAME, CATEGORY, DESCRIPTION, CHECK_KIND, HANDLER_KEY, SQL_TEMPLATE,
-             PARAMETERS_SCHEMA, DEFAULT_THRESHOLD_CONFIG, DEFAULT_SEVERITY, ALLOWED_SCOPES,
-             SOURCE, STATUS, OWNER, CREATED_BY)
+             TEMPLATE_SHAPE, PARAMETERS_SCHEMA, DEFAULT_THRESHOLD_CONFIG, DEFAULT_SEVERITY,
+             ALLOWED_SCOPES, SOURCE, STATUS, OWNER, CREATED_BY)
         SELECT
             %(id)s, %(name)s, %(category)s, %(description)s, %(check_kind)s, %(handler_key)s,
-            %(sql_template)s, PARSE_JSON(%(parameters_schema)s), PARSE_JSON(%(default_threshold_config)s),
-            %(default_severity)s, PARSE_JSON(%(allowed_scopes)s), %(source)s, %(status)s,
-            %(owner)s, %(created_by)s
+            %(sql_template)s, %(template_shape)s, PARSE_JSON(%(parameters_schema)s),
+            PARSE_JSON(%(default_threshold_config)s), %(default_severity)s, PARSE_JSON(%(allowed_scopes)s),
+            %(source)s, %(status)s, %(owner)s, %(created_by)s
         """,
         {
             "id": definition_id,
@@ -609,6 +657,7 @@ def create_definition(
             "check_kind": check_kind,
             "handler_key": handler_key,
             "sql_template": sql_template,
+            "template_shape": template_shape,
             "parameters_schema": _json_or_null(parameters_schema),
             "default_threshold_config": _json_or_null(default_threshold_config),
             "default_severity": default_severity,
@@ -649,6 +698,37 @@ def ensure_definition(
         )
     ensure_global_instance(existing)
     return existing
+
+
+def ensure_template_definition(
+    template_shape: str,
+    name: str,
+    description: str,
+    category: str,
+    severity: str,
+    allowed_scopes: list[str],
+) -> SimpleNamespace:
+    """Return the canonical sql_template definition for `template_shape`,
+    auto-creating it (as system/active) if missing — the sql_template analog
+    of ensure_definition() above. Unlike ensure_definition, does NOT create a
+    global instance: sql_template checks are always table/column-scoped via
+    their own TARGET_CONFIG, there is no 'runs everywhere' degenerate case."""
+    existing = get_definition_by_template_shape(template_shape)
+    if existing:
+        return existing
+    return create_definition(
+        name=name,
+        category=category,
+        description=description,
+        check_kind="sql_template",
+        template_shape=template_shape,
+        default_severity=severity,
+        allowed_scopes=allowed_scopes,
+        source="system",
+        status="active",
+        owner="data-governance-team",
+        created_by="system",
+    )
 
 
 def update_definition(definition_id: str, **fields: Any) -> SimpleNamespace:
@@ -701,6 +781,7 @@ def _instance_from_row(row: dict) -> SimpleNamespace:
         threshold_config=_parse_json(row.get("THRESHOLD_CONFIG")),
         severity=row["SEVERITY"],
         rule_sql=row["RULE_SQL"],
+        rationale=row.get("RATIONALE"),
         status=row["STATUS"],
         fingerprint=row["FINGERPRINT"],
         is_active=row["IS_ACTIVE"],
@@ -721,6 +802,21 @@ def _instance_from_row(row: dict) -> SimpleNamespace:
 def get_instance(instance_id: str) -> Optional[SimpleNamespace]:
     rows = sf_session.query("SELECT * FROM RULE_INSTANCES WHERE ID = %(id)s", {"id": instance_id})
     return _instance_from_row(rows[0]) if rows else None
+
+
+def get_instances_by_ids(instance_ids: list[str]) -> Dict[str, SimpleNamespace]:
+    """Batch-fetch instances in ONE query, keyed by id — same N+1 fix as
+    get_definitions_by_ids, for callers resolving instance rows in a loop
+    (RuleEngine.execute_sql_instances)."""
+    if not instance_ids:
+        return {}
+    unique_ids = list(dict.fromkeys(instance_ids))
+    placeholders = ", ".join(f"%(id_{i})s" for i in range(len(unique_ids)))
+    params = {f"id_{i}": i_id for i, i_id in enumerate(unique_ids)}
+    rows = sf_session.query(
+        f"SELECT * FROM RULE_INSTANCES WHERE ID IN ({placeholders})", params,
+    )
+    return {row["ID"]: _instance_from_row(row) for row in rows}
 
 
 def get_instance_by_fingerprint(fingerprint: str) -> Optional[SimpleNamespace]:
@@ -877,6 +973,7 @@ def create_instance(
     target_config: Optional[dict] = None,
     threshold_config: Optional[dict] = None,
     rule_sql: Optional[str] = None,
+    rationale: Optional[str] = None,
     status: str = "active",
     is_active: bool = True,
     jira_ticket: Optional[str] = None,
@@ -889,12 +986,12 @@ def create_instance(
         """
         INSERT INTO RULE_INSTANCES
             (ID, DEFINITION_ID, SCOPE, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME,
-             TARGET_CONFIG, THRESHOLD_CONFIG, SEVERITY, RULE_SQL, STATUS, FINGERPRINT,
+             TARGET_CONFIG, THRESHOLD_CONFIG, SEVERITY, RULE_SQL, RATIONALE, STATUS, FINGERPRINT,
              IS_ACTIVE, JIRA_TICKET, OWNER, CREATED_BY, SOURCE_RUN_ID)
         SELECT
             %(id)s, %(definition_id)s, %(scope)s, %(database_name)s, %(schema_name)s,
             %(table_name)s, PARSE_JSON(%(target_config)s), PARSE_JSON(%(threshold_config)s),
-            %(severity)s, %(rule_sql)s, %(status)s, %(fingerprint)s, %(is_active)s,
+            %(severity)s, %(rule_sql)s, %(rationale)s, %(status)s, %(fingerprint)s, %(is_active)s,
             %(jira_ticket)s, %(owner)s, %(created_by)s, %(source_run_id)s
         """,
         {
@@ -908,6 +1005,7 @@ def create_instance(
             "threshold_config": _json_or_null(threshold_config),
             "severity": severity,
             "rule_sql": rule_sql,
+            "rationale": rationale,
             "status": status,
             "fingerprint": fingerprint,
             "is_active": is_active,
@@ -981,6 +1079,119 @@ def reject_instance(instance_id: str, reason: str) -> SimpleNamespace:
         instance_id, status="rejected", is_active=False,
         rejection_reason=reason, rejected_at=datetime.datetime.utcnow(),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RELATIONSHIP_CATALOG — discovered cross-table FK relationships, cached
+# per (database, schema) so RuleIntelligenceAgent's referential_integrity
+# proposals have real ref_table/ref_column candidates to draw from instead
+# of never being reachable (see relationship_discovery.py).
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _relationship_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        database_name=row["DATABASE_NAME"],
+        schema_name=row["SCHEMA_NAME"],
+        from_table=row["FROM_TABLE"],
+        from_column=row["FROM_COLUMN"],
+        to_table=row["TO_TABLE"],
+        to_column=row["TO_COLUMN"],
+        status=row["STATUS"],
+        confidence=row["CONFIDENCE"],
+        orphan_rate=row["ORPHAN_RATE"],
+        sample_total=row["SAMPLE_TOTAL"],
+        sample_orphans=row["SAMPLE_ORPHANS"],
+        discovered_at=row["DISCOVERED_AT"],
+        last_verified_at=row["LAST_VERIFIED_AT"],
+        created_at=row["CREATED_AT"],
+    )
+
+
+def list_relationships(
+    database_name: str,
+    schema_name: str,
+    status: Optional[str] = None,
+) -> list[SimpleNamespace]:
+    where = ["DATABASE_NAME = %(database_name)s", "SCHEMA_NAME = %(schema_name)s"]
+    params = {"database_name": database_name, "schema_name": schema_name}
+    if status:
+        where.append("STATUS = %(status)s")
+        params["status"] = status
+    rows = sf_session.query(
+        f"SELECT * FROM RELATIONSHIP_CATALOG WHERE {' AND '.join(where)} ORDER BY FROM_TABLE, FROM_COLUMN",
+        params,
+    )
+    return [_relationship_from_row(r) for r in rows]
+
+
+def upsert_relationship(
+    database_name: str,
+    schema_name: str,
+    from_table: str,
+    from_column: str,
+    to_table: str,
+    to_column: str,
+    status: str = "confirmed",
+    confidence: str = "name_match",
+    orphan_rate: Optional[float] = None,
+    sample_total: Optional[int] = None,
+    sample_orphans: Optional[int] = None,
+) -> SimpleNamespace:
+    """Insert or refresh one relationship candidate, keyed on
+    (database, schema, from_table, from_column, to_table, to_column). Callers
+    re-discovering a schema simply upsert every candidate again — no need to
+    diff against the previous run's rows first."""
+    existing_rows = sf_session.query(
+        """
+        SELECT ID FROM RELATIONSHIP_CATALOG
+        WHERE DATABASE_NAME = %(database_name)s AND SCHEMA_NAME = %(schema_name)s
+          AND FROM_TABLE = %(from_table)s AND FROM_COLUMN = %(from_column)s
+          AND TO_TABLE = %(to_table)s AND TO_COLUMN = %(to_column)s
+        """,
+        {
+            "database_name": database_name, "schema_name": schema_name,
+            "from_table": from_table, "from_column": from_column,
+            "to_table": to_table, "to_column": to_column,
+        },
+    )
+    params = {
+        "status": status, "confidence": confidence, "orphan_rate": orphan_rate,
+        "sample_total": sample_total, "sample_orphans": sample_orphans,
+    }
+    if existing_rows:
+        relationship_id = existing_rows[0]["ID"]
+        sf_session.execute(
+            """
+            UPDATE RELATIONSHIP_CATALOG
+            SET STATUS = %(status)s, CONFIDENCE = %(confidence)s, ORPHAN_RATE = %(orphan_rate)s,
+                SAMPLE_TOTAL = %(sample_total)s, SAMPLE_ORPHANS = %(sample_orphans)s,
+                LAST_VERIFIED_AT = CURRENT_TIMESTAMP()
+            WHERE ID = %(id)s
+            """,
+            {**params, "id": relationship_id},
+        )
+    else:
+        relationship_id = _new_id()
+        sf_session.execute(
+            """
+            INSERT INTO RELATIONSHIP_CATALOG
+                (ID, DATABASE_NAME, SCHEMA_NAME, FROM_TABLE, FROM_COLUMN, TO_TABLE, TO_COLUMN,
+                 STATUS, CONFIDENCE, ORPHAN_RATE, SAMPLE_TOTAL, SAMPLE_ORPHANS)
+            SELECT
+                %(id)s, %(database_name)s, %(schema_name)s, %(from_table)s, %(from_column)s,
+                %(to_table)s, %(to_column)s, %(status)s, %(confidence)s, %(orphan_rate)s,
+                %(sample_total)s, %(sample_orphans)s
+            """,
+            {
+                **params, "id": relationship_id,
+                "database_name": database_name, "schema_name": schema_name,
+                "from_table": from_table, "from_column": from_column,
+                "to_table": to_table, "to_column": to_column,
+            },
+        )
+    rows = sf_session.query("SELECT * FROM RELATIONSHIP_CATALOG WHERE ID = %(id)s", {"id": relationship_id})
+    return _relationship_from_row(rows[0])
 
 
 # ═══════════════════════════════════════════════════════════════════════════

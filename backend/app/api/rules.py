@@ -4,9 +4,15 @@ from collections import defaultdict
 from datetime import datetime
 import json, re, logging
 from app.services import storage
-from app.schemas.rule import RuleCreate, RuleUpdate, RuleResponse, RuleListResponse
+from app.schemas.rule import (
+    RuleCreate, RuleUpdate, RuleResponse, RuleListResponse,
+    RuleDefinitionResponse, RuleDefinitionListResponse,
+    RuleInstanceResponse, RuleInstanceListResponse,
+    RuleExecutionResponse, RuleExecutionListResponse,
+)
 from app.services.rule_engine import initialize_default_rules
 from app.services.claude_client import ask_claude
+from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -62,6 +68,63 @@ def list_rules(
         is_active=is_active, skip=skip, limit=limit,
     )
     return RuleListResponse(total=total, rules=rules)
+
+
+# ── Rule library: definitions / instances / executions ──────────────────────
+# Registered before /{rule_id} so "/definitions" isn't swallowed as a rule_id.
+
+@router.get("/definitions", response_model=RuleDefinitionListResponse)
+def list_rule_definitions(
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    check_kind: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 500,
+):
+    total, definitions = storage.list_definitions(
+        status=status, category=category, skip=0, limit=5000,
+    )
+    if check_kind:
+        definitions = [d for d in definitions if d.check_kind == check_kind]
+        total = len(definitions)
+
+    # RULE_DEFINITIONS.INSTANCE_COUNT only increments, never decrements, so
+    # it drifts from reality if a row is ever removed outside the normal
+    # app flow — recompute live rather than show a stale number.
+    real_counts = storage.get_real_instance_counts()
+    for d in definitions:
+        d.instance_count = real_counts.get(d.id, 0)
+    definitions.sort(key=lambda d: d.instance_count, reverse=True)
+
+    return RuleDefinitionListResponse(total=total, definitions=definitions[skip:skip + limit])
+
+
+@router.get("/definitions/{definition_id}", response_model=RuleDefinitionResponse)
+def get_rule_definition(definition_id: str):
+    definition = storage.get_definition(definition_id)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Rule definition not found")
+    definition.instance_count = storage.get_real_instance_counts().get(definition_id, 0)
+    return definition
+
+
+@router.get("/definitions/{definition_id}/instances", response_model=RuleInstanceListResponse)
+def list_definition_instances(
+    definition_id: str,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 500,
+):
+    total, instances = storage.list_instances(
+        definition_id=definition_id, status=status, skip=skip, limit=limit,
+    )
+    return RuleInstanceListResponse(total=total, instances=instances)
+
+
+@router.get("/instances/{instance_id}/executions", response_model=RuleExecutionListResponse)
+def list_instance_executions(instance_id: str, limit: int = 20):
+    executions = storage.list_executions_for_instance(instance_id, limit=limit)
+    return RuleExecutionListResponse(total=len(executions), executions=executions)
 
 
 # ── Get ───────────────────────────────────────────────────────────────────────
@@ -243,30 +306,12 @@ Rules for code generation:
 """
 
 
-def _word_overlap_score(text1: str, text2: str) -> float:
-    """
-    Simple word-overlap similarity between two strings (0.0 – 1.0).
-    Used to catch semantic duplicates regardless of language/phrasing.
-    """
-    stop = {"a","an","the","is","are","was","were","be","been","being","have",
-            "has","had","do","does","did","will","would","could","should","may",
-            "might","must","shall","can","need","dare","ought","used","to","of",
-            "in","for","on","with","at","by","from","as","into","through","this",
-            "that","these","those","it","its","and","or","but","if","than","when",
-            "where","which","who","how","all","each","every","both","rule","check",
-            "column","table","snowflake","data","quality","should","not","no","any"}
-    def words(t: str) -> set:
-        return {w.lower() for w in re.findall(r"\w+", t) if w.lower() not in stop and len(w) > 2}
-    w1, w2 = words(text1), words(text2)
-    if not w1 or not w2:
-        return 0.0
-    return len(w1 & w2) / min(len(w1), len(w2))
-
-
-def _find_similar_rule(name: str, description: str, threshold: float = 0.55):
+def _find_similar_rule(name: str, description: str, threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
     """
     Return the most similar existing rule if overlap score ≥ threshold.
-    Checks against all existing rule names and descriptions.
+    Checks against all existing rule names and descriptions. Uses the shared
+    word_overlap_score (app.services.text_similarity) so this duplicate-catch
+    gate and the Rule Intelligence Agent's definition-dedup gate stay in sync.
     """
     combined = f"{name} {description}"
     best_score = 0.0
@@ -274,7 +319,7 @@ def _find_similar_rule(name: str, description: str, threshold: float = 0.55):
     _, rules = storage.list_rules_view(limit=5000)
     for rule in rules:
         rule_text = f"{rule.name} {rule.description or ''}"
-        score = _word_overlap_score(combined, rule_text)
+        score = word_overlap_score(combined, rule_text)
         if score > best_score:
             best_score = score
             best_rule = rule

@@ -72,6 +72,7 @@ class RuleReviewEntry(BaseModel):
     reason: str = ""
     is_new_instance: bool = False
     is_new_definition: bool = False
+    source: str = "llm"  # "existing" | "llm" | "deterministic"
     scope: str = "table"
     target_config: Dict[str, Any] = {}
     violated: bool = False

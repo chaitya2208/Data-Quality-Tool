@@ -89,13 +89,27 @@ class SnowflakeSession:
     # Read queries (use shared connection directly)
     # ─────────────────────────────────────────────
 
-    def query(self, sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def query(
+        self,
+        sql: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run a read query on the shared connection. `timeout`, when given, is
+        a server-side statement timeout in seconds — Snowflake cancels the
+        query if it runs longer, which bounds the blast radius of an expensive
+        ad-hoc SELECT (e.g. an AI-authored draft_sql with an accidental
+        cartesian join) instead of letting it saturate the warehouse."""
         conn = self.get_connection()
         cur = conn.cursor(DictCursor)
-        cur.execute(sql, params or {})
-        rows = cur.fetchall()
-        cur.close()
-        return rows
+        try:
+            if timeout is not None:
+                cur.execute(sql, params or {}, timeout=timeout)
+            else:
+                cur.execute(sql, params or {})
+            return cur.fetchall()
+        finally:
+            cur.close()
 
     def execute(self, sql: str, params: Optional[Dict[str, Any]] = None) -> int:
         """

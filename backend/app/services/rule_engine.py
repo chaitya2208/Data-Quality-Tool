@@ -30,11 +30,20 @@ class RuleEngine:
     def get_active_instances(self, scope: str) -> List[Any]:
         """Active instances with a given scope ('table' | 'column'), each
         annotated with `.handler_key`/`.check_kind` from its definition and a
-        `.code` (HANDLER_KEY upper-cased) for legacy-shaped call sites."""
+        `.code` (HANDLER_KEY upper-cased) for legacy-shaped call sites.
+
+        Definitions are batch-fetched in ONE query (get_definitions_by_ids)
+        instead of one get_definition() call per instance in the loop — the
+        old N+1 pattern meant a 24-instance scan issued 24+ sequential
+        Snowflake round-trips (each ~300-500ms) just to resolve definitions,
+        which is what made findings runs feel stuck rather than merely slow."""
         instances = storage.list_active_instances_for_scope(scope)
+        definitions_by_id = storage.get_definitions_by_ids(
+            [inst.definition_id for inst in instances]
+        )
         result = []
         for inst in instances:
-            definition = storage.get_definition(inst.definition_id)
+            definition = definitions_by_id.get(inst.definition_id)
             if not definition:
                 continue
             inst.check_kind = definition.check_kind
@@ -129,18 +138,32 @@ class RuleEngine:
     def execute_sql_instances(
         self, table_asset: Any, scan_id: str, allowed_instance_ids: Set[str],
     ) -> List[Dict[str, Any]]:
-        """Run every active sql_template instance in allowed_instance_ids
-        that belongs to this table (global '*'-scoped sql_template instances
-        aren't a thing today, but the check is harmless if that changes)."""
+        """Run every active sql_template instance in allowed_instance_ids that
+        belongs to this table. sql_template instances are ALWAYS bound to a
+        concrete table: their rule_sql has the fully-qualified db.schema.table
+        baked in at proposal time (see rule_sql_templates._fqn). A global
+        ('*'-scoped) sql_template instance therefore can't exist coherently —
+        its SQL still names one specific table — so we match on the concrete
+        database_name only. (Global '*' instances are a python_handler concept,
+        created via the CRUD API, and are handled by execute_rules, not here.)
+
+        Instances and definitions are batch-fetched (2 queries total) instead
+        of one get_instance()+get_definition() round-trip per instance in the
+        loop — the old N+1 pattern was the main source of "findings run feels
+        stuck" reports on tables with many approved instances."""
         findings: List[Dict[str, Any]] = []
+        instances_by_id = storage.get_instances_by_ids(list(allowed_instance_ids))
+        definitions_by_id = storage.get_definitions_by_ids(
+            [inst.definition_id for inst in instances_by_id.values()]
+        )
         for instance_id in allowed_instance_ids:
-            instance = storage.get_instance(instance_id)
+            instance = instances_by_id.get(instance_id)
             if not instance:
                 continue
-            definition = storage.get_definition(instance.definition_id)
+            definition = definitions_by_id.get(instance.definition_id)
             if not definition or definition.check_kind != "sql_template":
                 continue
-            if instance.database_name not in (table_asset.database_name, "*"):
+            if instance.database_name != table_asset.database_name:
                 continue
             try:
                 result = self._execute_sql_instance(instance, definition, table_asset, scan_id)

@@ -34,8 +34,15 @@ from app.services.snowflake_session import session as sf_session
 from app.services.claude_client import ask_claude
 from app.services.sql_validation import validate_sql
 from app.services.rule_sql_templates import TEMPLATE_SHAPES, render_template
+from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
+from app.services.agents.profiler_agent import DeterministicProfilerAgent
 
 logger = logging.getLogger(__name__)
+
+# Server-side statement timeout (seconds) for running a candidate check's SQL
+# at proposal time. Bounds the cost of an AI-authored draft_sql that passes
+# static validation but is accidentally expensive — see _execute_check_sql.
+_CHECK_SQL_TIMEOUT_SECONDS = 120
 
 _TEMPLATE_SHAPES_DOC = "\n".join(
     f"  - {name} (scope={spec['scope']}, needs threshold_config keys: {spec['params'] or 'none'})"
@@ -77,7 +84,34 @@ system will silently drop exact duplicates, so re-proposing them wastes a
 slot a genuinely new check could use instead.
 Focus new instances on: value constraints, referential patterns, naming
 standards for this domain, null semantics, data freshness, business key
-uniqueness patterns."""
+uniqueness patterns.
+
+You will also be given DETERMINISTIC SIGNALS — objective facts already
+computed from live data (e.g. "this PK-shaped column has duplicate values",
+"this timestamp column's most recent value is N days old"). Every signal
+listed MUST get an entry in "signals_evaluated" in your response — you may
+decide a signal doesn't need a NEW instance and say so with a reason, but
+you cannot silently omit a listed signal. Some signals (uniqueness
+violations, confirmed cross-table orphan relationships) are marked
+"already proposed this run, do not duplicate" — a candidate instance for
+those already exists outside this conversation (verified deterministically,
+no LLM judgment needed for the objective fact itself); do not add another
+new_instances entry for them, just acknowledge them in signals_evaluated.
+Freshness signals are NOT auto-proposed — a specific staleness threshold is
+a business judgment call only you (or the human reviewer) can make, so you
+decide whether and how to propose a freshness check for those.
+
+You will also be given KNOWN CROSS-TABLE RELATIONSHIPS for this table (real,
+already-verified against live data). If you propose a referential_integrity
+check, ref_table/ref_column MUST come from that list — never invent a
+relationship that wasn't given to you.
+
+You will also be given LOW-CARDINALITY COLUMNS with their full observed
+value sets. If you propose an accepted_values check on one of these columns,
+every value in your accepted_values list MUST come from that observed set —
+any value you list that wasn't actually observed will be silently removed
+before the check can run, so there is no benefit to padding the list from
+assumed/world knowledge."""
 
 USER_PROMPT_TEMPLATE = """Table: {fqn}
 Row count: {row_count}
@@ -88,6 +122,20 @@ Owner: {owner}
 
 === COLUMN STATISTICS (computed from the live data — use these, not guesses) ===
 {column_stats}
+
+=== DETERMINISTIC SIGNALS (objective facts computed from live data — every
+signal below MUST get an entry in signals_evaluated; see system prompt) ===
+{deterministic_signals}
+
+=== KNOWN CROSS-TABLE RELATIONSHIPS (verified against live data — any
+referential_integrity proposal's ref_table/ref_column MUST come from this
+list; never invent one) ===
+{relationship_catalog}
+
+=== LOW-CARDINALITY COLUMNS — full observed value sets (ground any
+accepted_values proposal in these; any value not in this set will be
+silently removed before the check can run) ===
+{closed_set_columns}
 
 === SAMPLE DATA (first 5 rows) ===
 {sample_data}
@@ -108,6 +156,12 @@ Respond with this JSON:
       "keep_running": true/false,
       "severity_override": null or "critical|high|medium|low",
       "reason": "one sentence"
+    }}
+  }},
+  "signals_evaluated": {{
+    "<signal_id>": {{
+      "propose_instance": true/false,
+      "reason": "one sentence — why you did or didn't propose a new_instances entry for this signal"
     }}
   }},
   "new_instances": [
@@ -137,6 +191,8 @@ IMPORTANT REQUIREMENTS:
 - Every definitions_evaluated entry MUST cover every definition listed as
   "ALREADY ACTIVE OR PENDING ON THIS TABLE" above — decide keep_running for
   each one.
+- Every signals_evaluated entry MUST cover every signal_id listed under
+  DETERMINISTIC SIGNALS above — decide propose_instance for each one.
 - new_instances entries with definition_id set reuse an existing definition
   for a NEW target on this table. Entries with new_definition set propose a
   genuinely new concept — only use this when nothing in the library fits.
@@ -151,22 +207,6 @@ IMPORTANT REQUIREMENTS:
 
 VALID_CATEGORIES = {"naming", "documentation", "ownership", "schema", "data_quality", "security", "performance"}
 VALID_SEVERITIES = {"critical", "high", "medium", "low", "info"}
-WORD_STOP = {"a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have",
-             "has", "had", "do", "does", "did", "will", "would", "could", "should", "may",
-             "might", "must", "shall", "can", "need", "dare", "ought", "used", "to", "of",
-             "in", "for", "on", "with", "at", "by", "from", "as", "into", "through", "this",
-             "that", "these", "those", "it", "its", "and", "or", "but", "if", "than", "when",
-             "where", "which", "who", "how", "all", "each", "every", "both", "rule", "check",
-             "column", "table", "snowflake", "data", "quality", "should", "not", "no", "any"}
-
-
-def _word_overlap_score(text1: str, text2: str) -> float:
-    def words(t: str) -> set:
-        return {w.lower() for w in re.findall(r"\w+", t) if w.lower() not in WORD_STOP and len(w) > 2}
-    w1, w2 = words(text1), words(text2)
-    if not w1 or not w2:
-        return 0.0
-    return len(w1 & w2) / min(len(w1), len(w2))
 
 
 class RuleIntelligenceAgent:
@@ -177,6 +217,7 @@ class RuleIntelligenceAgent:
 
     def __init__(self):
         self._severity_backup: Dict[str, str] = {}
+        self._closed_set_columns: Dict[str, dict] = {}
 
     def run(
         self,
@@ -184,6 +225,8 @@ class RuleIntelligenceAgent:
         column_assets: List[Any],
         existing_definitions: List[Any],
         run_id: str,
+        profiler_result: Optional[Dict[str, Any]] = None,
+        relationship_catalog: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """
         Returns a result dict with:
@@ -195,11 +238,28 @@ class RuleIntelligenceAgent:
               — "new" entries have NOT been persisted; the caller (coordinator)
               persists them as PROPOSED/pending only after building the
               review state, so nothing exists in storage until reviewed.
+              Each entry also carries "source": "deterministic" | "llm" —
+              "deterministic" entries bypassed the LLM entirely (uniqueness on
+              a PK-shaped column, a confirmed cross-table orphan relationship)
+              because they're objective facts verified against live data, not
+              business judgment calls — they still go through the same
+              fingerprint/execute/validate path and land pending like every
+              other proposal, so the human-approval gate is unchanged.
           - suppressed: list of dicts describing candidates dropped due to
               fingerprint match against active/rejected instances — logged,
               never shown to the human as new.
+
+        profiler_result (from DeterministicProfilerAgent) and
+        relationship_catalog (from relationship_discovery.get_or_refresh_catalog)
+        are optional so this agent still runs (with reduced signal) if either
+        upstream step failed — see coordinator.py's degrade-gracefully pattern
+        for the rest of this pipeline.
         """
         logger.info(f"[RuleIntelligence] Analyzing {table_asset.fqn}")
+
+        profiler_result = profiler_result or {}
+        relationship_catalog = relationship_catalog or []
+        self._closed_set_columns = profiler_result.get("closed_set_columns") or {}
 
         existing_instances = self._existing_instances_for_table(table_asset)
         rejected_instances = self._rejected_instances_for_table(table_asset)
@@ -220,11 +280,36 @@ class RuleIntelligenceAgent:
                     by_id[resolved.id] = resolved
         all_known_definitions = list(by_id.values())
 
+        # ── Deterministic candidates first — objective facts verified
+        # against live data, bypass the LLM entirely (see class docstring).
+        # Run through the identical _process_candidate fingerprint/execute/
+        # validate path as LLM candidates, just tagged source="deterministic".
+        proposed_instances: List[dict] = []
+        suppressed: List[dict] = []
+        deterministic_fingerprints: Set[str] = set()
+
+        for det_candidate in self._build_deterministic_candidates(
+            table_asset, profiler_result, relationship_catalog, existing_instances,
+        ):
+            result = self._process_candidate(
+                det_candidate, table_asset, run_id, all_known_definitions, source="deterministic",
+            )
+            if result is None:
+                continue
+            if result.get("suppressed"):
+                suppressed.append(result)
+            else:
+                proposed_instances.append(result)
+                deterministic_fingerprints.add(result["fingerprint"])
+
         sample_data = self._fetch_sample(table_asset)
-        column_stats_text = self._fetch_column_stats(table_asset, column_assets)
+        column_stats_text = self._format_column_stats(profiler_result.get("column_stats") or {})
         columns_text = self._format_columns(column_assets)
         definitions_text = self._format_definitions(existing_definitions)
         existing_text = self._format_existing_instances(existing_instances, all_known_definitions)
+        signals_text = self._format_signals(profiler_result, proposed_instances)
+        relationships_text = self._format_relationships(table_asset, relationship_catalog)
+        closed_sets_text = self._format_closed_sets(self._closed_set_columns)
 
         prompt = USER_PROMPT_TEMPLATE.format(
             fqn=table_asset.fqn,
@@ -232,6 +317,9 @@ class RuleIntelligenceAgent:
             owner=table_asset.owner or "unknown",
             columns=columns_text,
             column_stats=column_stats_text,
+            deterministic_signals=signals_text,
+            relationship_catalog=relationships_text,
+            closed_set_columns=closed_sets_text,
             sample_data=sample_data,
             definitions=definitions_text,
             existing_instances=existing_text,
@@ -240,8 +328,30 @@ class RuleIntelligenceAgent:
         raw = self._call_model(prompt)
         parsed = self._extract_json(raw)
 
+        # A parse failure (malformed/truncated response) is NOT the same as a
+        # model that ran fine and proposed nothing — but downstream both look
+        # like "0 new instances". Retry once with an explicit repair
+        # instruction before giving up, and flag the run when even the retry
+        # fails so it surfaces to the reviewer instead of masquerading as a
+        # clean, well-covered table.
+        parse_failed = False
         if not parsed:
-            logger.warning("[RuleIntelligence] Empty JSON from Claude — using defaults")
+            logger.warning("[RuleIntelligence] Could not parse model JSON — retrying once with repair prompt")
+            repair_prompt = (
+                prompt
+                + "\n\nYour previous response could not be parsed as JSON. "
+                "Respond again with ONLY a single valid JSON object matching the "
+                "schema above — no markdown fences, no prose before or after."
+            )
+            raw = self._call_model(repair_prompt)
+            parsed = self._extract_json(raw)
+
+        if not parsed:
+            logger.error(
+                "[RuleIntelligence] Model JSON unparseable after retry — proceeding with "
+                "defaults (0 proposals). Flagging run so this isn't mistaken for full coverage."
+            )
+            parse_failed = True
             parsed = {}
 
         classification = {
@@ -249,6 +359,7 @@ class RuleIntelligenceAgent:
             "table_type_confidence": parsed.get("table_type_confidence", 50),
             "table_type_reason":     parsed.get("table_type_reason", ""),
             "definitions_evaluated": parsed.get("definitions_evaluated", {}),
+            "signals_evaluated":     parsed.get("signals_evaluated", {}),
         }
 
         # Normalize: fill missing decisions with default (keep_running=True)
@@ -260,16 +371,32 @@ class RuleIntelligenceAgent:
                     "reason": "Default — not explicitly re-evaluated",
                 }
 
-        proposed_instances = []
-        suppressed = []
+        # Signals Claude never addressed at all — logged, not hard-failed
+        # (this codebase's existing graceful-degradation philosophy; see
+        # _extract_json falling back to {} rather than raising).
+        expected_signal_ids = {s["signal_id"] for s in self._all_signal_ids(profiler_result)}
+        signals_missed = sorted(expected_signal_ids - set(classification["signals_evaluated"].keys()))
+        if signals_missed:
+            logger.info(f"[RuleIntelligence] Signals not addressed by Claude: {signals_missed}")
+
         for candidate in parsed.get("new_instances", []):
-            result = self._process_candidate(candidate, table_asset, run_id, all_known_definitions)
+            result = self._process_candidate(
+                candidate, table_asset, run_id, all_known_definitions, source="llm",
+            )
             if result is None:
                 continue
             if result.get("suppressed"):
                 suppressed.append(result)
-            else:
-                proposed_instances.append(result)
+                continue
+            if result["fingerprint"] in deterministic_fingerprints:
+                # Claude independently proposed the same target a deterministic
+                # candidate already covers this run — suppress, don't duplicate.
+                suppressed.append({
+                    "suppressed": True, "reason": "already_proposed_deterministically",
+                    "fingerprint": result["fingerprint"], "candidate": candidate,
+                })
+                continue
+            proposed_instances.append(result)
 
         logger.info(
             f"[RuleIntelligence] Table={classification['table_type']}, "
@@ -282,6 +409,8 @@ class RuleIntelligenceAgent:
             "existing_instances": existing_instances,
             "proposed_instances": proposed_instances,
             "suppressed": suppressed,
+            "signals_missed": signals_missed,
+            "parse_failed": parse_failed,
         }
 
     # ── Existing-state gathering ──────────────────────────────────────────
@@ -315,6 +444,123 @@ class RuleIntelligenceAgent:
         )
         return table_scoped
 
+    # ── Deterministic candidate generation ─────────────────────────────────
+
+    def _all_signal_ids(self, profiler_result: Dict[str, Any]) -> List[dict]:
+        """Every signal_id Claude is expected to address in signals_evaluated
+        — PK-shaped-column candidates (regardless of whether they're already
+        violated — even a currently-unique key is worth a forced check-in)
+        and freshness signals. Used both to build the prompt section and to
+        compute signals_missed after the response comes back."""
+        signals = []
+        for cand in profiler_result.get("pk_shaped_candidates", []):
+            signals.append({"signal_id": f"uniqueness:{cand['column']}", **cand})
+        for sig in profiler_result.get("freshness_signals", []):
+            signals.append(sig)
+        return signals
+
+    def _build_deterministic_candidates(
+        self,
+        table_asset: Any,
+        profiler_result: Dict[str, Any],
+        relationship_catalog: List[Any],
+        existing_instances: List[Any],
+    ) -> List[dict]:
+        """Objective facts verified against live data — uniqueness violations
+        on PK-shaped columns, and confirmed cross-table orphan relationships
+        — become candidate dicts in the SAME shape _process_candidate expects
+        from an LLM response, so they run through the identical fingerprint/
+        execute/validate/human-review path. Freshness is deliberately NOT
+        included here (see class docstring / system prompt) — a staleness
+        threshold is a business judgment call, not an objective fact."""
+        candidates: List[dict] = []
+        existing_columns_with_uniqueness = {
+            inst.target_config.get("column")
+            for inst in existing_instances
+            if (inst.target_config or {}).get("column")
+        }
+        # A column matching the PK-shape regex is NOT a uniqueness candidate
+        # if it's a confirmed foreign key on THIS table — a transactions
+        # table having many rows per customer is normal, not a defect.
+        # relationship_discovery's live orphan-rate verification is a fact,
+        # not a guess, so it's the authority here whenever the referenced
+        # table exists in-schema to be discovered against. A PK-shaped
+        # column whose referenced table isn't in this schema (so no
+        # relationship candidate could ever be built for it) still gets
+        # proposed — a human reviews every deterministic proposal anyway,
+        # so a rare false positive here is a one-click skip, not a silent
+        # wrong action.
+        confirmed_fk_columns = {
+            rel.from_column for rel in relationship_catalog
+            if rel.from_table == table_asset.table_name and rel.status == "confirmed"
+        }
+
+        for cand in profiler_result.get("pk_shaped_candidates", []):
+            column = cand["column"]
+            if cand.get("is_unique") is not False:
+                continue  # only propose when live data actually shows duplicates
+            if column in existing_columns_with_uniqueness:
+                continue
+            if column in confirmed_fk_columns:
+                continue  # verified: this column references another table, not this table's own key
+            candidates.append({
+                "definition_id": None,
+                "new_definition": None,
+                "template_shape": "uniqueness",
+                "scope": "column",
+                "column_name": column,
+                "threshold_config": {},
+                "draft_sql": None,
+                "severity": "high",
+                "violation_detected": True,
+                "violation_evidence": (
+                    f"{cand['duplicate_rows']} duplicate value(s) among "
+                    f"{cand['non_null_total']} non-null rows in a PK-shaped column "
+                    f"({cand['distinct']} distinct values)."
+                ),
+                "rationale": (
+                    f"{column} matches common primary-key naming conventions but its "
+                    f"live data has {cand['duplicate_rows']} duplicated value(s) — a real "
+                    "integrity risk for joins, GROUP BY, and deduplication."
+                ),
+            })
+
+        for rel in relationship_catalog:
+            if rel.status != "confirmed" or rel.confidence != "verified":
+                continue
+            if rel.from_table != table_asset.table_name:
+                continue
+            if not rel.orphan_rate:
+                continue
+            candidates.append({
+                "definition_id": None,
+                "new_definition": None,
+                "template_shape": "referential_integrity",
+                "scope": "cross_table",
+                "column_name": rel.from_column,
+                "cross_table_ref": {
+                    "ref_database": table_asset.database_name,
+                    "ref_schema": table_asset.schema_name,
+                    "ref_table": rel.to_table,
+                    "ref_column": rel.to_column,
+                },
+                "threshold_config": {},
+                "draft_sql": None,
+                "severity": "high",
+                "violation_detected": True,
+                "violation_evidence": (
+                    f"{rel.sample_orphans} of {rel.sample_total} rows have a "
+                    f"{rel.from_column} value with no matching row in "
+                    f"{rel.to_table}.{rel.to_column} ({rel.orphan_rate:.1%} orphan rate)."
+                ),
+                "rationale": (
+                    f"{rel.from_column} is a verified foreign key into {rel.to_table} — "
+                    "live data shows orphaned references, breaking referential integrity."
+                ),
+            })
+
+        return candidates
+
     # ── Candidate processing (fingerprint dedup) ──────────────────────────
 
     def _build_target_config(self, candidate: dict, scope: str) -> dict:
@@ -343,6 +589,15 @@ class RuleIntelligenceAgent:
         allowed_tables = [
             f"{table_asset.database_name}.{table_asset.schema_name}.{table_asset.table_name}".upper()
         ]
+        # cross_table checks (referential_integrity) legitimately reference a
+        # second table — the reference target — so it must be in the allow-
+        # list too, or validate_sql rejects every such check regardless of
+        # who proposed it (LLM or deterministic candidate).
+        cross_table_ref = candidate.get("cross_table_ref") or {}
+        if cross_table_ref.get("ref_database") and cross_table_ref.get("ref_schema") and cross_table_ref.get("ref_table"):
+            allowed_tables.append(
+                f"{cross_table_ref['ref_database']}.{cross_table_ref['ref_schema']}.{cross_table_ref['ref_table']}".upper()
+            )
 
         if template_shape:
             try:
@@ -374,9 +629,16 @@ class RuleIntelligenceAgent:
         """Run a validated check SQL now and return (failed_count,
         total_count), or None if execution errors (e.g. TRY_CAST issue not
         caught by static validation). Only ever called with SELECT-only,
-        single-statement, table-scoped SQL that already passed validate_sql()."""
+        single-statement, table-scoped SQL that already passed validate_sql().
+
+        Bounded by a server-side statement timeout: validate_sql() proves the
+        SQL is SELECT-only and table-scoped, but NOT that it's cheap — an
+        AI-authored draft_sql with an accidental cartesian join passes
+        validation yet could scan billions of rows. The timeout caps that
+        blast radius; a query that exceeds it is cancelled and the candidate
+        discarded (execution returned None) rather than proposed."""
         try:
-            rows = sf_session.query(rule_sql)
+            rows = sf_session.query(rule_sql, timeout=_CHECK_SQL_TIMEOUT_SECONDS)
             if not rows:
                 return None
             row = rows[0]
@@ -390,26 +652,68 @@ class RuleIntelligenceAgent:
             logger.warning(f"[RuleIntelligence] Check SQL execution failed: {e}")
             return None
 
+    def _ground_accepted_values(self, candidate: dict, target_config: dict) -> dict:
+        """Mechanically trims any accepted_values list down to values this
+        column's profiled data actually contains — a general-purpose
+        validation gate on the LLM's own output (works identically for any
+        low-cardinality column on any table), not a per-table patch. Values
+        not observed are dropped and logged; if nothing survives, the render
+        step below will reject the candidate outright (an accepted_values
+        check with no accepted values left is not a real check)."""
+        threshold_config = candidate.get("threshold_config") or {}
+        accepted = threshold_config.get("accepted_values")
+        column = target_config.get("column")
+        if not accepted or not column:
+            return candidate
+        closed_set = self._closed_set_columns.get(column)
+        if not closed_set:
+            return candidate  # not profiled as low-cardinality — nothing to ground against
+        observed = {str(v) for v in closed_set.get("values", [])}
+        grounded = [v for v in accepted if str(v) in observed]
+        dropped = [v for v in accepted if str(v) not in observed]
+        if dropped:
+            logger.info(
+                f"[RuleIntelligence] Trimmed accepted_values for {column}: "
+                f"dropped {dropped} (not observed in live data), kept {grounded}"
+            )
+        new_candidate = dict(candidate)
+        new_candidate["threshold_config"] = {**threshold_config, "accepted_values": grounded}
+        return new_candidate
+
     def _process_candidate(
         self,
         candidate: dict,
         table_asset: Any,
         run_id: str,
         existing_definitions: List[Any],
+        source: str = "llm",
     ) -> Optional[dict]:
         scope = (candidate.get("scope") or "table").lower()
         column_name = candidate.get("column_name")
         target_config = self._build_target_config(candidate, scope)
+        candidate = self._ground_accepted_values(candidate, target_config)
 
         definition_id = candidate.get("definition_id")
         new_definition_data = candidate.get("new_definition")
+        template_shape = candidate.get("template_shape")
+
+        is_new_definition = False
+        definition = None
 
         if definition_id:
             definition = storage.get_definition(definition_id)
             if not definition:
                 logger.warning(f"[RuleIntelligence] Claude referenced unknown definition_id={definition_id}")
                 return None
-            is_new_definition = False
+        elif template_shape and storage.get_definition_by_template_shape(template_shape):
+            # Deterministic backstop — checked BEFORE the fuzzy-similarity
+            # path so it works even for a candidate Claude never attaches a
+            # definition_id to. A canonical definition for this shape already
+            # exists system-wide; always reuse it instead of letting a new
+            # per-table/per-column duplicate spawn. The candidate's own
+            # name/description (if any) is discarded — its business-specific
+            # rationale is preserved separately via RULE_INSTANCES.RATIONALE.
+            definition = storage.get_definition_by_template_shape(template_shape)
         elif new_definition_data:
             # Check if this "new" concept actually matches an existing one by
             # name/description similarity — Claude sometimes re-describes a
@@ -417,7 +721,6 @@ class RuleIntelligenceAgent:
             matched = self._find_similar_definition(new_definition_data, existing_definitions)
             if matched:
                 definition = matched
-                is_new_definition = False
             else:
                 definition = None  # not persisted yet — staged below
                 is_new_definition = True
@@ -428,19 +731,29 @@ class RuleIntelligenceAgent:
         if severity not in VALID_SEVERITIES:
             severity = "medium"
 
-        # A genuinely new concept must resolve to real, executable SQL —
-        # this is the fix for AI rules being a one-time opinion with no
-        # handler behind them. Reusing an existing definition needs no new
-        # SQL: its check_kind/handler_key or rule_sql was already settled
-        # when it was first approved.
+        # sql_template checks need rule_sql rendered/validated/executed for
+        # THIS SPECIFIC target — whether the definition is brand new or a
+        # reused canonical/matched one, because rule_sql/threshold_config are
+        # per-instance, not per-definition (a shared "not_null" definition
+        # still needs a fresh SELECT for each new column it's applied to).
+        # python_handler reuse needs none: its dispatch is by handler_key
+        # against already-fetched metadata, settled when the definition was
+        # first approved, not per-target.
+        needs_rule_sql = definition is None or definition.check_kind == "sql_template"
+        effective_template_shape = template_shape or (definition.template_shape if definition else None)
+
         rule_sql = None
         violated_override: Optional[bool] = None
         evidence_override: Optional[str] = None
-        if is_new_definition:
-            rule_sql, threshold_config = self._build_rule_sql(candidate, table_asset, target_config)
+        threshold_config = candidate.get("threshold_config") or {}
+
+        if needs_rule_sql:
+            render_candidate = {**candidate, "template_shape": effective_template_shape}
+            rule_sql, threshold_config = self._build_rule_sql(render_candidate, table_asset, target_config)
+            label = new_definition_data.get("name", "?") if new_definition_data else (definition.name if definition else "?")
             if not rule_sql:
                 logger.info(
-                    f"[RuleIntelligence] Discarding candidate '{new_definition_data.get('name', '?')}' — "
+                    f"[RuleIntelligence] Discarding candidate '{label}' — "
                     "no valid template_shape or draft_sql resolved to executable SQL"
                 )
                 return None
@@ -451,15 +764,13 @@ class RuleIntelligenceAgent:
             executed = self._execute_check_sql(rule_sql)
             if executed is None:
                 logger.info(
-                    f"[RuleIntelligence] Discarding candidate '{new_definition_data.get('name', '?')}' — "
+                    f"[RuleIntelligence] Discarding candidate '{label}' — "
                     "rule_sql failed to execute against Snowflake"
                 )
                 return None
             failed_count, total_count = executed
             violated_override = failed_count > 0
             evidence_override = f"{failed_count} of {total_count} rows fail this check"
-        else:
-            threshold_config = candidate.get("threshold_config") or {}
 
         # Fingerprint requires a definition_id — for a genuinely new
         # definition we don't have one yet, so fingerprint against a stable
@@ -487,7 +798,7 @@ class RuleIntelligenceAgent:
             if existing_match.status == "rejected":
                 new_evidence = candidate.get("violation_evidence") or ""
                 old_reason = existing_match.rejection_reason or ""
-                if new_evidence and _word_overlap_score(new_evidence, old_reason) < 0.3:
+                if new_evidence and word_overlap_score(new_evidence, old_reason) < 0.3:
                     logger.info(
                         f"[RuleIntelligence] Re-proposing previously rejected fingerprint "
                         f"{fingerprint[:12]} — new evidence differs from rejection reason"
@@ -506,13 +817,15 @@ class RuleIntelligenceAgent:
         return {
             "suppressed": False,
             "kind": "new" if is_new_definition else "reuse",
+            "source": source,
             "fingerprint": fingerprint,
             "definition": definition,  # None if is_new_definition
             "new_definition_data": new_definition_data if is_new_definition else None,
+            "template_shape": effective_template_shape,
             "scope": scope,
             "target_config": target_config,
             "threshold_config": threshold_config,
-            "rule_sql": rule_sql,  # only set for is_new_definition; reuse needs none
+            "rule_sql": rule_sql,  # set whenever needs_rule_sql was true
             "column_name": column_name,
             "severity": severity,
             "violated": violated,
@@ -527,10 +840,10 @@ class RuleIntelligenceAgent:
         combined = f"{name} {desc}"
         best_score, best = 0.0, None
         for d in existing_definitions:
-            score = _word_overlap_score(combined, f"{d.name} {d.description or ''}")
+            score = word_overlap_score(combined, f"{d.name} {d.description or ''}")
             if score > best_score:
                 best_score, best = score, d
-        return best if best_score >= 0.55 else None
+        return best if best_score >= DEFAULT_SIMILARITY_THRESHOLD else None
 
     # ── Classification decision helpers (consumed by coordinator) ────────
 
@@ -568,55 +881,72 @@ class RuleIntelligenceAgent:
             logger.warning(f"[RuleIntelligence] Could not fetch sample data: {e}")
         return "(sample data unavailable)"
 
-    def _fetch_column_stats(self, table_asset: Any, column_assets: List[Any]) -> str:
-        """Real per-column stats (null%, distinct count, min/max, top values)
-        computed from the live table — this is what grounds a proposed
-        check's violation_evidence in actual data instead of a 3-row guess.
-        One query per column, capped at 20 columns to bound cost on wide
-        tables; skips columns that error (e.g. unsupported type for MIN/MAX)
-        rather than failing the whole scan."""
-        fqn = table_asset.fqn
+    def _format_column_stats(self, column_stats: Dict[str, dict]) -> str:
+        """Formats DeterministicProfilerAgent's column_stats for the prompt —
+        the querying itself now happens once, upstream in profiler_agent.py,
+        reused for both this text and deterministic candidate generation."""
+        if not column_stats:
+            return "  (stats unavailable)"
         lines = []
-        for col in column_assets[:20]:
-            name = col.column_name
-            if not name:
-                continue
-            try:
-                rows = sf_session.query(
-                    f"""
-                    SELECT
-                        COUNT(*) AS TOTAL,
-                        COUNT_IF({name} IS NULL) AS NULLS,
-                        COUNT(DISTINCT {name}) AS DISTINCT_COUNT
-                    FROM {fqn}
-                    """
-                )
-                stat = rows[0] if rows else {}
-                total = stat.get("TOTAL", 0) or 0
-                nulls = stat.get("NULLS", 0) or 0
-                distinct = stat.get("DISTINCT_COUNT", 0) or 0
-                null_pct = round((nulls / total * 100), 1) if total else 0.0
+        for name, stat in column_stats.items():
+            top_values = ", ".join(f"{tv['value']!r}({tv['count']})" for tv in stat.get("top_values", []))
+            lines.append(
+                f"  {name:<25} null%={stat['null_pct']:<6} distinct={stat['distinct']:<8} "
+                f"top_values=[{top_values}]"
+            )
+        return "\n".join(lines)
 
-                top_rows = sf_session.query(
-                    f"""
-                    SELECT {name} AS VAL, COUNT(*) AS CNT
-                    FROM {fqn}
-                    WHERE {name} IS NOT NULL
-                    GROUP BY {name}
-                    ORDER BY CNT DESC
-                    LIMIT 5
-                    """
-                )
-                top_values = ", ".join(f"{r['VAL']!r}({r['CNT']})" for r in top_rows)
+    def _format_signals(self, profiler_result: Dict[str, Any], deterministic_proposed: List[dict]) -> str:
+        """Every signal Claude must acknowledge in signals_evaluated — see
+        system prompt. Uniqueness/referential-integrity signals already
+        covered by a deterministic candidate this run are marked so Claude
+        doesn't duplicate them; freshness signals are always open for Claude
+        to decide on, since a staleness threshold is a judgment call."""
+        proposed_columns = {
+            p["target_config"].get("column")
+            for p in deterministic_proposed
+            if p.get("target_config")
+        }
+        lines = []
+        for cand in profiler_result.get("pk_shaped_candidates", []):
+            column = cand["column"]
+            status = "VIOLATED — duplicates found" if cand.get("is_unique") is False else "currently unique"
+            already = " [already proposed this run, do not duplicate]" if column in proposed_columns else ""
+            lines.append(
+                f"  signal_id=uniqueness:{column}  column={column}  {status} "
+                f"({cand['distinct']} distinct / {cand['non_null_total']} non-null){already}"
+            )
+        for sig in profiler_result.get("freshness_signals", []):
+            lines.append(
+                f"  signal_id={sig['signal_id']}  column={sig['column']} ({sig['data_type']})  "
+                f"most recent value={sig['max_value']}  age={sig['age_days']} days"
+            )
+        return "\n".join(lines) if lines else "  (no deterministic signals for this table)"
 
-                lines.append(
-                    f"  {name:<25} null%={null_pct:<6} distinct={distinct:<8} "
-                    f"top_values=[{top_values}]"
-                )
-            except Exception as e:
-                logger.debug(f"[RuleIntelligence] Skipping stats for column {name}: {e}")
-                continue
-        return "\n".join(lines) if lines else "  (stats unavailable)"
+    def _format_relationships(self, table_asset: Any, relationship_catalog: List[Any]) -> str:
+        relevant = [
+            r for r in relationship_catalog
+            if r.from_table == table_asset.table_name and r.status == "confirmed"
+        ]
+        if not relevant:
+            return "  (no verified cross-table relationships found for this table)"
+        lines = []
+        for r in relevant:
+            orphan_note = f", orphan_rate={r.orphan_rate:.1%}" if r.orphan_rate else ""
+            lines.append(
+                f"  {r.from_column} -> {r.to_table}.{r.to_column}  "
+                f"confidence={r.confidence}{orphan_note}"
+            )
+        return "\n".join(lines)
+
+    def _format_closed_sets(self, closed_set_columns: Dict[str, dict]) -> str:
+        if not closed_set_columns:
+            return "  (no low-cardinality columns profiled for this table)"
+        lines = []
+        for name, info in closed_set_columns.items():
+            values = ", ".join(repr(v) for v in info["values"][:50])
+            lines.append(f"  {name} ({info['distinct_count']} distinct values): [{values}]")
+        return "\n".join(lines)
 
     def _format_columns(self, column_assets: List[Any]) -> str:
         lines = []
@@ -658,7 +988,13 @@ class RuleIntelligenceAgent:
 
     def _call_model(self, prompt: str) -> str:
         try:
-            return sf_session.ask_cortex(prompt, model="claude-opus-4-8")
+            # ask_cortex has no separate system-prompt channel, so the system
+            # prompt MUST be prepended to the user prompt here — otherwise the
+            # (default) Cortex path runs with none of the constraints, output
+            # schema, or grounding rules in SYSTEM_PROMPT, while only the
+            # Bedrock fallback below gets them. Keep both paths equivalent.
+            cortex_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
+            return sf_session.ask_cortex(cortex_prompt, model="claude-opus-4-8")
         except Exception as e:
             logger.warning(f"[RuleIntelligence] Cortex failed ({e}), using Claude/Bedrock")
         return ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=4096)

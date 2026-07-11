@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Loader2, CheckCircle, XCircle, ShieldCheck, Menu, X } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Loader2, CheckCircle, XCircle, ShieldCheck, Menu, X, Library } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { aiApi, healthApi } from './api/client'
 import Dashboard from './pages/Dashboard'
@@ -9,6 +9,7 @@ import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
 import AIFix from './pages/AIFix'
 import Rules from './pages/Rules'
+import RuleLibrary from './pages/RuleLibrary'
 
 function App() {
   const location = useLocation()
@@ -34,11 +35,12 @@ function App() {
   const sfConnected = sfHealth?.status === 'connected'
 
   const navigation = [
-    { name: 'Dashboard', href: '/',         icon: Home        },
-    { name: 'Assets',    href: '/assets',   icon: Database    },
-    { name: 'Findings',  href: '/findings', icon: AlertCircle },
-    { name: 'Rules',     href: '/rules',    icon: ShieldCheck },
-    { name: 'Workflow',  href: '/workflow', icon: GitBranch   },
+    { name: 'Dashboard',    href: '/',             icon: Home        },
+    { name: 'Assets',       href: '/assets',       icon: Database    },
+    { name: 'Findings',     href: '/findings',     icon: AlertCircle },
+    { name: 'Rules',        href: '/rules',        icon: ShieldCheck },
+    { name: 'Rule Library', href: '/rule-library', icon: Library     },
+    { name: 'Workflow',     href: '/workflow',     icon: GitBranch   },
   ]
 
   if (connectingSnowflake) {
@@ -163,6 +165,7 @@ function App() {
             <Route path="/workflow" element={<AgentWorkflow />} />
             <Route path="/ai-fix"   element={<AIFix />}         />
             <Route path="/rules"    element={<Rules />}         />
+            <Route path="/rule-library" element={<RuleLibrary />} />
           </Routes>
         </main>
       </div>

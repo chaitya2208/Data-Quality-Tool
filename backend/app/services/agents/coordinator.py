@@ -1,11 +1,13 @@
 """
-WorkflowCoordinator — new pipeline:
+WorkflowCoordinator — pipeline:
 
   Coordinator
       ↓
-  [Metadata Agent ∥ Rules Fetch Agent]   ← parallel threads
+  [Metadata Agent ∥ Rules Fetch Agent ∥ Relationship Discovery Agent]   ← parallel threads
       ↓
-  Rule Intelligence Agent                ← Claude: selects + generates rules
+  Profiler Agent                         ← deterministic stats (needs column_assets)
+      ↓
+  Rule Intelligence Agent                ← deterministic candidates + Claude proposals
       ↓
   Findings Agent                         ← runs rules, persists findings
       ↓  [developer fixes — manual]
@@ -25,6 +27,8 @@ AGENT_ORDER = [
     "coordinator",
     "metadata_agent",
     "rules_fetch_agent",
+    "relationship_discovery_agent",
+    "profiler_agent",
     "rule_intelligence_agent",
     "findings_agent",
     "fix_issues",          # UI-only node
@@ -35,6 +39,8 @@ DB_AGENT_ORDER = [
     "coordinator",
     "metadata_agent",
     "rules_fetch_agent",
+    "relationship_discovery_agent",
+    "profiler_agent",
     "rule_intelligence_agent",
     "findings_agent",
     "verification_agent",
@@ -61,8 +67,8 @@ class WorkflowCoordinator:
         storage.update_agent_run(self.run_id, status="running", started_at=datetime.utcnow())
 
         all_downstream = [
-            "metadata_agent", "rules_fetch_agent", "rule_intelligence_agent",
-            "findings_agent", "verification_agent",
+            "metadata_agent", "rules_fetch_agent", "relationship_discovery_agent", "profiler_agent",
+            "rule_intelligence_agent", "findings_agent", "verification_agent",
         ]
 
         # ── Coordinator: validate target ──────────────────────────────────────
@@ -90,14 +96,17 @@ class WorkflowCoordinator:
             self._mark_run_failed(str(e))
             return
 
-        # ── Parallel: Metadata Agent + Rules Fetch Agent ──────────────────────
-        meta_task   = self._get_task("metadata_agent")
-        rules_task  = self._get_task("rules_fetch_agent")
+        # ── Parallel: Metadata ∥ Rules Fetch ∥ Relationship Discovery ─────────
+        meta_task = self._get_task("metadata_agent")
+        rules_task = self._get_task("rules_fetch_agent")
+        reldisc_task = self._get_task("relationship_discovery_agent")
         self._start_task(meta_task)
         self._start_task(rules_task)
+        self._start_task(reldisc_task)
 
         meta_result  = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
         rules_result = {"rule_codes": None, "error": None}
+        reldisc_result = {"catalog": None, "error": None}
 
         def _run_metadata():
             try:
@@ -132,15 +141,33 @@ class WorkflowCoordinator:
                 rules_result["error"] = str(e)
                 self._fail_task(rules_task, str(e))
 
-        t1 = threading.Thread(target=_run_metadata,    daemon=True)
-        t2 = threading.Thread(target=_run_rules_fetch, daemon=True)
-        t1.start(); t2.start()
-        t1.join();  t2.join()
+        def _run_relationship_discovery():
+            # Only needs database/schema — known before MetadataAgent even
+            # runs — so this belongs in the parallel group, not sequential.
+            # Cached per (database, schema) with a 24h TTL, so a schema-scope
+            # batch only pays discovery cost on its first table.
+            try:
+                from app.services.relationship_discovery import get_or_refresh_catalog
+                catalog = get_or_refresh_catalog(run.database, run.schema_name)
+                reldisc_result["catalog"] = catalog
+                self._complete_task(reldisc_task, output={
+                    "relationships_found": len(catalog),
+                    "confirmed": len([r for r in catalog if r.status == "confirmed"]),
+                })
+            except Exception as e:
+                reldisc_result["error"] = str(e)
+                self._fail_task(reldisc_task, str(e))
+
+        t1 = threading.Thread(target=_run_metadata,               daemon=True)
+        t2 = threading.Thread(target=_run_rules_fetch,             daemon=True)
+        t3 = threading.Thread(target=_run_relationship_discovery,  daemon=True)
+        t1.start(); t2.start(); t3.start()
+        t1.join();  t2.join();  t3.join()
 
         run = storage.get_agent_run(self.run_id)
 
         if meta_result["error"]:
-            self._skip_tasks(["rule_intelligence_agent", "findings_agent", "verification_agent"])
+            self._skip_tasks(["profiler_agent", "rule_intelligence_agent", "findings_agent", "verification_agent"])
             self._mark_run_failed(meta_result["error"])
             return
 
@@ -157,6 +184,27 @@ class WorkflowCoordinator:
                 logger.warning(f"[Coordinator] Rules fetch failed: {rules_result['error']}, loading all active definitions")
             _, existing_definitions = storage.list_definitions(status="active", limit=1000)
 
+        if reldisc_result["error"]:
+            logger.warning(f"[Coordinator] Relationship discovery failed: {reldisc_result['error']}, continuing with no catalog")
+        relationship_catalog = reldisc_result["catalog"] or []
+
+        # ── Profiler Agent — needs column_assets, so runs after the join ──────
+        profiler_task = self._get_task("profiler_agent")
+        self._start_task(profiler_task)
+        try:
+            from app.services.agents.profiler_agent import DeterministicProfilerAgent
+            profiler_result = DeterministicProfilerAgent().run(table_asset, column_assets)
+            self._complete_task(profiler_task, output={
+                "columns_profiled": len(profiler_result.get("column_stats", {})),
+                "pk_shaped_candidates": len(profiler_result.get("pk_shaped_candidates", [])),
+                "freshness_signals": len(profiler_result.get("freshness_signals", [])),
+                "closed_set_columns": len(profiler_result.get("closed_set_columns", {})),
+            })
+        except Exception as e:
+            logger.error(f"[Coordinator] ProfilerAgent failed: {e}")
+            self._fail_task(profiler_task, str(e))
+            profiler_result = {}
+
         # ── Rule Intelligence Agent ───────────────────────────────────────────
         intel_task = self._get_task("rule_intelligence_agent")
         self._start_task(intel_task)
@@ -164,7 +212,10 @@ class WorkflowCoordinator:
         try:
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent()
-            intel_result = agent.run(table_asset, column_assets, existing_definitions, run.id)
+            intel_result = agent.run(
+                table_asset, column_assets, existing_definitions, run.id,
+                profiler_result=profiler_result, relationship_catalog=relationship_catalog,
+            )
 
             classification       = intel_result["classification"]
             proposed_instances   = intel_result["proposed_instances"]
@@ -176,6 +227,9 @@ class WorkflowCoordinator:
                 "table_type_reason":     classification["table_type_reason"],
                 "existing_instances_evaluated": len(intel_result["existing_instances"]),
                 "new_instances_proposed": len(proposed_instances),
+                "deterministic_proposals": len([p for p in proposed_instances if p.get("source") == "deterministic"]),
+                "signals_missed": intel_result.get("signals_missed", []),
+                "parse_failed": intel_result.get("parse_failed", False),
                 "suppressed_duplicates": [
                     {"reason": s["reason"], "fingerprint": s["fingerprint"][:12]}
                     for s in suppressed
@@ -213,6 +267,7 @@ class WorkflowCoordinator:
                 "reason":            decision.get("reason", ""),
                 "is_new_instance":   False,
                 "is_new_definition": False,
+                "source":            "existing",
                 "scope":             inst.scope,
                 "target_config":     inst.target_config,
             }
@@ -224,7 +279,11 @@ class WorkflowCoordinator:
         # Newly proposed instances — persist as PENDING (never auto-active),
         # new definitions persist as PROPOSED (never auto-active either).
         # This is the explicit approval gate: nothing here runs until a
-        # human approves it via review-rules + run-pipeline.
+        # human approves it via review-rules + run-pipeline. "deterministic"
+        # proposals (uniqueness on a PK-shaped column, a confirmed cross-
+        # table orphan relationship) go through this exact same gate —
+        # bypassing the LLM for the objective fact never bypasses human
+        # review of whether to activate the check.
         for proposal in proposed_instances:
             if proposal["kind"] == "new":
                 nd = proposal["new_definition_data"] or {}
@@ -235,13 +294,19 @@ class WorkflowCoordinator:
                 # discards any candidate that doesn't resolve to validated,
                 # executable SQL) — check_kind is always sql_template here,
                 # never python_handler, since we have no Python function to
-                # bind to a Claude-authored concept.
+                # bind to a Claude-authored concept. template_shape is set
+                # whenever the candidate named one of the 9 known shapes (all
+                # pre-seeded as canonical, see 06_seed_canonical_shape_
+                # definitions.sql) so a shape not yet seeded still becomes
+                # canonical from this point forward, closing the definition-
+                # library-explosion loop for future shapes too.
                 definition = storage.create_definition(
                     name=nd.get("name", "Untitled Check"),
                     category=category,
                     description=nd.get("description", ""),
                     check_kind="sql_template",
                     sql_template=proposal["rule_sql"],
+                    template_shape=proposal.get("template_shape"),
                     default_threshold_config=proposal["threshold_config"],
                     default_severity=proposal["severity"],
                     allowed_scopes=[proposal["scope"]],
@@ -264,6 +329,7 @@ class WorkflowCoordinator:
                 target_config=proposal["target_config"],
                 threshold_config=proposal["threshold_config"],
                 rule_sql=proposal["rule_sql"],
+                rationale=proposal["rationale"],
                 status="pending",
                 is_active=False,
                 owner="rule_intelligence_agent",
@@ -281,16 +347,33 @@ class WorkflowCoordinator:
                 "reason":            proposal["rationale"],
                 "is_new_instance":   True,
                 "is_new_definition": proposal["kind"] == "new",
+                "source":            proposal.get("source", "llm"),
                 "scope":             proposal["scope"],
                 "target_config":     proposal["target_config"],
                 "violated":          proposal["violated"],
                 "violation_evidence": proposal["evidence"],
             })
 
+        # signals_missed = deterministic signals Claude never addressed at all.
+        # Freshness is the exposed flank: it has no deterministic backstop (a
+        # staleness threshold is a judgment call, so it's never auto-proposed),
+        # so an omitted freshness signal means NO freshness check is proposed
+        # and, without this, nobody would know. Surface it into the review
+        # state so the reviewer sees "N signals unaddressed" instead of a clean
+        # screen that hides the gap.
+        signals_missed = intel_result.get("signals_missed", [])
         storage.update_agent_run(
             self.run_id,
             ai_rules_count=len([p for p in proposed_instances if p["kind"] == "new"]),
-            instance_review_state={"active": active_entries, "skipped": skipped_entries},
+            instance_review_state={
+                "active": active_entries,
+                "skipped": skipped_entries,
+                "signals_missed": signals_missed,
+                # True when the model's response couldn't be parsed even after a
+                # retry — the reviewer should treat "0 proposals" with suspicion
+                # rather than as confirmation the table is fully covered.
+                "parse_failed": intel_result.get("parse_failed", False),
+            },
             status="awaiting_rule_review",
         )
         logger.info(
