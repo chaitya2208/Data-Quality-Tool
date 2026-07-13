@@ -5,13 +5,14 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from typing import List, Optional
 
 from app.services import storage
+from app.services.snowflake_session import session as sf_session
 from app.schemas.agent_run import (
     AgentRunCreateRequest, AgentRunResponse, AgentRunListResponse,
     AgentRuleSuggestion, AgentTaskResponse, RuleReviewRequest,
     AgentBatchCreateRequest, AgentBatchResponse, BulkInstanceActionRequest,
 )
 from app.services.agents.coordinator import WorkflowCoordinator, DB_AGENT_ORDER
-from app.services.snowflake_session import session as sf_session
+from app.services.datasources import get_source
 import logging
 
 router = APIRouter()
@@ -41,6 +42,7 @@ def _build_task_response(task) -> AgentTaskResponse:
 def _build_run_response(run) -> AgentRunResponse:
     return AgentRunResponse(
         id=run.id,
+        connection_id=getattr(run, "connection_id", None),
         batch_id=getattr(run, "batch_id", None),
         batch_index=getattr(run, "batch_index", 0) or 0,
         database=run.database,
@@ -66,6 +68,7 @@ def start_workflow(
 ):
     """Start a new agent workflow run. Returns immediately; pipeline runs in background."""
     run = storage.create_agent_run(
+        connection_id=request.connection_id,
         database=request.database,
         schema_name=request.schema_name,
         table=request.table,
@@ -79,19 +82,7 @@ def start_workflow(
     return _build_run_response(run)
 
 
-def _list_tables(database: str, schema: str) -> List[str]:
-    rows = sf_session.query(f"SHOW TABLES IN {database}.{schema}")
-    return [r.get("name") or r.get("NAME") for r in rows if r.get("name") or r.get("NAME")]
-
-
-def _list_schemas(database: str) -> List[str]:
-    rows = sf_session.query(f"SHOW SCHEMAS IN DATABASE {database}")
-    names = [r.get("name") or r.get("NAME") for r in rows if r.get("name") or r.get("NAME")]
-    # INFORMATION_SCHEMA has no user tables — skip it
-    return [n for n in names if n.upper() != "INFORMATION_SCHEMA"]
-
-
-def _expand_scope(req: AgentBatchCreateRequest) -> List[tuple]:
+def _expand_scope(req: AgentBatchCreateRequest, source) -> List[tuple]:
     """Resolve a scope request into an ordered list of (database, schema, table)."""
     scope = (req.scope or "table").lower()
 
@@ -103,14 +94,14 @@ def _expand_scope(req: AgentBatchCreateRequest) -> List[tuple]:
     if scope == "schema":
         if not req.schema_name:
             raise HTTPException(status_code=400, detail="scope=schema requires schema_name")
-        tables = _list_tables(req.database, req.schema_name)
+        tables = [t["name"] for t in source.list_tables(req.database, req.schema_name)]
         return [(req.database, req.schema_name, t) for t in tables]
 
     if scope == "database":
         targets: List[tuple] = []
-        for sch in _list_schemas(req.database):
-            for t in _list_tables(req.database, sch):
-                targets.append((req.database, sch, t))
+        for sch in source.list_schemas(req.database):
+            for t in source.list_tables(req.database, sch):
+                targets.append((req.database, sch, t["name"]))
         return targets
 
     raise HTTPException(status_code=400, detail=f"Unknown scope '{req.scope}'")
@@ -125,7 +116,8 @@ def start_batch(request: AgentBatchCreateRequest):
     previous one reaches rule review / awaiting fixes.
     """
     try:
-        targets = _expand_scope(request)
+        source = get_source(request.connection_id)
+        targets = _expand_scope(request, source)
     except HTTPException:
         raise
     except Exception as e:
@@ -138,6 +130,7 @@ def start_batch(request: AgentBatchCreateRequest):
     runs = []
     for idx, (database, schema_name, table) in enumerate(targets):
         run = storage.create_agent_run(
+            connection_id=request.connection_id,
             database=database,
             schema_name=schema_name,
             table=table,
@@ -381,7 +374,7 @@ def trigger_verification(run_id: str, background_tasks: BackgroundTasks):
             else:
                 storage.update_agent_run(run_id, status="awaiting_fixes")
                 # Reschedule auto-verify for next cycle
-                schedule_auto_verify(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
+                schedule_auto_verify(run_id)
 
         except Exception as e:
             logger.error(f"Verification failed: {e}")
@@ -392,7 +385,7 @@ def trigger_verification(run_id: str, background_tasks: BackgroundTasks):
             except Exception:
                 pass
             # Reschedule even after failure
-            schedule_auto_verify(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
+            schedule_auto_verify(run_id)
             return
 
     background_tasks.add_task(_run_verification)

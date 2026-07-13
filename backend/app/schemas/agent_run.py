@@ -8,6 +8,7 @@ class AgentRunCreateRequest(BaseModel):
     database: str
     schema_name: str
     table: str
+    connection_id: Optional[str] = None
 
 
 class AgentBatchCreateRequest(BaseModel):
@@ -22,6 +23,7 @@ class AgentBatchCreateRequest(BaseModel):
     database: str
     schema_name: Optional[str] = None
     table: Optional[str] = None
+    connection_id: Optional[str] = None
 
 
 class AgentTaskResponse(BaseModel):
@@ -41,6 +43,7 @@ class AgentTaskResponse(BaseModel):
 
 class AgentRunResponse(BaseModel):
     id: str
+    connection_id: Optional[str] = None
     batch_id: Optional[str] = None
     batch_index: int = 0
     database: str

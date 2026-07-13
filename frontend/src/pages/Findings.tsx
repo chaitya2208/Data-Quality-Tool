@@ -161,14 +161,14 @@ export default function Findings() {
     high:     'bg-orange-100 text-orange-800 border-orange-200',
     medium:   'bg-yellow-100 text-yellow-800 border-yellow-200',
     low:      'bg-blue-100 text-blue-800 border-blue-200',
-  }[s] ?? 'bg-gray-100 text-gray-800 border-gray-200')
+  }[s] ?? 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   const stColor = (s: string) => ({
     detected:  'bg-red-50 text-red-700 border-red-200',
     validated: 'bg-yellow-50 text-yellow-700 border-yellow-200',
     assigned:  'bg-blue-50 text-blue-700 border-blue-200',
     resolved:  'bg-green-50 text-green-700 border-green-200',
-  }[s] ?? 'bg-gray-50 text-gray-700 border-gray-200')
+  }[s] ?? 'bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   return (
     <div className="space-y-6">
@@ -176,13 +176,13 @@ export default function Findings() {
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Findings</h1>
-          <p className="mt-2 text-gray-600">
+          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 dark:text-gray-100">Findings</h1>
+          <p className="mt-2 text-gray-600 dark:text-gray-300">
             {anyFilter ? (
-              <>Showing <span className="font-semibold text-gray-900">{data?.findings.length ?? 0}</span> of{' '}
-              <span className="font-semibold text-gray-900">{allFindings?.total ?? 0}</span> quality issues</>
+              <>Showing <span className="font-semibold text-gray-900 dark:text-gray-100">{data?.findings.length ?? 0}</span> of{' '}
+              <span className="font-semibold text-gray-900 dark:text-gray-100">{allFindings?.total ?? 0}</span> quality issues</>
             ) : (
-              <><span className="font-semibold text-gray-900">{data?.total ?? 0}</span> quality issues detected</>
+              <><span className="font-semibold text-gray-900 dark:text-gray-100">{data?.total ?? 0}</span> quality issues detected</>
             )}
             {selectedFindings.length > 0 && (
               <span className="ml-2 text-primary-600 font-semibold">({selectedFindings.length} selected)</span>
@@ -199,13 +199,13 @@ export default function Findings() {
       </div>
 
       {/* ── Filters ──────────────────────────────────────────────────────────── */}
-      <div className="bg-white rounded-lg shadow p-4 space-y-3">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4 space-y-3">
         <div className="flex items-center gap-2 mb-1">
-          <Filter className="w-4 h-4 text-gray-400" />
-          <span className="text-sm font-medium text-gray-600">Filters</span>
+          <Filter className="w-4 h-4 text-gray-400 dark:text-gray-400" />
+          <span className="text-sm font-medium text-gray-600 dark:text-gray-300">Filters</span>
           {anyFilter && (
             <button onClick={clearAll}
-              className="ml-auto flex items-center gap-1 text-xs text-gray-500 hover:text-gray-800 px-2 py-1 rounded hover:bg-gray-100">
+              className="ml-auto flex items-center gap-1 text-xs text-gray-500 dark:text-gray-300 hover:text-gray-800 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700">
               <X className="w-3 h-3" /> Clear all
             </button>
           )}
@@ -215,12 +215,12 @@ export default function Findings() {
 
           {/* Table */}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1">
               Table ({uniqueTables.length})
             </label>
             <select value={tableFilter.startsWith('__table_name__') ? tableFilter : tableFilter}
               onChange={e => { setTableFilter(e.target.value); setSearchParams({}) }}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Tables</option>
               {uniqueTables.map(t => (
                 <option key={t.fqn} value={t.fqn}>{t.table_name}</option>
@@ -230,11 +230,11 @@ export default function Findings() {
 
           {/* Rule */}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1 flex items-center gap-1">
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1 flex items-center gap-1">
               <ShieldCheck className="w-3 h-3" /> Rule ({uniqueRuleCodes.length} active)
             </label>
             <select value={ruleFilter} onChange={e => setRuleFilter(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Rules</option>
               {uniqueRuleCodes.map(code => {
                 const rule = rulesData?.rules.find(r => r.code === code)
@@ -249,9 +249,9 @@ export default function Findings() {
 
           {/* Severity */}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Severity</label>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1">Severity</label>
             <select value={severityFilter} onChange={e => setSeverityFilter(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Severities</option>
               <option value="critical">Critical</option>
               <option value="high">High</option>
@@ -263,9 +263,9 @@ export default function Findings() {
 
           {/* Status */}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Status</label>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1">Status</label>
             <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Statuses</option>
               <option value="detected">Detected</option>
               <option value="validated">Validated</option>
@@ -315,47 +315,47 @@ export default function Findings() {
 
       {/* Bulk select bar */}
       {data?.findings && data.findings.length > 0 && (
-        <div className="bg-white rounded-lg shadow p-4 flex items-center justify-between">
+        <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4 flex items-center justify-between">
           <label className="flex items-center cursor-pointer">
             <input type="checkbox"
               checked={selectedFindings.length === data.findings.length}
               onChange={handleSelectAll}
-              className="w-4 h-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500" />
-            <span className="ml-2 text-sm font-medium text-gray-700">
+              className="w-4 h-4 text-primary-600 border-gray-300 dark:border-gray-600 rounded focus:ring-primary-500" />
+            <span className="ml-2 text-sm font-medium text-gray-700 dark:text-gray-200">
               Select All ({data.findings.length})
             </span>
           </label>
           {selectedFindings.length > 0 && (
             <div className="flex items-center gap-3">
-              <span className="text-sm text-gray-600">{selectedFindings.length} selected</span>
-              <button onClick={() => setSelectedFindings([])} className="text-sm text-gray-600 hover:text-gray-900">Clear</button>
+              <span className="text-sm text-gray-600 dark:text-gray-300">{selectedFindings.length} selected</span>
+              <button onClick={() => setSelectedFindings([])} className="text-sm text-gray-600 dark:text-gray-300 hover:text-gray-900">Clear</button>
             </div>
           )}
         </div>
       )}
 
       {/* Findings list */}
-      <div className="bg-white rounded-lg shadow overflow-hidden">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
         {isLoading ? (
           <div className="p-12 text-center">
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600 mx-auto mb-4" />
-            <p className="text-gray-500">Loading findings…</p>
+            <p className="text-gray-500 dark:text-gray-300">Loading findings…</p>
           </div>
         ) : data?.findings.length === 0 ? (
           <div className="p-12 text-center">
             <AlertCircle className="w-16 h-16 text-gray-300 mx-auto mb-4" />
             {anyFilter ? (
               <>
-                <p className="text-lg font-medium text-gray-900 mb-2">No findings match your filters</p>
-                <p className="text-sm text-gray-500 mb-4">Try adjusting or clearing the filters above</p>
+                <p className="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No findings match your filters</p>
+                <p className="text-sm text-gray-500 dark:text-gray-300 mb-4">Try adjusting or clearing the filters above</p>
                 <button onClick={clearAll} className="px-4 py-2 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700">
                   Clear Filters
                 </button>
               </>
             ) : (
               <>
-                <p className="text-lg font-medium text-gray-900 mb-2">No quality issues found yet</p>
-                <p className="text-sm text-gray-500 mb-4">Scan a table to discover data quality issues</p>
+                <p className="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No quality issues found yet</p>
+                <p className="text-sm text-gray-500 dark:text-gray-300 mb-4">Scan a table to discover data quality issues</p>
                 <button onClick={() => navigate('/scanner')} className="px-4 py-2 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700">
                   Go to Scanner
                 </button>
@@ -363,15 +363,15 @@ export default function Findings() {
             )}
           </div>
         ) : (
-          <div className="divide-y divide-gray-200">
+          <div className="divide-y divide-gray-200 dark:divide-gray-700">
             {data?.findings.map(finding => (
-              <div key={finding.id} className="p-6 hover:bg-gray-50 transition-colors">
+              <div key={finding.id} className="p-6 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
                 <div className="flex items-start gap-4">
                   <div className="flex-shrink-0 pt-1">
                     <input type="checkbox"
                       checked={selectedFindings.includes(finding.id)}
                       onChange={() => handleSelectFinding(finding.id)}
-                      className="w-5 h-5 text-primary-600 border-gray-300 rounded focus:ring-primary-500 cursor-pointer" />
+                      className="w-5 h-5 text-primary-600 border-gray-300 dark:border-gray-600 rounded focus:ring-primary-500 cursor-pointer" />
                   </div>
 
                   <div className="flex-1 min-w-0">
@@ -407,7 +407,7 @@ export default function Findings() {
                           onClick={() => setTableFilter(
                             `${finding.context.database_name}.${finding.context.schema_name}.${finding.context.table_name}`
                           )}
-                          className="inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700 border border-gray-300 hover:bg-gray-200 transition-colors"
+                          className="inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-300 dark:border-gray-600 hover:bg-gray-200 transition-colors"
                           title="Filter by this table"
                         >
                           <Database className="w-3 h-3 mr-1" />
@@ -416,17 +416,17 @@ export default function Findings() {
                       </div>
                     )}
 
-                    <h3 className="text-base font-semibold text-gray-900 mb-1">{finding.title}</h3>
-                    <p className="text-sm text-gray-600 mb-3">{finding.description}</p>
+                    <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-1">{finding.title}</h3>
+                    <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">{finding.description}</p>
 
-                    <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500">
+                    <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500 dark:text-gray-300">
                       {finding.context?.fqn && (
-                        <span className="font-mono bg-gray-50 px-2 py-1 rounded border border-gray-200">
+                        <span className="font-mono bg-gray-50 dark:bg-gray-900 px-2 py-1 rounded border border-gray-200 dark:border-gray-700">
                           {finding.context.fqn}
                         </span>
                       )}
                       <span className="flex items-center">
-                        <span className="text-gray-400 mr-1">Detected:</span>
+                        <span className="text-gray-400 dark:text-gray-400 mr-1">Detected:</span>
                         {new Date(finding.detected_at).toLocaleString()}
                       </span>
                     </div>

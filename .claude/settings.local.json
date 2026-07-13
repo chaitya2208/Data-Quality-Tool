@@ -128,7 +128,9 @@
       "Bash(awk 'NR>=1 && NR<=10' /tmp/mergecheck/app.ours)",
       "Bash(awk 'NR>=13 && NR<=23' /tmp/mergecheck/app.ours)",
       "Bash(awk 'NR>=27 && NR<=46' /tmp/mergecheck/app.ours)",
-      "Bash(awk 'NR>=150 && NR<=178' /tmp/mergecheck/app.ours)"
+      "Bash(awk 'NR>=150 && NR<=178' /tmp/mergecheck/app.ours)",
+      "Bash(git check-ignore *)",
+      "Bash(grep -rn *)"
     ]
   }
 }

@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        # Ignore unrelated keys that may linger in .env (e.g. a legacy
+        # DATABASE_URL from the pre-Snowflake SQLite era) instead of failing
+        # startup. All app state now lives in Snowflake (DQ_APP), not SQLite.
+        extra = "ignore"
 
 
 settings = Settings()

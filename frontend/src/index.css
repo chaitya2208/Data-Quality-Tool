@@ -15,7 +15,7 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   -webkit-tap-highlight-color: transparent;
-  @apply bg-gray-50;
+  @apply bg-gray-50 dark:bg-gray-900;
 }
 
 /* Consistent form controls on iOS */

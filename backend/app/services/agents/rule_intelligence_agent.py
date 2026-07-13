@@ -997,7 +997,12 @@ class RuleIntelligenceAgent:
             return sf_session.ask_cortex(cortex_prompt, model="claude-opus-4-8")
         except Exception as e:
             logger.warning(f"[RuleIntelligence] Cortex failed ({e}), using Claude/Bedrock")
-        return ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=4096)
+        # Bedrock fallback: the 2-arg CORTEX.COMPLETE path has a low,
+        # unraisable output cap that can truncate the large rule-
+        # classification response, so the fallback uses a much higher
+        # ceiling — ask_claude streams internally, so the full response
+        # comes back intact even near 32k tokens.
+        return ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=32000)
 
     @staticmethod
     def _extract_json(text: str) -> dict:

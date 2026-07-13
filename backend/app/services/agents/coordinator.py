@@ -28,6 +28,7 @@ AGENT_ORDER = [
     "metadata_agent",
     "rules_fetch_agent",
     "relationship_discovery_agent",
+    "profiling_agent",
     "profiler_agent",
     "rule_intelligence_agent",
     "findings_agent",
@@ -40,6 +41,7 @@ DB_AGENT_ORDER = [
     "metadata_agent",
     "rules_fetch_agent",
     "relationship_discovery_agent",
+    "profiling_agent",
     "profiler_agent",
     "rule_intelligence_agent",
     "findings_agent",
@@ -75,20 +77,18 @@ class WorkflowCoordinator:
         coord_task = self._get_task("coordinator")
         self._start_task(coord_task)
         try:
-            rows = sf_session.query(
-                f"SHOW TABLES LIKE '{run.table}' IN {run.database}.{run.schema_name}"
-            )
-            match = next(
-                (r for r in rows if (r.get("name") or "").upper() == run.table.upper()),
-                None,
-            )
-            if not match:
+            from app.services.datasources import get_source
+            source = get_source(run.connection_id)
+            info = source.table_info(run.database, run.schema_name, run.table)
+            tables = source.list_tables(run.database, run.schema_name)
+            exists = any((t.get("name") or "").upper() == run.table.upper() for t in tables)
+            if not exists:
                 raise ValueError(
-                    f"Table {run.database}.{run.schema_name}.{run.table} not found in Snowflake"
+                    f"Table {run.database}.{run.schema_name}.{run.table} not found in the data source"
                 )
             self._complete_task(coord_task, output={
                 "target":    f"{run.database}.{run.schema_name}.{run.table}",
-                "row_count": match.get("rows"),
+                "row_count": info.get("row_count"),
             })
         except Exception as e:
             self._fail_task(coord_task, str(e))
@@ -96,23 +96,29 @@ class WorkflowCoordinator:
             self._mark_run_failed(str(e))
             return
 
-        # ── Parallel: Metadata ∥ Rules Fetch ∥ Relationship Discovery ─────────
-        meta_task = self._get_task("metadata_agent")
-        rules_task = self._get_task("rules_fetch_agent")
+        # ── Parallel: Metadata ∥ Rules Fetch ∥ Relationship Discovery ∥ Profiling ──
+        # Threads store only IDs / plain dicts — never DB row objects. The shared
+        # Snowflake session is thread-safe (serialized), so no per-thread session.
+        meta_task    = self._get_task("metadata_agent")
+        rules_task   = self._get_task("rules_fetch_agent")
         reldisc_task = self._get_task("relationship_discovery_agent")
+        profile_task = self._get_task("profiling_agent")
         self._start_task(meta_task)
         self._start_task(rules_task)
         self._start_task(reldisc_task)
+        if profile_task:
+            self._start_task(profile_task)
 
-        meta_result  = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
-        rules_result = {"rule_codes": None, "error": None}
+        meta_result    = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
+        rules_result   = {"rule_codes": None, "error": None}
         reldisc_result = {"catalog": None, "error": None}
+        profile_result = {"profile": None, "error": None}
 
         def _run_metadata():
             try:
                 from app.services.agents.metadata_agent import MetadataAgent
                 scan, table_asset, column_assets = MetadataAgent().run(
-                    run.database, run.schema_name, run.table
+                    run.database, run.schema_name, run.table, run.connection_id
                 )
                 meta_result["scan_id"]        = scan.id
                 meta_result["table_asset_id"] = table_asset.id
@@ -158,11 +164,35 @@ class WorkflowCoordinator:
                 reldisc_result["error"] = str(e)
                 self._fail_task(reldisc_task, str(e))
 
+        def _run_profiling():
+            # UI-facing profiling (anomaly surfacing / Data Explorer) — best-
+            # effort, and NOT consumed by RuleIntelligenceAgent (that agent
+            # gets its own deterministic column stats from ProfilerAgent,
+            # run sequentially below since it needs column_assets).
+            if not profile_task:
+                return
+            try:
+                from app.services.agents.profiling_agent import ProfilingAgent
+                prof = ProfilingAgent(None).run(run.database, run.schema_name, run.table, run.connection_id)
+                profile_result["profile"] = prof
+                anomalies = prof.get("anomalies", [])
+                self._complete_task(profile_task, output={
+                    "columns_profiled": len(prof.get("columns", [])),
+                    "anomalies_found":  len(anomalies),
+                    "anomalies":        anomalies[:20],
+                    "row_count":        prof.get("table", {}).get("row_count"),
+                    "sampled":          prof.get("table", {}).get("is_sampled", False),
+                })
+            except Exception as e:
+                profile_result["error"] = str(e)
+                self._fail_task(profile_task, str(e))
+
         t1 = threading.Thread(target=_run_metadata,               daemon=True)
         t2 = threading.Thread(target=_run_rules_fetch,             daemon=True)
         t3 = threading.Thread(target=_run_relationship_discovery,  daemon=True)
-        t1.start(); t2.start(); t3.start()
-        t1.join();  t2.join();  t3.join()
+        t4 = threading.Thread(target=_run_profiling,               daemon=True)
+        t1.start(); t2.start(); t3.start(); t4.start()
+        t1.join();  t2.join();  t3.join();  t4.join()
 
         run = storage.get_agent_run(self.run_id)
 
@@ -481,14 +511,40 @@ class WorkflowCoordinator:
             storage.update_agent_run(self.run_id, findings_count=len(findings))
 
             sev_breakdown = {}
+            fired_instance_ids = set()  # instances that produced at least one finding
+            findings_by_instance = {}
             for f in findings:
                 sev_breakdown[f.severity] = sev_breakdown.get(f.severity, 0) + 1
+                iid = f.instance_id
+                if iid:
+                    fired_instance_ids.add(iid)
+                    findings_by_instance[iid] = findings_by_instance.get(iid, 0) + 1
+
+            # Split the executed (approved) instance set into "used" (produced a
+            # finding) vs "unused" (ran clean) — mirrors the active/skipped panel
+            # from Rule Intelligence, so the user sees what fired and what came
+            # back clean. Keyed by instance_id (harsh's rule-instance model).
+            name_by_instance = {e["instance_id"]: e.get("name", e["instance_id"]) for e in active_entries}
+            rules_used = [
+                {"instance_id": iid, "name": name_by_instance.get(iid, iid),
+                 "findings": findings_by_instance.get(iid, 0)}
+                for iid in approved_instance_ids if iid in fired_instance_ids
+            ]
+            rules_unused = [
+                {"instance_id": iid, "name": name_by_instance.get(iid, iid)}
+                for iid in approved_instance_ids if iid not in fired_instance_ids
+            ]
 
             self._complete_task(findings_task, output={
                 "findings_count":     len(findings),
                 "severity_breakdown": sev_breakdown,
                 "scan_id":            scan.id,
                 "new_instances_approved": new_instances_approved,
+                "rules_executed":     len(approved_instance_ids),
+                "rules_used_count":   len(rules_used),
+                "rules_unused_count": len(rules_unused),
+                "rules_used":         rules_used,
+                "rules_unused":       rules_unused,
             })
         except Exception as e:
             self._fail_task(findings_task, str(e))
