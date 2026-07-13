@@ -67,9 +67,20 @@ export default function AIFix() {
 
   const isLoading = loadingFindings || loadingRecommendations
 
+  // Which data source these findings belong to. All findings in one AI-Fix
+  // session share a connection, so the first recommendation's source_type is
+  // authoritative. Postgres/RDS fixes run as the connection's user — no
+  // Snowflake role/warehouse — so the UI branches on this.
+  const firstRec       = recommendations?.[0]
+  const isPostgres     = firstRec?.source_type === 'postgres'
+  const connectionName = firstRec?.connection_name ?? ''
+  const connectionUser = firstRec?.connection_user ?? ''
+
   const executeMutation = useMutation({
     mutationFn: ({ findingId, sqlQuery }: { findingId: string; sqlQuery: string }) =>
-      aiApi.executeSQL(findingId, sqlQuery, effectiveWarehouse, effectiveRole),
+      isPostgres
+        ? aiApi.executeSQL(findingId, sqlQuery)
+        : aiApi.executeSQL(findingId, sqlQuery, effectiveWarehouse, effectiveRole),
     onSuccess: (_, variables) => {
       setExecutedFixes(prev => [...prev, variables.findingId])
       queryClient.invalidateQueries({ queryKey: ['findings'] })
@@ -92,7 +103,8 @@ export default function AIFix() {
     else navigate(`/ai-fix?findings=${remaining.join(',')}&return_to=${encodeURIComponent(returnTo)}`)
   }
 
-  const canExecute = !!effectiveWarehouse && !!effectiveRole
+  // Postgres needs no Snowflake context; Snowflake needs a role + warehouse.
+  const canExecute = isPostgres || (!!effectiveWarehouse && !!effectiveRole)
 
   if (loadingFindings) {
     return (
@@ -134,7 +146,8 @@ export default function AIFix() {
             </p>
           </div>
 
-          {/* Role + Warehouse dropdowns */}
+          {/* Role + Warehouse dropdowns — Snowflake only */}
+          {!isPostgres && (
           <div className="flex flex-wrap items-end gap-3">
             {/* Role dropdown */}
             <div className="flex flex-col gap-1">
@@ -190,11 +203,25 @@ export default function AIFix() {
               </div>
             </div>
           </div>
+          )}
+
+          {/* Postgres/RDS: no role/warehouse — show which connection it runs as */}
+          {isPostgres && (
+            <div className="flex flex-col gap-1 items-end">
+              <label className="text-xs font-medium text-gray-500 dark:text-gray-300 flex items-center gap-1">
+                <Server className="w-3 h-3 text-primary-500" /> Runs on
+              </label>
+              <span className="inline-flex items-center gap-1.5 px-3 py-2 border-2 border-primary-200 dark:border-primary-500/40 rounded-lg bg-white dark:bg-gray-800 text-sm font-medium text-gray-900 dark:text-gray-100">
+                {connectionName || 'Postgres connection'}
+                {connectionUser && <span className="text-gray-400 dark:text-gray-400">· {connectionUser}</span>}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Active context pill */}
-      {canExecute && (
+      {/* Active context pill — Snowflake role+warehouse */}
+      {!isPostgres && canExecute && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <span className="flex items-center gap-1.5 bg-purple-50 border border-purple-200 text-purple-800 px-3 py-1.5 rounded-full font-medium">
             <ShieldCheck className="w-3.5 h-3.5" /> {effectiveRole}
@@ -210,19 +237,33 @@ export default function AIFix() {
         </div>
       )}
 
-      {!canExecute && !loadingWarehouses && !loadingRoles && (
+      {/* Postgres/RDS context pill — connection + user */}
+      {isPostgres && (
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="flex items-center gap-1.5 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-500/40 text-blue-800 dark:text-blue-300 px-3 py-1.5 rounded-full font-medium">
+            <Server className="w-3.5 h-3.5" /> {connectionName || 'Postgres/RDS'}
+            {connectionUser && <span className="opacity-80">· {connectionUser}</span>}
+          </span>
+          <span className="text-gray-400 dark:text-gray-400 italic hidden sm:inline">— fixes run on this connection</span>
+        </div>
+      )}
+
+      {!isPostgres && !canExecute && !loadingWarehouses && !loadingRoles && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-sm text-yellow-800">
           ⚠️ Could not load warehouse or role from Snowflake. Check your connection.
         </div>
       )}
 
       {/* Info banner */}
-      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 flex items-start gap-3">
+      <div className="bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-500/40 rounded-lg p-4 flex items-start gap-3">
         <Sparkles className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
-        <p className="text-sm text-blue-800">
+        <p className="text-sm text-blue-800 dark:text-blue-300">
           <span className="font-semibold">Review each fix carefully before approving.</span>{' '}
-          The AI generates SQL based on the detected issue. Once you execute, the fix runs in Snowflake
-          under the role and warehouse selected above, and the finding is marked resolved.
+          The AI generates SQL based on the detected issue. Once you execute, the fix runs{' '}
+          {isPostgres
+            ? <>on <span className="font-medium">{connectionName || 'the Postgres connection'}</span>{connectionUser ? <> as <span className="font-medium">{connectionUser}</span></> : null}</>
+            : <>in Snowflake under the role and warehouse selected above</>}
+          , and the finding is marked resolved.
         </p>
       </div>
 
@@ -399,14 +440,16 @@ export default function AIFix() {
                         className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700 transition-colors"
                       >
                         <Server className="w-4 h-4" />
-                        Execute as <span className="font-bold">{effectiveRole}</span> on <span className="font-bold">{effectiveWarehouse}</span>
+                        {isPostgres
+                          ? <>Execute Fix{connectionName ? <> on <span className="font-bold">{connectionName}</span></> : null}</>
+                          : <>Execute as <span className="font-bold">{effectiveRole}</span> on <span className="font-bold">{effectiveWarehouse}</span></>}
                       </button>
                     )}
 
                     {isExecuting && (
                       <div className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-primary-50 text-primary-700 font-medium rounded-lg">
                         <Loader2 className="w-4 h-4 animate-spin" />
-                        Running on {effectiveWarehouse}...
+                        {isPostgres ? `Running on ${connectionName || 'Postgres'}...` : `Running on ${effectiveWarehouse}...`}
                       </div>
                     )}
 

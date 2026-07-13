@@ -422,6 +422,11 @@ def list_findings(
     if status:
         where.append("STATUS = %(status)s")
         params["status"] = status
+    else:
+        # 'superseded' findings are stale rows replaced by a newer scan's run —
+        # never surface them by default (they'd inflate totals and clutter the
+        # list). Only shown if explicitly filtered for.
+        where.append("STATUS <> 'superseded'")
     if severity:
         where.append("SEVERITY = %(severity)s")
         params["severity"] = severity
@@ -466,6 +471,51 @@ def update_finding(finding_id: str, **fields: Any) -> SimpleNamespace:
     return get_finding(finding_id)
 
 
+# Open (non-closed) finding statuses — anything not here is considered resolved/
+# closed and won't be superseded or shown under "Detected".
+_OPEN_FINDING_STATUSES = ("detected", "validated", "in_progress")
+
+
+def supersede_open_findings(
+    table_asset_id: str,
+    instance_ids,
+    except_scan_id: str,
+) -> int:
+    """
+    Mark still-open findings from PRIOR scans as 'superseded' when a new scan is
+    about to re-create findings for the same instances. Without this, re-running
+    a workflow on a table leaves stale 'detected' twins from the old scan, so one
+    real issue appears in both Detected and Resolved.
+
+    Scoped by INSTANCE_ID (these are this run's approved instances, all bound to
+    this table), still-open status only, and a DIFFERENT scan than the one being
+    created. `table_asset_id` is accepted for clarity/future use. Returns rows
+    affected.
+    """
+    ids = [i for i in (instance_ids or []) if i]
+    if not ids:
+        return 0
+    in_open = ", ".join(f"'{s}'" for s in _OPEN_FINDING_STATUSES)
+    placeholders = ", ".join(f"%(iid{n})s" for n in range(len(ids)))
+    params = {"except_scan": except_scan_id}
+    for n, iid in enumerate(ids):
+        params[f"iid{n}"] = iid
+    affected = sf_session.execute(
+        f"""
+        UPDATE FINDINGS
+        SET STATUS = 'superseded', CLOSED_AT = CURRENT_TIMESTAMP(),
+            UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE INSTANCE_ID IN ({placeholders})
+          AND STATUS IN ({in_open})
+          AND (SCAN_ID IS NULL OR SCAN_ID <> %(except_scan)s)
+        """,
+        params,
+    )
+    if affected:
+        logger.info(f"[storage] Superseded {affected} stale open findings for table asset {table_asset_id}")
+    return affected or 0
+
+
 def findings_with_asset_not_closed() -> list[tuple[SimpleNamespace, SimpleNamespace]]:
     """(finding, asset) pairs for every finding not RESOLVED/CLOSED — dashboard chart."""
     rows = sf_session.query(
@@ -474,7 +524,7 @@ def findings_with_asset_not_closed() -> list[tuple[SimpleNamespace, SimpleNamesp
                a.TABLE_NAME AS A_TABLE_NAME, a.FQN AS A_FQN
         FROM FINDINGS f
         JOIN ASSETS a ON a.ID = f.ASSET_ID
-        WHERE f.STATUS NOT IN ('resolved', 'closed')
+        WHERE f.STATUS NOT IN ('resolved', 'closed', 'superseded')
         """
     )
     result = []
@@ -491,14 +541,16 @@ def findings_with_asset_not_closed() -> list[tuple[SimpleNamespace, SimpleNamesp
 
 
 def findings_summary() -> dict:
-    """total / by_status / by_severity counts — dashboard stats."""
-    total_rows = sf_session.query("SELECT COUNT(*) AS CNT FROM FINDINGS")
+    """total / by_status / by_severity counts — dashboard stats. Excludes
+    'superseded' (stale rows replaced by a newer scan) so counts reflect real
+    current findings, not re-scan duplicates."""
+    total_rows = sf_session.query("SELECT COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded'")
     total = total_rows[0]["CNT"] if total_rows else 0
 
-    status_rows = sf_session.query("SELECT STATUS, COUNT(*) AS CNT FROM FINDINGS GROUP BY STATUS")
+    status_rows = sf_session.query("SELECT STATUS, COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded' GROUP BY STATUS")
     by_status = {r["STATUS"]: r["CNT"] for r in status_rows}
 
-    severity_rows = sf_session.query("SELECT SEVERITY, COUNT(*) AS CNT FROM FINDINGS GROUP BY SEVERITY")
+    severity_rows = sf_session.query("SELECT SEVERITY, COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded' GROUP BY SEVERITY")
     by_severity = {r["SEVERITY"]: r["CNT"] for r in severity_rows}
 
     return {"total": total, "by_status": by_status, "by_severity": by_severity}

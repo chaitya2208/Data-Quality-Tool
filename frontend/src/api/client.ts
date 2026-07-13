@@ -342,6 +342,9 @@ export interface AIRecommendation {
   impact: string;
   from_cache: boolean;
   source: string; // cortex | claude | cache | error
+  source_type: string; // snowflake | postgres — which data source the fix runs against
+  connection_name: string | null; // Postgres: "runs on <conn>"
+  connection_user: string | null; // Postgres: the user the fix runs as
 }
 
 export interface WarehouseInfo {
@@ -458,7 +461,7 @@ export const aiApi = {
   getRoles: () => api.get<RoleInfo[]>('/ai/roles'),
   getRecommendations: (findingIds: string[]) =>
     api.post<AIRecommendation[]>('/ai/recommendations', findingIds),
-  executeSQL: (findingId: string, sqlQuery: string, warehouse: string, role: string) =>
+  executeSQL: (findingId: string, sqlQuery: string, warehouse?: string, role?: string) =>
     api.post('/ai/execute', { finding_id: findingId, sql_query: sqlQuery, warehouse, role }),
 };
 

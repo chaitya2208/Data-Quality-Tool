@@ -5,7 +5,7 @@ from app.services.snowflake_session import session as sf_session
 from app.services import recommendation_cache_service as rec_cache
 from app.services.cortex_client import ask_for_recommendation, _sanitize_sql
 from pydantic import BaseModel
-from typing import List, Any
+from typing import List, Any, Optional
 from datetime import datetime
 import logging
 
@@ -42,6 +42,13 @@ def _call_claude_for_finding(finding: Any, rule_code: str, context: dict):
     data_type = full_context["data_type"]
     cache_key = rec_cache.build_cache_key(rule_code, data_type)
 
+    # Resolve the finding's connection up front so BOTH the cache-hit and
+    # cache-miss paths can report the source type (snowflake vs postgres) and,
+    # for postgres, which connection/user the fix will run as. The AI-Fix UI
+    # uses this to show role+warehouse (Snowflake) or a plain connection line
+    # (Postgres) instead of forcing Snowflake controls onto every finding.
+    conn_info = _resolve_connection_info(finding)
+
     # ── Cache hit ──────────────────────────────────────────────────────────────
     cached = rec_cache.get_cached(cache_key, full_context)
     if cached:
@@ -53,6 +60,7 @@ def _call_claude_for_finding(finding: Any, rule_code: str, context: dict):
             impact=cached["impact"],
             from_cache=True,
             source="cache",
+            **conn_info,
         )
 
     # ── Cache miss: call Cortex (with live schema) → fallback Claude ──────────
@@ -108,7 +116,29 @@ def _call_claude_for_finding(finding: Any, rule_code: str, context: dict):
         impact=impact,
         from_cache=False,
         source=source,
+        **conn_info,
     )
+
+
+def _resolve_connection_info(finding: Any) -> dict:
+    """
+    {source_type, connection_name, connection_user} for the finding's data
+    source, derived from its scan's connection. Defaults to snowflake with no
+    name/user (the legacy single-source case) when the connection can't be
+    resolved. Never raises — recommendation generation shouldn't fail over this.
+    """
+    info = {"source_type": "snowflake", "connection_name": None, "connection_user": None}
+    try:
+        scan = storage.get_scan(finding.scan_id) if finding.scan_id else None
+        conn = storage.get_connection_record(scan.connection_id) if scan and scan.connection_id else None
+        if conn:
+            ctype = conn.type.value if hasattr(conn.type, "value") else str(conn.type)
+            info["source_type"] = ctype or "snowflake"
+            info["connection_name"] = conn.name
+            info["connection_user"] = conn.username
+    except Exception as e:
+        logger.debug(f"[AI] Could not resolve connection info for finding {getattr(finding, 'id', '?')}: {e}")
+    return info
 
 
 class AIRecommendation(BaseModel):
@@ -119,6 +149,11 @@ class AIRecommendation(BaseModel):
     impact: str
     from_cache: bool = False
     source: str = "unknown"  # cortex | claude | cache | error
+    # Which data source the fix will run against, so the UI shows the right
+    # execution controls (Snowflake role+warehouse vs. a Postgres connection).
+    source_type: str = "snowflake"        # snowflake | postgres
+    connection_name: Optional[str] = None  # for the Postgres "runs on <conn>" line
+    connection_user: Optional[str] = None  # the Postgres user the fix runs as
 
 
 class WarehouseInfo(BaseModel):
@@ -144,16 +179,18 @@ class SnowflakeContext(BaseModel):
 class ExecuteSQLRequest(BaseModel):
     finding_id: str
     sql_query: str
-    warehouse: str
-    role: str
+    # Snowflake-only execution context. Omitted for Postgres/RDS findings, whose
+    # execute path ignores them (the fix runs as the connection's Postgres user).
+    warehouse: Optional[str] = None
+    role: Optional[str] = None
 
 
 class ExecuteSQLResponse(BaseModel):
     success: bool
     message: str
     finding_id: str
-    warehouse_used: str
-    role_used: str
+    warehouse_used: Optional[str] = None
+    role_used: Optional[str] = None
     executed_at: datetime
 
 
@@ -217,6 +254,13 @@ def get_ai_recommendations(finding_ids: List[str]):
         except Exception as e:
             logger.warning(f"Claude call failed for {finding_id}, using template: {e}")
             rec = _generate_recommendation(finding, rule_code, context)
+            # The template fallback doesn't resolve the source; stamp the
+            # connection info so the UI still branches correctly (Postgres vs
+            # Snowflake) instead of defaulting every fallback to Snowflake.
+            conn_info = _resolve_connection_info(finding)
+            rec.source_type      = conn_info["source_type"]
+            rec.connection_name  = conn_info["connection_name"]
+            rec.connection_user  = conn_info["connection_user"]
 
         recommendations.append(rec)
     return recommendations
@@ -258,14 +302,16 @@ def execute_sql_fix(request: ExecuteSQLRequest):
             warehouse=request.warehouse,
         )
 
+        # Only mention role/warehouse when they were actually used (Snowflake);
+        # Postgres runs as the connection's user, so omit them.
+        ctx_note = ""
+        if request.role or request.warehouse:
+            ctx_note = f"Role: {request.role}. Warehouse: {request.warehouse}. "
         storage.update_finding(
             finding.id,
             status="resolved",
             resolution_notes=(
-                f"Fixed via AI recommendation. "
-                f"Role: {request.role}. "
-                f"Warehouse: {request.warehouse}. "
-                f"SQL: {request.sql_query}"
+                f"Fixed via AI recommendation. {ctx_note}SQL: {request.sql_query}"
             ),
             resolved_at=datetime.utcnow(),
         )
@@ -281,12 +327,12 @@ def execute_sql_fix(request: ExecuteSQLRequest):
 
     except Exception as e:
         logger.error(f"Execution failed for finding {request.finding_id}: {e}")
+        ctx_note = ""
+        if request.role or request.warehouse:
+            ctx_note = f"Role: {request.role}, Warehouse: {request.warehouse}. "
         storage.update_finding(
             finding.id,
-            resolution_notes=(
-                f"Execution failed. Role: {request.role}, "
-                f"Warehouse: {request.warehouse}. Error: {str(e)}"
-            ),
+            resolution_notes=f"Execution failed. {ctx_note}Error: {str(e)}",
         )
         raise HTTPException(
             status_code=500,

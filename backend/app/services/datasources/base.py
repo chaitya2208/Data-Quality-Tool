@@ -48,6 +48,15 @@ class DataSource(ABC):
     def table_info(self, database: str, schema: str, table: str) -> Dict[str, Any]:
         """{name, row_count, bytes, kind, owner, comment}."""
 
+    @abstractmethod
+    def query(self, sql: str) -> List[Dict[str, Any]]:
+        """
+        Run an arbitrary read-only SELECT and return rows as dicts. Used to run
+        Claude-authored sql_template checks (FAILED_COUNT/TOTAL_COUNT SELECTs)
+        against THIS source. Snowflake returns UPPERCASE keys, Postgres
+        lowercase — callers must be tolerant of both.
+        """
+
     # ── profiling primitives ─────────────────────────────────────────────────
     @abstractmethod
     def column_stats(self, database: str, schema: str, table: str,
