@@ -19,7 +19,7 @@ function StatusDot({ connId }: { connId: string }) {
     retry: false,
   })
   if (isLoading) return <span className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-400"><Loader2 className="w-3 h-3 animate-spin" />checking</span>
-  if (data?.ok) return <span className="flex items-center gap-1 text-xs text-green-600"><CheckCircle2 className="w-3 h-3" />connected</span>
+  if (data?.ok) return <span className="flex items-center gap-1 text-xs text-green-600"><CheckCircle2 className="w-3 h-3" />connected{data.user ? ` · ${data.user}` : ''}</span>
   return <span className="flex items-center gap-1 text-xs text-red-600" title={data?.detail ?? ''}><XCircle className="w-3 h-3" />error</span>
 }
 
@@ -100,7 +100,7 @@ export default function Connections({ embedded = false }: { embedded?: boolean }
                     <div className="min-w-0">
                       <p className="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">{c.name}</p>
                       <p className="text-xs text-gray-400 dark:text-gray-400 truncate">
-                        {meta.label} · {c.host ?? '—'}{c.database ? ` / ${c.database}` : ''}{c.username ? ` · ${c.username}` : ''}
+                        {meta.label} · {c.host ?? '—'}{c.database ? ` / ${c.database}` : ''}
                       </p>
                       {testResult[c.id] && <p className="text-xs mt-0.5 text-gray-500 dark:text-gray-300">{testResult[c.id]}</p>}
                     </div>

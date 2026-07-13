@@ -1,12 +1,96 @@
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { workflowsApi, agentRunsApi, type WorkflowTemplate, type RulePattern } from '../api/client'
+import { workflowsApi, agentRunsApi, assetsApi, ruleLibraryApi, type WorkflowTemplate, type RulePattern } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import {
   BookOpen, Play, Pencil, Trash2, X, Save,
   ChevronDown, ChevronRight, Database, AlertTriangle, Loader2,
+  Plus, Search,
 } from 'lucide-react'
+
+// ── Searchable combobox ───────────────────────────────────────────────────────
+
+function Combobox({
+  value,
+  onChange,
+  options,
+  placeholder,
+  loading,
+  disabled,
+  error,
+}: {
+  value: string
+  onChange: (v: string) => void
+  options: string[]
+  placeholder: string
+  loading?: boolean
+  disabled?: boolean
+  error?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState(value)
+  const ref = useRef<HTMLDivElement>(null)
+
+  // Sync internal query when value changes externally (e.g. reset)
+  useEffect(() => { setQuery(value) }, [value])
+
+  // Close on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const filtered = options.filter(o => o.toLowerCase().includes(query.toLowerCase()))
+
+  const select = (v: string) => {
+    onChange(v)
+    setQuery(v)
+    setOpen(false)
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <div className="relative">
+        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400 pointer-events-none" />
+        <input
+          value={query}
+          onChange={e => { setQuery(e.target.value); onChange(e.target.value); setOpen(true) }}
+          onFocus={() => setOpen(true)}
+          disabled={disabled}
+          placeholder={loading ? 'Loading…' : error ? 'Failed to load' : placeholder}
+          className={`w-full text-sm border rounded-lg pl-8 pr-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100 disabled:opacity-50 disabled:cursor-not-allowed ${
+            error ? 'border-red-300' : 'border-gray-300 dark:border-gray-600'
+          } focus:ring-2 focus:ring-primary-500 focus:border-transparent`}
+        />
+        {loading && <Loader2 className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 animate-spin text-gray-400" />}
+      </div>
+      {open && !loading && filtered.length > 0 && (
+        <ul className="absolute z-50 mt-1 w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg max-h-48 overflow-y-auto">
+          {filtered.map(o => (
+            <li
+              key={o}
+              onMouseDown={() => select(o)}
+              className={`px-3 py-2 text-sm cursor-pointer hover:bg-primary-50 dark:hover:bg-primary-900/30 ${
+                o === value ? 'bg-primary-50 dark:bg-primary-900/30 font-medium text-primary-700 dark:text-primary-300' : 'text-gray-800 dark:text-gray-200'
+              }`}
+            >
+              {o}
+            </li>
+          ))}
+        </ul>
+      )}
+      {open && !loading && filtered.length === 0 && query && (
+        <div className="absolute z-50 mt-1 w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg px-3 py-2 text-xs text-gray-400">
+          No matches — press Enter to use "{query}" anyway
+        </div>
+      )}
+    </div>
+  )
+}
 
 // ── Run modal ─────────────────────────────────────────────────────────────────
 
@@ -23,6 +107,36 @@ function RunModal({
   const [database, setDatabase] = useState('')
   const [schemaName, setSchemaName] = useState('')
   const [table, setTable] = useState('')
+
+  const { data: dbData, isFetching: dbLoading } = useQuery({
+    queryKey: ['databases', selectedId],
+    queryFn: () => assetsApi.discoverDatabases(selectedId).then(r => r.data),
+    staleTime: 5 * 60_000,
+  })
+  const { data: schemaData, isFetching: schemaLoading, isError: schemaError } = useQuery({
+    queryKey: ['schemas', selectedId, database],
+    queryFn: () => assetsApi.discoverSchemas(database, selectedId).then(r => r.data),
+    enabled: !!database,
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+  const { data: tableData, isFetching: tableLoading, isError: tableError } = useQuery({
+    queryKey: ['tables', selectedId, database, schemaName],
+    queryFn: () => assetsApi.discoverTables(database, schemaName, selectedId).then(r => r.data),
+    enabled: !!database && !!schemaName && scope === 'table',
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+
+  const databases = dbData?.databases ?? []
+  const schemas   = schemaData?.schemas ?? []
+  const tables    = tableData?.tables ?? []
+
+  const canRun = !!database && (
+    scope === 'database' ||
+    (scope === 'schema' && !!schemaName) ||
+    (scope === 'table' && !!schemaName && !!table)
+  )
 
   const runMutation = useMutation({
     mutationFn: () =>
@@ -70,34 +184,44 @@ function RunModal({
               <option value="database">All tables in database</option>
             </select>
           </div>
+
           <div>
             <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Database</label>
-            <input
+            <Combobox
               value={database}
-              onChange={e => setDatabase(e.target.value)}
-              placeholder="e.g. PLAYGROUND_DB"
-              className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+              onChange={v => { setDatabase(v); setSchemaName(''); setTable('') }}
+              options={databases}
+              placeholder="Search databases…"
+              loading={dbLoading}
             />
           </div>
+
           {(scope === 'table' || scope === 'schema') && (
             <div>
               <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Schema</label>
-              <input
+              <Combobox
                 value={schemaName}
-                onChange={e => setSchemaName(e.target.value)}
-                placeholder="e.g. PUBLIC"
-                className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+                onChange={v => { setSchemaName(v); setTable('') }}
+                options={schemas}
+                placeholder={database ? 'Search schemas…' : 'Select a database first'}
+                loading={schemaLoading}
+                disabled={!database}
+                error={schemaError}
               />
             </div>
           )}
+
           {scope === 'table' && (
             <div>
               <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Table</label>
-              <input
+              <Combobox
                 value={table}
-                onChange={e => setTable(e.target.value)}
-                placeholder="e.g. ORDERS"
-                className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+                onChange={setTable}
+                options={tables}
+                placeholder={schemaName ? 'Search tables…' : 'Select a schema first'}
+                loading={tableLoading}
+                disabled={!schemaName}
+                error={tableError}
               />
             </div>
           )}
@@ -115,7 +239,7 @@ function RunModal({
           </button>
           <button
             onClick={() => runMutation.mutate()}
-            disabled={runMutation.isPending || !database}
+            disabled={runMutation.isPending || !canRun}
             className="flex items-center gap-2 px-4 py-2 text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50"
           >
             {runMutation.isPending
@@ -143,6 +267,41 @@ function EditModal({
   const [description, setDescription] = useState(workflow.description || '')
   const [patterns, setPatterns] = useState<RulePattern[]>(workflow.rule_patterns)
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null)
+  const [addOpen, setAddOpen] = useState(false)
+  const [addSearch, setAddSearch] = useState('')
+
+  const { data: defsData, isFetching: defsLoading } = useQuery({
+    queryKey: ['rule-definitions-active'],
+    queryFn: () => ruleLibraryApi.listDefinitions({ status: 'active' }).then(r => r.data),
+    staleTime: 60_000,
+    enabled: addOpen,
+  })
+  const allDefs = defsData?.definitions ?? []
+  const filteredDefs = allDefs.filter(d =>
+    d.name.toLowerCase().includes(addSearch.toLowerCase()) ||
+    d.category.toLowerCase().includes(addSearch.toLowerCase())
+  )
+
+  const alreadyAdded = new Set(patterns.map(p => p.definition_id))
+
+  const addPattern = (def: typeof allDefs[number]) => {
+    if (alreadyAdded.has(def.id)) return
+    setPatterns(p => [...p, {
+      definition_id: def.id,
+      definition_name: def.name,
+      scope: def.allowed_scopes?.[0] ?? 'table',
+      target_config: {},
+      threshold_config: {},
+      severity: def.default_severity,
+      template_shape: def.template_shape,
+      rationale: def.description,
+    }])
+  }
+
+  const removePattern = (idx: number) => {
+    setPatterns(p => p.filter((_, i) => i !== idx))
+    if (expandedIdx === idx) setExpandedIdx(null)
+  }
 
   const saveMutation = useMutation({
     mutationFn: () =>
@@ -152,10 +311,6 @@ function EditModal({
       onClose()
     },
   })
-
-  const removePattern = (idx: number) => {
-    setPatterns(p => p.filter((_, i) => i !== idx))
-  }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
@@ -187,16 +342,72 @@ function EditModal({
           </div>
         </div>
 
+        {/* Current patterns */}
         <div className="mb-4">
           <div className="flex items-center justify-between mb-2">
             <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">
               Rule Patterns ({patterns.length})
             </h4>
+            <button
+              onClick={() => setAddOpen(o => !o)}
+              className="flex items-center gap-1 text-xs px-2.5 py-1 bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 border border-primary-200 dark:border-primary-700 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/50"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Add Rule
+            </button>
           </div>
 
-          {patterns.length === 0 && (
+          {/* Add rule picker */}
+          {addOpen && (
+            <div className="mb-3 border border-primary-200 dark:border-primary-700 rounded-lg overflow-hidden">
+              <div className="px-3 py-2 bg-primary-50 dark:bg-primary-900/20 border-b border-primary-200 dark:border-primary-700 flex items-center gap-2">
+                <Search className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
+                <input
+                  autoFocus
+                  value={addSearch}
+                  onChange={e => setAddSearch(e.target.value)}
+                  placeholder="Search rule definitions…"
+                  className="flex-1 text-sm bg-transparent outline-none text-gray-800 dark:text-gray-200 placeholder-gray-400"
+                />
+                {defsLoading && <Loader2 className="w-3.5 h-3.5 animate-spin text-gray-400" />}
+              </div>
+              <div className="max-h-52 overflow-y-auto">
+                {filteredDefs.length === 0 && !defsLoading && (
+                  <p className="text-xs text-gray-400 text-center py-4">No matching rules</p>
+                )}
+                {filteredDefs.map(def => {
+                  const added = alreadyAdded.has(def.id)
+                  return (
+                    <div
+                      key={def.id}
+                      onClick={() => !added && addPattern(def)}
+                      className={`flex items-center gap-3 px-3 py-2.5 border-b border-gray-100 dark:border-gray-700 last:border-0 ${
+                        added
+                          ? 'opacity-40 cursor-not-allowed'
+                          : 'cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50'
+                      }`}
+                    >
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-gray-800 dark:text-gray-200 truncate">{def.name}</p>
+                        <p className="text-xs text-gray-400 truncate">{def.category} · {def.description.slice(0, 80)}{def.description.length > 80 ? '…' : ''}</p>
+                      </div>
+                      <span className={`text-xs px-2 py-0.5 rounded-full font-medium flex-shrink-0 ${severityClass(def.default_severity)}`}>
+                        {def.default_severity}
+                      </span>
+                      {added
+                        ? <span className="text-xs text-gray-400 flex-shrink-0">added</span>
+                        : <Plus className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
+                      }
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {patterns.length === 0 && !addOpen && (
             <p className="text-xs text-gray-400 py-4 text-center">
-              No patterns — workflow is empty. Add rules from the Rule Library.
+              No patterns — click "Add Rule" to build your workflow.
             </p>
           )}
 

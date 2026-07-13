@@ -32,7 +32,6 @@ class FindingResponse(FindingBase):
     assigned_to: Optional[str] = None
     resolution_notes: Optional[str] = None
     detected_at: datetime
-    validated_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
     updated_at: datetime

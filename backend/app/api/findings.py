@@ -73,9 +73,7 @@ def update_finding(finding_id: str, update_data: FindingUpdate):
     fields = {}
     if update_data.status is not None:
         fields["status"] = update_data.status
-        if update_data.status == "validated" and not finding.validated_at:
-            fields["validated_at"] = datetime.utcnow()
-        elif update_data.status == "resolved" and not finding.resolved_at:
+        if update_data.status == "resolved" and not finding.resolved_at:
             fields["resolved_at"] = datetime.utcnow()
         elif update_data.status == "closed" and not finding.closed_at:
             fields["closed_at"] = datetime.utcnow()

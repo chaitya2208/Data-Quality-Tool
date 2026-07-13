@@ -25,7 +25,6 @@ class ScanType(str, enum.Enum):
 
 class FindingStatus(str, enum.Enum):
     DETECTED = "detected"
-    VALIDATED = "validated"
     ASSIGNED = "assigned"
     IN_PROGRESS = "in_progress"
     RESOLVED = "resolved"

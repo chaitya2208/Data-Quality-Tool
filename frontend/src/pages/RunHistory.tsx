@@ -1,0 +1,254 @@
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { useNavigate } from 'react-router-dom'
+import { agentRunsApi } from '../api/client'
+import type { AgentRun } from '../api/client'
+import {
+  History, Loader2, CheckCircle2, AlertTriangle, BrainCircuit,
+  Wrench, Clock, Database, Search, Filter, ExternalLink,
+} from 'lucide-react'
+
+type StatusFilter = 'all' | 'completed' | 'failed' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes'
+
+const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
+  { value: 'all',                  label: 'All'             },
+  { value: 'completed',            label: 'Completed'       },
+  { value: 'running',              label: 'Running'         },
+  { value: 'awaiting_rule_review', label: 'Awaiting Review' },
+  { value: 'awaiting_fixes',       label: 'Awaiting Fixes'  },
+  { value: 'failed',               label: 'Failed'          },
+]
+
+function statusBadge(status: string) {
+  switch (status) {
+    case 'completed':
+      return <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium bg-green-100 text-green-700"><CheckCircle2 className="w-3 h-3" />Completed</span>
+    case 'failed':
+      return <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium bg-red-100 text-red-700"><AlertTriangle className="w-3 h-3" />Failed</span>
+    case 'running':
+      return <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium bg-blue-100 text-blue-700"><Loader2 className="w-3 h-3 animate-spin" />Running</span>
+    case 'awaiting_rule_review':
+      return <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium bg-purple-100 text-purple-700"><BrainCircuit className="w-3 h-3" />Awaiting Review</span>
+    case 'awaiting_fixes':
+      return <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium bg-orange-100 text-orange-700"><Wrench className="w-3 h-3" />Awaiting Fixes</span>
+    default:
+      return <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-gray-100 text-gray-600">{status.replace(/_/g, ' ')}</span>
+  }
+}
+
+function duration(run: AgentRun): string | null {
+  if (!run.started_at || !run.completed_at) return null
+  const s = (new Date(run.completed_at).getTime() - new Date(run.started_at).getTime()) / 1000
+  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${(s % 60).toFixed(0)}s`
+}
+
+export default function RunHistory() {
+  const navigate = useNavigate()
+  const [search, setSearch]           = useState('')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+
+  const { data, isLoading, refetch } = useQuery({
+    queryKey: ['agent-runs-history'],
+    queryFn: () => agentRunsApi.list().then(r => r.data),
+    refetchInterval: 10_000,
+  })
+
+  const runs = data?.runs ?? []
+
+  const filtered = runs.filter(run => {
+    const matchesStatus = statusFilter === 'all' || run.status === statusFilter
+    const fqn = `${run.database}.${run.schema_name}.${run.table}`.toLowerCase()
+    const matchesSearch = !search || fqn.includes(search.toLowerCase())
+    return matchesStatus && matchesSearch
+  })
+
+  const stats = {
+    total:     runs.length,
+    completed: runs.filter(r => r.status === 'completed').length,
+    failed:    runs.filter(r => r.status === 'failed').length,
+    active:    runs.filter(r => ['running', 'awaiting_rule_review', 'awaiting_fixes', 'pending'].includes(r.status)).length,
+  }
+
+  return (
+    <div className="space-y-6">
+
+      {/* Header */}
+      <div>
+        <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Run History</h1>
+        <p className="mt-1 text-gray-600 dark:text-gray-300">All past and active agent workflow runs.</p>
+      </div>
+
+      {/* Stats row */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        {[
+          { label: 'Total Runs',  value: stats.total,     color: 'text-gray-900 dark:text-gray-100' },
+          { label: 'Completed',   value: stats.completed, color: 'text-green-600' },
+          { label: 'Active',      value: stats.active,    color: 'text-blue-600'  },
+          { label: 'Failed',      value: stats.failed,    color: 'text-red-600'   },
+        ].map(s => (
+          <div key={s.label} className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 text-center">
+            <p className={`text-2xl font-bold ${s.color}`}>{s.value}</p>
+            <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">{s.label}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Filters */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+        <div className="flex flex-col sm:flex-row gap-3">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search by database, schema, or table..."
+              className="w-full pl-9 pr-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Filter className="w-4 h-4 text-gray-400 flex-shrink-0" />
+            <select
+              value={statusFilter}
+              onChange={e => setStatusFilter(e.target.value as StatusFilter)}
+              className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
+            >
+              {STATUS_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Run list */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
+        {isLoading ? (
+          <div className="p-12 flex items-center justify-center gap-2 text-gray-400">
+            <Loader2 className="w-5 h-5 animate-spin" />Loading runs...
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="p-12 text-center">
+            <History className="w-12 h-12 text-gray-200 mx-auto mb-3" />
+            <p className="text-gray-900 dark:text-gray-100 font-medium mb-1">
+              {runs.length === 0 ? 'No runs yet' : 'No runs match your filters'}
+            </p>
+            <p className="text-sm text-gray-400 dark:text-gray-400">
+              {runs.length === 0
+                ? 'Start a workflow from the Workflow page to see runs here.'
+                : 'Try changing the status filter or search term.'}
+            </p>
+          </div>
+        ) : (
+          <div className="divide-y divide-gray-100 dark:divide-gray-700">
+            {/* Table header */}
+            <div className="hidden sm:grid grid-cols-[1fr_auto_auto_auto_auto] gap-4 px-6 py-3 bg-gray-50 dark:bg-gray-900 text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide">
+              <span>Target</span>
+              <span>Status</span>
+              <span>Findings</span>
+              <span>AI Rules</span>
+              <span>Duration</span>
+            </div>
+
+            {filtered.map(run => {
+              const d = duration(run)
+              const isActive = ['running', 'awaiting_rule_review', 'awaiting_fixes', 'pending'].includes(run.status)
+              return (
+                <div
+                  key={run.id}
+                  className="px-6 py-4 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors"
+                >
+                  <div className="flex flex-col sm:grid sm:grid-cols-[1fr_auto_auto_auto_auto] sm:gap-4 sm:items-center gap-2">
+
+                    {/* Target */}
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <Database className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+                        <span className="text-sm font-medium text-gray-900 dark:text-gray-100 font-mono truncate">
+                          {run.database}.{run.schema_name}.{run.table}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3 mt-1">
+                        <span className="text-xs text-gray-400 dark:text-gray-400">
+                          {new Date(run.created_at).toLocaleString()}
+                        </span>
+                        {run.batch_id && (
+                          <span className="text-xs text-gray-400 dark:text-gray-500 font-mono">
+                            batch #{run.batch_index + 1}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Status */}
+                    <div>{statusBadge(run.status)}</div>
+
+                    {/* Findings */}
+                    <div className="flex items-center gap-1">
+                      {run.findings_count > 0 ? (
+                        <button
+                          onClick={() => run.scan_id && navigate(`/findings?scan_id=${run.scan_id}`)}
+                          disabled={!run.scan_id}
+                          className="flex items-center gap-1 text-xs text-orange-700 dark:text-orange-300 font-medium hover:underline disabled:no-underline disabled:text-gray-500"
+                        >
+                          {run.findings_count} findings
+                          {run.scan_id && <ExternalLink className="w-3 h-3" />}
+                        </button>
+                      ) : (
+                        <span className="text-xs text-gray-400 dark:text-gray-500">—</span>
+                      )}
+                    </div>
+
+                    {/* AI rules */}
+                    <div className="text-xs text-gray-500 dark:text-gray-400">
+                      {run.ai_rules_count > 0
+                        ? <span className="text-purple-600 font-medium">{run.ai_rules_count} AI</span>
+                        : <span className="text-gray-400">—</span>
+                      }
+                    </div>
+
+                    {/* Duration + actions */}
+                    <div className="flex items-center gap-3">
+                      {d ? (
+                        <span className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-400">
+                          <Clock className="w-3 h-3" />{d}
+                        </span>
+                      ) : isActive ? (
+                        <span className="flex items-center gap-1 text-xs text-blue-500">
+                          <Loader2 className="w-3 h-3 animate-spin" />active
+                        </span>
+                      ) : (
+                        <span className="text-xs text-gray-300">—</span>
+                      )}
+                      <button
+                        onClick={() => navigate(`/workflow?run_id=${run.id}`)}
+                        className="text-xs px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors flex-shrink-0"
+                        title="Open in Workflow"
+                      >
+                        Open
+                      </button>
+                    </div>
+
+                  </div>
+
+                  {/* Error message */}
+                  {run.status === 'failed' && run.error_message && (
+                    <p className="mt-2 text-xs text-red-600 dark:text-red-400 font-mono bg-red-50 dark:bg-red-950/30 px-3 py-1.5 rounded truncate" title={run.error_message}>
+                      {run.error_message}
+                    </p>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Footer count */}
+      {!isLoading && filtered.length > 0 && (
+        <p className="text-xs text-gray-400 dark:text-gray-500 text-right">
+          Showing {filtered.length} of {runs.length} runs · auto-refreshes every 10s
+        </p>
+      )}
+    </div>
+  )
+}
