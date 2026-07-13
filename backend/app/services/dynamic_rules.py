@@ -29,6 +29,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.services import storage
+from app.services.snowflake_session import session as sf_session
 
 import logging
 
@@ -146,6 +147,52 @@ UPDATED_AT_NAMES = {
 def _normalise_type(raw_type: str) -> str:
     """Strip precision/scale from type string and upper-case it."""
     return (raw_type or "").split("(")[0].strip().upper()
+
+
+def _fetch_live_column_metadata(table_asset: Any) -> Dict[str, Dict[str, Any]]:
+    """Runs a real SELECT against INFORMATION_SCHEMA.COLUMNS for this table
+    and returns {COLUMN_NAME: {"data_type": ..., "is_nullable": ..., "comment": ...}}.
+
+    This is the SQL-generation replacement for the checks that used to trust
+    the cached column-asset snapshot taken at scan time (MetadataAgent's
+    earlier pass): type/nullability/comment can drift between that snapshot
+    and when these checks actually run (e.g. an ALTER TABLE landed in
+    between), so type/nullability/comment-dependent checks below re-fetch
+    live, in ONE query per table rather than per-check, instead of trusting
+    the snapshot. On query failure, returns {} — callers fall back to the
+    column asset's cached raw_metadata for that column (see _column_type_info
+    below), so one query hiccup doesn't take out every check on the table."""
+    try:
+        rows = sf_session.query(
+            f"""
+            SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COMMENT
+            FROM {table_asset.database_name}.INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '{table_asset.schema_name}'
+              AND TABLE_NAME = '{table_asset.table_name}'
+            """
+        )
+    except Exception as e:
+        logger.warning(
+            f"[DynamicRules] Live column metadata fetch failed for {table_asset.fqn}: {e}"
+        )
+        return {}
+    return {
+        r["COLUMN_NAME"]: {
+            "data_type": r.get("DATA_TYPE") or "",
+            "is_nullable": r.get("IS_NULLABLE") or "NO",
+            "comment": r.get("COMMENT"),
+        }
+        for r in rows
+    }
+
+
+def _column_type_info(col_asset: Any, live_metadata: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Live INFORMATION_SCHEMA row for this column if the fetch succeeded,
+    else the column asset's cached raw_metadata as a fallback."""
+    live = live_metadata.get(col_asset.column_name)
+    if live is not None:
+        return live
+    return col_asset.raw_metadata or {}
 
 
 def _ensure_rule(
@@ -484,11 +531,11 @@ def check_generic_column_name(
 
 
 def check_column_type_mismatch(
-    col_asset: Any, scan_id: str
+    col_asset: Any, scan_id: str, live_metadata: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict]:
     """Flag columns whose name implies one type but are stored as another."""
     col_upper = (col_asset.column_name or "").upper()
-    raw_type = (col_asset.raw_metadata or {}).get("data_type", "") or ""
+    raw_type = _column_type_info(col_asset, live_metadata).get("data_type", "") or ""
     actual_type = _normalise_type(raw_type)
 
     for pattern, expected_types, suffix, label in NAME_TYPE_RULES:
@@ -578,7 +625,7 @@ def check_fk_without_constraint(
 
 
 def check_nullable_id_column(
-    col_asset: Any, scan_id: str
+    col_asset: Any, scan_id: str, live_metadata: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict]:
     """Flag ID/PK columns that allow NULLs."""
     col_upper = (col_asset.column_name or "").upper()
@@ -586,7 +633,7 @@ def check_nullable_id_column(
     if not is_id:
         return None
 
-    is_nullable = (col_asset.raw_metadata or {}).get("is_nullable", "NO")
+    is_nullable = _column_type_info(col_asset, live_metadata).get("is_nullable", "NO")
     if str(is_nullable).upper() not in ("YES", "Y", "TRUE", "1"):
         return None
 
@@ -621,11 +668,11 @@ def check_nullable_id_column(
 
 
 def check_date_stored_as_varchar(
-    col_asset: Any, scan_id: str
+    col_asset: Any, scan_id: str, live_metadata: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict]:
     """Flag date/timestamp columns stored as VARCHAR/TEXT."""
     col_upper = (col_asset.column_name or "").upper()
-    raw_type = (col_asset.raw_metadata or {}).get("data_type", "") or ""
+    raw_type = _column_type_info(col_asset, live_metadata).get("data_type", "") or ""
     actual_type = _normalise_type(raw_type)
 
     date_name = re.search(
@@ -668,11 +715,11 @@ def check_date_stored_as_varchar(
 
 
 def check_boolean_stored_as_varchar(
-    col_asset: Any, scan_id: str
+    col_asset: Any, scan_id: str, live_metadata: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict]:
     """Flag boolean/flag columns stored as VARCHAR instead of BOOLEAN or a numeric type."""
     col_upper = (col_asset.column_name or "").upper()
-    raw_type = (col_asset.raw_metadata or {}).get("data_type", "") or ""
+    raw_type = _column_type_info(col_asset, live_metadata).get("data_type", "") or ""
     actual_type = _normalise_type(raw_type)
 
     # Column name must look like a boolean/flag field
@@ -740,6 +787,21 @@ _COLUMN_CHECK_CODES = {
     check_fk_without_constraint:   "FK_COLUMN_NO_CONSTRAINT",
 }
 
+# Every python_handler HANDLER_KEY actually served by this module (lower-cased,
+# matching RULE_DEFINITIONS.HANDLER_KEY) — table + column codes, plus the
+# per-subtype codes check_column_type_mismatch can emit (COLUMN_ID_WRONG_TYPE,
+# COLUMN_DATE_WRONG_TYPE, etc., seeded individually in rule_engine.py's
+# initialize_default_rules but all produced by the one _NAME_TYPE_RULES loop
+# above). RuleEngine imports this so execute_rules() can skip these instances
+# instead of attempting (and warning on) a Python-object dispatch that only
+# ever covers 3 keys — these are executed via run_dynamic_checks() instead.
+DYNAMIC_RULE_HANDLER_KEYS = frozenset(
+    code.lower() for code in {**_TABLE_CHECK_CODES, **_COLUMN_CHECK_CODES}.values()
+) | frozenset({
+    "column_id_wrong_type", "column_date_wrong_type", "column_timestamp_wrong_type",
+    "column_flag_wrong_type", "column_amount_wrong_type",
+})
+
 
 def run_dynamic_checks(
     table_asset: Any,
@@ -754,6 +816,17 @@ def run_dynamic_checks(
     """
     findings: List[Dict[str, Any]] = []
     col_names = [a.column_name for a in column_assets if a.column_name]
+
+    # Live INFORMATION_SCHEMA.COLUMNS read for this table — ONE query, reused
+    # by every type/nullability-dependent check below, instead of trusting
+    # each column asset's cached raw_metadata from MetadataAgent's earlier
+    # scan pass (which can drift if an ALTER TABLE landed in between).
+    live_metadata = _fetch_live_column_metadata(table_asset)
+
+    _NEEDS_LIVE_METADATA = {
+        check_column_type_mismatch, check_nullable_id_column,
+        check_date_stored_as_varchar, check_boolean_stored_as_varchar,
+    }
 
     def _allowed(code: str) -> bool:
         if allowed_rule_codes is None:
@@ -782,6 +855,8 @@ def run_dynamic_checks(
                 continue
             if fn is check_fk_without_constraint:
                 result = fn(col_asset, table_asset.table_name or "", scan_id)
+            elif fn in _NEEDS_LIVE_METADATA:
+                result = fn(col_asset, scan_id, live_metadata)
             else:
                 result = fn(col_asset, scan_id)
             if result:

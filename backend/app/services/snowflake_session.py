@@ -72,7 +72,7 @@ class SnowflakeSession:
         logger.info("Snowflake connection established.")
 
     def get_connection(self):
-        if not self._connection or not self._is_alive():
+        if not self._connection:
             self.connect()
         return self._connection
 
@@ -101,15 +101,32 @@ class SnowflakeSession:
         ad-hoc SELECT (e.g. an AI-authored draft_sql with an accidental
         cartesian join) instead of letting it saturate the warehouse."""
         conn = self.get_connection()
-        cur = conn.cursor(DictCursor)
         try:
-            if timeout is not None:
-                cur.execute(sql, params or {}, timeout=timeout)
-            else:
-                cur.execute(sql, params or {})
-            return cur.fetchall()
-        finally:
-            cur.close()
+            cur = conn.cursor(DictCursor)
+            try:
+                if timeout is not None:
+                    cur.execute(sql, params or {}, timeout=timeout)
+                else:
+                    cur.execute(sql, params or {})
+                return cur.fetchall()
+            finally:
+                cur.close()
+        except snowflake.connector.errors.OperationalError:
+            # Connection dropped since the last call (idle timeout, network
+            # blip) — reconnect once and retry rather than pre-checking
+            # liveness on every call, which doubled round trips.
+            logger.warning("Snowflake connection dropped — reconnecting and retrying query.")
+            self._connection = None
+            conn = self.get_connection()
+            cur = conn.cursor(DictCursor)
+            try:
+                if timeout is not None:
+                    cur.execute(sql, params or {}, timeout=timeout)
+                else:
+                    cur.execute(sql, params or {})
+                return cur.fetchall()
+            finally:
+                cur.close()
 
     def execute(self, sql: str, params: Optional[Dict[str, Any]] = None) -> int:
         """
@@ -120,12 +137,23 @@ class SnowflakeSession:
         """
         with self._exec_lock:
             conn = self.get_connection()
-            cur = conn.cursor()
             try:
-                cur.execute(sql, params or {})
-                return cur.rowcount
-            finally:
-                cur.close()
+                cur = conn.cursor()
+                try:
+                    cur.execute(sql, params or {})
+                    return cur.rowcount
+                finally:
+                    cur.close()
+            except snowflake.connector.errors.OperationalError:
+                logger.warning("Snowflake connection dropped — reconnecting and retrying execute.")
+                self._connection = None
+                conn = self.get_connection()
+                cur = conn.cursor()
+                try:
+                    cur.execute(sql, params or {})
+                    return cur.rowcount
+                finally:
+                    cur.close()
 
     def describe_table(self, database: str, schema: str, table: str) -> List[Dict[str, Any]]:
         """
@@ -184,17 +212,17 @@ class SnowflakeSession:
             orig_wh   = state.get("W") or state.get("w") or settings.SNOWFLAKE_WAREHOUSE
 
             try:
-                logger.info(f"USE ROLE {role}")
+                logger.debug(f"USE ROLE {role}")
                 cur.execute(f"USE ROLE {role}")
-                logger.info(f"USE WAREHOUSE {warehouse}")
+                logger.debug(f"USE WAREHOUSE {warehouse}")
                 cur.execute(f"USE WAREHOUSE {warehouse}")
                 clean_sql = _sanitize_sql(sql)
-                logger.info(f"Executing SQL: {clean_sql[:300]}")
+                logger.info(f"Executing SQL as {role}/{warehouse}: {clean_sql[:300]}")
                 # Execute each statement individually — execute_string has known
                 # parsing issues with multi-statement DDL+DML batches in Snowflake
                 statements = [s.strip() for s in clean_sql.split(";") if s.strip()]
                 for stmt in statements:
-                    logger.info(f"  Running statement: {stmt[:150]}")
+                    logger.debug(f"  Running statement: {stmt[:150]}")
                     cur.execute(stmt)
             finally:
                 # Always restore — even if sql raises

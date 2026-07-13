@@ -377,7 +377,7 @@ class RuleIntelligenceAgent:
         expected_signal_ids = {s["signal_id"] for s in self._all_signal_ids(profiler_result)}
         signals_missed = sorted(expected_signal_ids - set(classification["signals_evaluated"].keys()))
         if signals_missed:
-            logger.info(f"[RuleIntelligence] Signals not addressed by Claude: {signals_missed}")
+            logger.debug(f"[RuleIntelligence] Signals not addressed by Claude: {signals_missed}")
 
         for candidate in parsed.get("new_instances", []):
             result = self._process_candidate(
@@ -672,7 +672,7 @@ class RuleIntelligenceAgent:
         grounded = [v for v in accepted if str(v) in observed]
         dropped = [v for v in accepted if str(v) not in observed]
         if dropped:
-            logger.info(
+            logger.debug(
                 f"[RuleIntelligence] Trimmed accepted_values for {column}: "
                 f"dropped {dropped} (not observed in live data), kept {grounded}"
             )

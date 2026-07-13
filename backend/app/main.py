@@ -10,6 +10,12 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+# Third-party libraries log verbosely at INFO by default (connector internals,
+# OCSP cert checks, HTTP retries, telemetry) — they'd otherwise drown out the
+# app's own log lines since basicConfig sets the level for every logger.
+for _noisy_logger in ("snowflake.connector", "boto3", "botocore", "urllib3"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 

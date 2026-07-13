@@ -160,7 +160,7 @@ def _discover(database: str, schema_name: str) -> List[Any]:
         from_type = column_types.get((cand["from_table"].upper(), cand["from_column"].upper()))
         to_type = column_types.get((cand["to_table"].upper(), cand["to_column"].upper()))
         if not _types_compatible(from_type, to_type):
-            logger.info(
+            logger.debug(
                 f"[RelationshipDiscovery] Skipping type-incompatible candidate "
                 f"{cand['from_table']}.{cand['from_column']} ({from_type}) -> "
                 f"{cand['to_table']}.{cand['to_column']} ({to_type}) — not a real FK"

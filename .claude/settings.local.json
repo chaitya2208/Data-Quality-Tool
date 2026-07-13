@@ -116,7 +116,19 @@
       "Bash(powershell -Command \"Get-NetTCPConnection -LocalPort 8001 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique\" 2>&1)",
       "Bash(powershell -Command \"\n\\\\$mainPids = @\\(24276, 15076, 12164, 2696\\)\nforeach \\(\\\\$p in \\\\$mainPids\\) {\n  Stop-Process -Id \\\\$p -Force -ErrorAction SilentlyContinue\n}\nStart-Sleep -Seconds 2\nGet-CimInstance Win32_Process -Filter \\\\\"Name='python.exe'\\\\\" | Select-Object ProcessId, CommandLine\n\" 2>&1)",
       "Bash(xargs grep -ln \"runs/batch\\\\|def start_batch\\\\|WorkflowCoordinator\\\\|status=\\\\\"pending\\\\\"\\\\|'pending'\")",
-      "Bash(./.venv/Scripts/python.exe -c \"import snowflake.connector, os; print\\(os.path.dirname\\(snowflake.connector.__file__\\)\\)\")"
+      "Bash(./.venv/Scripts/python.exe -c \"import snowflake.connector, os; print\\(os.path.dirname\\(snowflake.connector.__file__\\)\\)\")",
+      "Bash(git *)",
+      "Bash(awk NR>=210 && NR<=235 *)",
+      "Bash(git show *)",
+      "Bash(awk 'NR>=180 && NR<=195' /tmp/mergecheck/ria.ours)",
+      "Bash(awk 'NR>=198 && NR<=215' /tmp/mergecheck/ria.ours)",
+      "Bash(awk 'NR>=248 && NR<=270' /tmp/mergecheck/ria.ours)",
+      "Bash(awk 'NR>=270 && NR<=282' /tmp/mergecheck/ria.ours)",
+      "Bash(awk 'NR>=682 && NR<=705' /tmp/mergecheck/ria.ours)",
+      "Bash(awk 'NR>=1 && NR<=10' /tmp/mergecheck/app.ours)",
+      "Bash(awk 'NR>=13 && NR<=23' /tmp/mergecheck/app.ours)",
+      "Bash(awk 'NR>=27 && NR<=46' /tmp/mergecheck/app.ours)",
+      "Bash(awk 'NR>=150 && NR<=178' /tmp/mergecheck/app.ours)"
     ]
   }
 }
