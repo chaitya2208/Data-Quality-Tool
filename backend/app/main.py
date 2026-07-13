@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api import assets, scans, findings, rules, health, ai_recommendations, agent_runs, profiling, connections, settings as settings_api
+from app.api import assets, scans, findings, rules, health, ai_recommendations, agent_runs, profiling, connections, schedules, settings as settings_api
 from app.services.snowflake_session import session as sf_session
 import logging
 
@@ -39,10 +39,22 @@ async def lifespan(app: FastAPI):
             run_migrations()
         except Exception as mig_err:
             logger.warning(f"Migrations skipped: {mig_err}")
+        # Start the schedule runner AFTER migrations so the SCHEDULES table
+        # exists. Best-effort — a scheduler failure must not block startup.
+        try:
+            from app.services import schedule_runner
+            schedule_runner.start()
+        except Exception as sched_err:
+            logger.warning(f"Scheduler start skipped: {sched_err}")
     except Exception as e:
         logger.error(f"Snowflake startup failed: {e}")
     yield
     # ── Shutdown ──
+    try:
+        from app.services import schedule_runner
+        schedule_runner.stop()
+    except Exception:
+        pass
     logger.info("Shutting down.")
 
 
@@ -71,6 +83,7 @@ app.include_router(ai_recommendations.router, prefix=f"{settings.API_V1_STR}/ai"
 app.include_router(agent_runs.router, prefix=f"{settings.API_V1_STR}/agent", tags=["agent"])
 app.include_router(profiling.router, prefix=f"{settings.API_V1_STR}/profiling", tags=["profiling"])
 app.include_router(connections.router, prefix=f"{settings.API_V1_STR}/connections", tags=["connections"])
+app.include_router(schedules.router, prefix=f"{settings.API_V1_STR}/schedules", tags=["schedules"])
 app.include_router(settings_api.router, prefix=f"{settings.API_V1_STR}/settings", tags=["settings"])
 
 

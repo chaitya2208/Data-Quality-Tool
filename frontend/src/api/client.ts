@@ -553,12 +553,20 @@ export interface WorkflowTemplate {
   created_by: string | null;
   created_at: string;
   updated_at: string;
+  // Origin — the table this workflow was created from (null for older workflows)
+  origin_scope: WorkflowScope | null;
+  origin_database: string | null;
+  origin_schema: string | null;
+  origin_table: string | null;
 }
 
 export const workflowsApi = {
   list: () => api.get<WorkflowTemplate[]>('/agent/workflows'),
   get: (id: string) => api.get<WorkflowTemplate>(`/agent/workflows/${id}`),
-  create: (data: { label: string; description?: string; rule_patterns: RulePattern[]; created_by?: string }) =>
+  create: (data: {
+    label: string; description?: string; rule_patterns: RulePattern[]; created_by?: string;
+    origin_scope?: WorkflowScope; origin_database?: string; origin_schema?: string; origin_table?: string;
+  }) =>
     api.post<WorkflowTemplate>('/agent/workflows', data),
   update: (id: string, data: { label?: string; description?: string; rule_patterns?: RulePattern[] }) =>
     api.put<WorkflowTemplate>(`/agent/workflows/${id}`, data),
@@ -595,4 +603,66 @@ export const agentRunsApi = {
     api.post(`/agent/runs/${id}/run-pipeline`),
   verify: (id: string) =>
     api.post(`/agent/runs/${id}/verify`),
+  saveAsWorkflow: (id: string, data: { label: string; description?: string; created_by?: string }) =>
+    api.post<WorkflowTemplate>(`/agent/runs/${id}/save-as-workflow`, data),
+};
+
+// ── Schedules ───────────────────────────────────────────────────────────────
+
+export type ScheduleCadence = 'daily' | 'weekly' | 'monthly' | 'yearly' | 'custom';
+
+export interface Schedule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  connection_id: string | null;
+  scope: WorkflowScope;
+  database: string | null;
+  schema_name: string | null;
+  table: string | null;
+  workflow_template_id: string | null;
+  cadence: ScheduleCadence;
+  time_of_day: string | null;
+  day_of_week: number | null;
+  day_of_month: number | null;
+  month_of_year: number | null;
+  interval_value: number | null;
+  interval_unit: string | null;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_batch_id: string | null;
+  last_status: string | null;
+  last_error: string | null;
+  created_at: string | null;
+  created_by: string | null;
+}
+
+export interface ScheduleCreatePayload {
+  name: string;
+  enabled?: boolean;
+  connection_id?: string | null;
+  scope: WorkflowScope;
+  database: string;
+  schema_name?: string;
+  table?: string;
+  workflow_template_id?: string | null;
+  cadence: ScheduleCadence;
+  time_of_day?: string;
+  day_of_week?: number;
+  day_of_month?: number;
+  month_of_year?: number;
+  interval_value?: number;
+  interval_unit?: string;
+  created_by?: string;
+}
+
+export const schedulesApi = {
+  list: () => api.get<Schedule[]>('/schedules'),
+  get: (id: string) => api.get<Schedule>(`/schedules/${id}`),
+  create: (data: ScheduleCreatePayload) => api.post<Schedule>('/schedules', data),
+  update: (id: string, data: Partial<ScheduleCreatePayload>) =>
+    api.put<Schedule>(`/schedules/${id}`, data),
+  delete: (id: string) => api.delete(`/schedules/${id}`),
+  toggle: (id: string) => api.post<Schedule>(`/schedules/${id}/toggle`),
+  runNow: (id: string) => api.post(`/schedules/${id}/run-now`),
 };

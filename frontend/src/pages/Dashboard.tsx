@@ -246,7 +246,7 @@ export default function Dashboard() {
               <button
                 key={d.database}
                 onClick={() => setSelectedDb(d.database)}
-                className="text-left p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-primary-400 hover:bg-primary-50 transition-all group"
+                className="text-left p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-primary-400 hover:bg-primary-50 dark:hover:bg-primary-900/20 transition-all group"
               >
                 <div className="flex items-center gap-1.5 mb-1">
                   <Database className="w-3.5 h-3.5 text-gray-400 dark:text-gray-400 group-hover:text-primary-500" />

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { assetsApi, agentRunsApi, findingsApi, workflowsApi } from '../api/client'
+import { assetsApi, agentRunsApi, findingsApi } from '../api/client'
 import type { AgentTask, RuleReviewEntry } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import {
@@ -461,26 +461,16 @@ export default function AgentWorkflow() {
   })
 
   const saveWorkflowMutation = useMutation({
-    mutationFn: () => {
-      // Use server-persisted approved list — local reviewActive is cleared after review
-      const approved = activeRun?.instance_review_state?.active ?? reviewActive
-      const patterns = approved.map((entry: any) => ({
-        definition_id: entry.definition_id,
-        definition_name: entry.name,
-        scope: entry.scope,
-        target_config: entry.target_config || {},
-        threshold_config: entry.threshold_config || {},
-        severity: entry.severity,
-        template_shape: entry.template_shape || null,
-        rationale: entry.reason || '',
-      }))
-      return workflowsApi.create({
+    // Build patterns server-side from the run's active rule instances. Works for
+    // every run type (AI pipeline, saved-workflow template, scheduled) — it does
+    // not depend on instance_review_state, which only exists for runs that
+    // paused for review. Origin (scope/db/schema/table) is captured server-side.
+    mutationFn: () =>
+      agentRunsApi.saveAsWorkflow(activeRunId!, {
         label: saveWfLabel.trim(),
         description: saveWfDesc.trim(),
-        rule_patterns: patterns,
         created_by: '',
-      })
-    },
+      }),
     onSuccess: () => {
       setSaveWfOpen(false)
       setSaveWfLabel('')
@@ -634,9 +624,9 @@ export default function AgentWorkflow() {
                 onClick={() => { setScope(opt.value); setSelectedTable('') }}
                 disabled={isRunning}
                 className={`text-left rounded-lg border-2 px-3 py-2.5 transition-all disabled:opacity-50 ${
-                  selected ? 'border-primary-500 bg-primary-50' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 bg-white dark:bg-gray-800'
+                  selected ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/40' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 bg-white dark:bg-gray-800'
                 }`}>
-                <p className={`text-sm font-semibold ${selected ? 'text-primary-800' : 'text-gray-800 dark:text-gray-200'}`}>{opt.label}</p>
+                <p className={`text-sm font-semibold ${selected ? 'text-primary-800 dark:text-primary-200' : 'text-gray-800 dark:text-gray-200'}`}>{opt.label}</p>
                 <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">{opt.hint}</p>
               </button>
             )
@@ -925,24 +915,24 @@ export default function AgentWorkflow() {
         const newAuto   = verifyOutput.newly_auto_resolved ?? 0
         const allDone   = remaining === 0
         return (
-          <div className={`border-2 rounded-xl p-5 ${allDone ? 'bg-green-50 border-green-300' : 'bg-blue-50 border-blue-300'}`}>
+          <div className={`border-2 rounded-xl p-5 ${allDone ? 'bg-green-50 dark:bg-green-950/40 border-green-300 dark:border-green-500/40' : 'bg-blue-50 dark:bg-blue-950/40 border-blue-300 dark:border-blue-500/40'}`}>
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h3 className={`font-semibold text-base mb-1 ${allDone ? 'text-green-900' : 'text-blue-900'}`}>
+                <h3 className={`font-semibold text-base mb-1 ${allDone ? 'text-green-900 dark:text-green-200' : 'text-blue-900 dark:text-blue-200'}`}>
                   {allDone
                     ? '✅ All issues resolved — workflow complete!'
                     : `📊 Verification: ${resolved}/${total} fixed (${pct}%) — ${remaining} remaining`
                   }
                 </h3>
-                <p className={`text-sm ${allDone ? 'text-green-800' : 'text-blue-800'}`}>
+                <p className={`text-sm ${allDone ? 'text-green-800 dark:text-green-300' : 'text-blue-800 dark:text-blue-300'}`}>
                   {allDone
                     ? 'Every finding has been resolved. Great work!'
                     : `${remaining} finding${remaining !== 1 ? 's' : ''} still need attention.`
                   }
                 </p>
                 {newAuto > 0 && (
-                  <p className="text-xs mt-1.5 text-green-700 font-medium">
-                    ✓ {newAuto} auto-resolved by live Snowflake re-scan
+                  <p className="text-xs mt-1.5 text-green-700 dark:text-green-400 font-medium">
+                    ✓ {newAuto} auto-resolved by live re-scan
                   </p>
                 )}
               </div>
@@ -954,7 +944,7 @@ export default function AgentWorkflow() {
                   </button>
                   <button onClick={() => verifyMutation.mutate(activeRunId!)}
                     disabled={verifyMutation.isPending}
-                    className="flex items-center gap-1.5 px-3 py-2 border border-blue-300 text-blue-700 rounded-lg text-sm font-medium hover:bg-blue-50 disabled:opacity-50 transition-colors">
+                    className="flex items-center gap-1.5 px-3 py-2 border border-blue-300 dark:border-blue-500/40 text-blue-700 dark:text-blue-300 rounded-lg text-sm font-medium hover:bg-blue-50 dark:hover:bg-blue-900/40 disabled:opacity-50 transition-colors">
                     <RefreshCw className={`w-3.5 h-3.5 ${verifyMutation.isPending ? 'animate-spin' : ''}`} />
                     Verify Again
                   </button>
@@ -968,14 +958,14 @@ export default function AgentWorkflow() {
       {/* ── RULE REVIEW PANEL (shown when awaiting_rule_review) ─────────────── */}
       {isReviewing && activeRunId && (
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
-          <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 bg-purple-50">
+          <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 bg-purple-50 dark:bg-purple-950/40">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-base font-semibold text-purple-900 flex items-center gap-2">
+                <h2 className="text-base font-semibold text-purple-900 dark:text-purple-200 flex items-center gap-2">
                   <BrainCircuit className="w-5 h-5 text-purple-600" />
                   Review Rules Before Running
                 </h2>
-                <p className="text-xs text-purple-700 mt-0.5">
+                <p className="text-xs text-purple-700 dark:text-purple-300 mt-0.5">
                   Claude kept {reviewActive.length} active and skipped {reviewSkipped.length}.
                   Approve or reject AI-generated rules, activate skipped ones, edit new rules, or select several and use bulk actions. Then click Run Pipeline.
                 </p>
@@ -1000,9 +990,9 @@ export default function AgentWorkflow() {
 
           {/* Parse-failure warning — "0 proposals" may be a broken response, not full coverage */}
           {parseFailed && (
-            <div className="px-6 py-3 bg-red-50 border-b border-red-200 flex items-start gap-2">
+            <div className="px-6 py-3 bg-red-50 dark:bg-red-950/40 border-b border-red-200 dark:border-red-500/40 flex items-start gap-2">
               <AlertTriangle className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5" />
-              <p className="text-xs text-red-800">
+              <p className="text-xs text-red-800 dark:text-red-300">
                 <span className="font-semibold">Rule Intelligence response could not be parsed</span>{' '}
                 (even after a retry). Any missing proposals below may be due to a broken or truncated
                 model response — treat this list as incomplete rather than as confirmation the table is
@@ -1013,9 +1003,9 @@ export default function AgentWorkflow() {
 
           {/* Unaddressed-signals warning — deterministic signals with no proposed check */}
           {signalsMissed.length > 0 && (
-            <div className="px-6 py-3 bg-amber-50 border-b border-amber-200 flex items-start gap-2">
+            <div className="px-6 py-3 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-500/40 flex items-start gap-2">
               <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
-              <div className="text-xs text-amber-800">
+              <div className="text-xs text-amber-800 dark:text-amber-300">
                 <span className="font-semibold">
                   {signalsMissed.length} signal{signalsMissed.length !== 1 ? 's' : ''} unaddressed
                 </span>{' '}
@@ -1023,7 +1013,7 @@ export default function AgentWorkflow() {
                 fallback:
                 <div className="flex flex-wrap gap-1.5 mt-1.5">
                   {signalsMissed.map(sig => (
-                    <span key={sig} className="font-mono bg-amber-100 border border-amber-200 text-amber-800 px-1.5 py-0.5 rounded">
+                    <span key={sig} className="font-mono bg-amber-100 dark:bg-amber-900/40 border border-amber-200 dark:border-amber-700 text-amber-800 dark:text-amber-300 px-1.5 py-0.5 rounded">
                       {sig}
                     </span>
                   ))}
@@ -1042,8 +1032,8 @@ export default function AgentWorkflow() {
                 </h3>
               </div>
               {selectedActiveIds.size > 0 && (
-                <div className="mb-2 flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg px-3 py-1.5">
-                  <span className="text-xs font-medium text-red-800">{selectedActiveIds.size} selected</span>
+                <div className="mb-2 flex items-center gap-2 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-500/40 rounded-lg px-3 py-1.5">
+                  <span className="text-xs font-medium text-red-800 dark:text-red-300">{selectedActiveIds.size} selected</span>
                   <button
                     onClick={() => bulkSkip(selectedActiveIds)}
                     className="ml-auto flex items-center gap-1 text-xs px-2.5 py-1 bg-red-600 text-white rounded hover:bg-red-700"
@@ -1060,9 +1050,7 @@ export default function AgentWorkflow() {
               )}
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewActive.map(rule => (
-                  <div key={rule.instance_id} className={`rounded-lg border p-3 text-sm ${
-                    rule.is_new_instance ? 'border-purple-200 bg-purple-50/40' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'
-                  }`}>
+                  <div key={rule.instance_id} className="rounded-lg border p-3 text-sm border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
                     {editingRule === rule.instance_id ? (
                       <div className="space-y-2">
                         <input
@@ -1141,7 +1129,7 @@ export default function AgentWorkflow() {
                           {rule.is_new_instance && (
                             <button
                               onClick={() => { setEditingRule(rule.instance_id); setEditForm({}) }}
-                              className="text-xs px-1.5 py-1 text-purple-600 border border-purple-200 rounded hover:bg-purple-50"
+                              className="text-xs px-1.5 py-1 text-purple-600 dark:text-purple-300 border border-purple-200 dark:border-purple-500/40 rounded hover:bg-purple-50 dark:hover:bg-purple-900/40"
                               title="Edit this new rule"
                             >
                               Edit
@@ -1154,8 +1142,8 @@ export default function AgentWorkflow() {
                                 disabled={approvedIds.has(rule.instance_id)}
                                 className={`flex items-center gap-1 text-xs px-1.5 py-1 rounded border ${
                                   approvedIds.has(rule.instance_id)
-                                    ? 'text-green-700 border-green-300 bg-green-50 dark:bg-green-950/40'
-                                    : 'text-green-600 border-green-200 hover:bg-green-50'
+                                    ? 'text-green-700 dark:text-green-300 border-green-300 dark:border-green-500/40 bg-green-50 dark:bg-green-950/40'
+                                    : 'text-green-600 dark:text-green-400 border-green-200 dark:border-green-500/40 hover:bg-green-50 dark:hover:bg-green-900/40'
                                 }`}
                                 title="Approve this AI-generated rule"
                               >
@@ -1164,7 +1152,7 @@ export default function AgentWorkflow() {
                               </button>
                               <button
                                 onClick={() => rejectRule(rule.instance_id)}
-                                className="text-xs px-1.5 py-1 text-red-600 border border-red-200 rounded hover:bg-red-50"
+                                className="text-xs px-1.5 py-1 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/40 rounded hover:bg-red-50 dark:hover:bg-red-900/40"
                                 title="Reject this AI-generated rule"
                               >
                                 Reject
@@ -1173,7 +1161,7 @@ export default function AgentWorkflow() {
                           ) : (
                             <button
                               onClick={() => rejectRule(rule.instance_id)}
-                              className="text-xs px-1.5 py-1 text-red-600 border border-red-200 rounded hover:bg-red-50"
+                              className="text-xs px-1.5 py-1 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/40 rounded hover:bg-red-50 dark:hover:bg-red-900/40"
                               title="Skip this rule"
                             >
                               Skip
@@ -1199,8 +1187,8 @@ export default function AgentWorkflow() {
                 </h3>
               </div>
               {selectedSkippedIds.size > 0 && (
-                <div className="mb-2 flex items-center gap-2 bg-green-50 border border-green-200 rounded-lg px-3 py-1.5">
-                  <span className="text-xs font-medium text-green-800">{selectedSkippedIds.size} selected</span>
+                <div className="mb-2 flex items-center gap-2 bg-green-50 dark:bg-green-950/40 border border-green-200 dark:border-green-500/40 rounded-lg px-3 py-1.5">
+                  <span className="text-xs font-medium text-green-800 dark:text-green-300">{selectedSkippedIds.size} selected</span>
                   <button
                     onClick={() => bulkActivate(selectedSkippedIds)}
                     className="ml-auto flex items-center gap-1 text-xs px-2.5 py-1 bg-green-600 text-white rounded hover:bg-green-700"
@@ -1245,7 +1233,7 @@ export default function AgentWorkflow() {
                       </div>
                       <button
                         onClick={() => activateRule(rule.instance_id)}
-                        className="flex-shrink-0 text-xs px-1.5 py-1 text-green-600 border border-green-200 rounded hover:bg-green-50"
+                        className="flex-shrink-0 text-xs px-1.5 py-1 text-green-600 dark:text-green-400 border border-green-200 dark:border-green-500/40 rounded hover:bg-green-50 dark:hover:bg-green-900/40"
                         title="Activate this rule"
                       >
                         Activate
@@ -1400,10 +1388,8 @@ export default function AgentWorkflow() {
               </button>
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
-              {(() => {
-                const n = (activeRun?.instance_review_state?.active ?? reviewActive).length
-                return `Saves ${n} approved rule pattern${n !== 1 ? 's' : ''} from this run as a reusable workflow. You can run it on any table or schema later.`
-              })()}
+              Saves the active rules applied on this run's table as a reusable workflow.
+              You can run it on any table or schema later.
             </p>
             <div className="space-y-3">
               <div>

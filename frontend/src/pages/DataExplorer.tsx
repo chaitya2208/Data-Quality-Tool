@@ -68,7 +68,7 @@ function SelectorColumn({
                   onClick={() => onSelect(name)}
                   className={`w-full text-left px-2.5 py-1.5 rounded-lg text-sm truncate transition-colors ${
                     name === selected
-                      ? 'bg-primary-50 text-primary-700 font-medium'
+                      ? 'bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 font-medium'
                       : 'text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/40'
                   }`}
                   title={name}
@@ -151,7 +151,7 @@ function ProfileProgressBar({ tableName, columnCount }: { tableName: string; col
         </span>
         <span className="text-sm font-bold text-primary-600 tabular-nums">{Math.round(pct)}%</span>
       </div>
-      <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
+      <div className="h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
         <div className="h-full bg-primary-500 rounded-full transition-[width] duration-300 ease-linear" style={{ width: `${pct}%` }} />
       </div>
       <p className="text-xs text-gray-400 dark:text-gray-400 mt-2">
@@ -256,7 +256,7 @@ function CategoryStatsTable({ profile, category }: { profile: TableProfile; cate
 function ColumnStatsPanel({ tableName, profile }: { tableName: string; profile: TableProfile }) {
   return (
     <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
-      <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 bg-primary-50/50">
+      <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 bg-primary-50/50 dark:bg-primary-900/20">
         <div className="flex items-center gap-2">
           <BarChart3 className="w-5 h-5 text-primary-600" />
           <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Column Statistics — {tableName}</h2>
@@ -433,7 +433,7 @@ export default function DataExplorer() {
       )}
 
       {selectedTable && profileMutation.isError && !profileMutation.isPending && (
-        <div className="bg-red-50 border border-red-200 rounded-xl px-5 py-3 text-sm text-red-700 flex items-center gap-2">
+        <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-500/40 rounded-xl px-5 py-3 text-sm text-red-700 dark:text-red-300 flex items-center gap-2">
           <AlertCircle className="w-4 h-4" />
           Profiling failed: {(profileMutation.error as any)?.response?.data?.detail ?? (profileMutation.error as Error).message}
         </div>
