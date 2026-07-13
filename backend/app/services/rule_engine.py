@@ -46,6 +46,12 @@ class RuleEngine:
             definition = definitions_by_id.get(inst.definition_id)
             if not definition:
                 continue
+            # Definition-level disable gates every instance under it — the
+            # "turn off this whole check concept" toggle in Rule Library
+            # (app/api/rules.py toggle_rule_definition) has no effect unless
+            # this filter exists; instance.is_active alone can't express it.
+            if definition.status == "disabled":
+                continue
             inst.check_kind = definition.check_kind
             inst.handler_key = definition.handler_key
             inst.code = (definition.handler_key or "").upper()
@@ -173,6 +179,8 @@ class RuleEngine:
                 continue
             definition = definitions_by_id.get(instance.definition_id)
             if not definition or definition.check_kind != "sql_template":
+                continue
+            if definition.status == "disabled":
                 continue
             if instance.database_name != table_asset.database_name:
                 continue

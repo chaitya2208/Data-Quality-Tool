@@ -8,6 +8,7 @@ class FindingBase(BaseModel):
     asset_id: str
     scan_id: str
     rule_id: Optional[str] = None
+    instance_id: Optional[str] = None
     title: str
     description: str
     severity: str

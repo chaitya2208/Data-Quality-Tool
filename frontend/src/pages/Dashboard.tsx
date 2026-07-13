@@ -377,7 +377,7 @@ export default function Dashboard() {
               <span className="font-semibold text-gray-900 dark:text-gray-100">{ruleStats?.total ?? 0}</span> total
             </span>
             <button
-              onClick={() => navigate('/rules')}
+              onClick={() => navigate('/rule-library')}
               className="text-sm text-primary-600 hover:text-primary-800 font-medium"
             >
               Manage →

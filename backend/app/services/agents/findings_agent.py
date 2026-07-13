@@ -93,7 +93,9 @@ class FindingsAgent:
             if not instance:
                 continue
             definition = storage.get_definition(instance.definition_id)
-            if definition and definition.check_kind == "python_handler" and definition.handler_key:
+            if not definition or definition.status == "disabled":
+                continue
+            if definition.check_kind == "python_handler" and definition.handler_key:
                 codes.add(definition.handler_key.upper())
         return codes
 

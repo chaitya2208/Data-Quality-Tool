@@ -14,6 +14,11 @@ export default function Findings() {
   const [statusFilter,   setStatusFilter]   = useState(searchParams.get('status')   || '')
   const [tableFilter,    setTableFilter]    = useState(searchParams.get('table')    || '')
   const [ruleFilter,     setRuleFilter]     = useState(searchParams.get('rule_code')|| '')
+  // instance filter: pre-applied when navigating from Rule Library's "View Findings"
+  // link — filters by instance_id directly, so it works for every check kind
+  // (SQL template, python handler, AI-proposed, deterministic), unlike rule_code
+  // which is only reliably set in context for python_handler checks.
+  const [instanceFilter, setInstanceFilter] = useState(searchParams.get('instance') || '')
   // scan_id filter: pre-applied when navigating from Workflow "Fix Issues"
   const [scanIdFilter,   setScanIdFilter]   = useState(searchParams.get('scan_id')  || '')
 
@@ -26,10 +31,12 @@ export default function Findings() {
   // Sync URL params → filter state once on mount
   useEffect(() => {
     if (urlTableName) setTableFilter('__table_name__' + urlTableName + '__db__' + urlDatabase)
-    const urlRule   = searchParams.get('rule_code')
-    const urlScanId = searchParams.get('scan_id')
-    if (urlRule)   setRuleFilter(urlRule)
-    if (urlScanId) setScanIdFilter(urlScanId)
+    const urlRule     = searchParams.get('rule_code')
+    const urlInstance = searchParams.get('instance')
+    const urlScanId   = searchParams.get('scan_id')
+    if (urlRule)     setRuleFilter(urlRule)
+    if (urlInstance) setInstanceFilter(urlInstance)
+    if (urlScanId)   setScanIdFilter(urlScanId)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Data fetching ──────────────────────────────────────────────────────────
@@ -105,11 +112,13 @@ export default function Findings() {
       }
       // Rule filter
       if (ruleFilter && f.context?.rule_code !== ruleFilter) return false
+      // Instance filter (from Rule Library — exact match, works for every check kind)
+      if (instanceFilter && f.instance_id !== instanceFilter) return false
       return true
     })
 
     return { total: allFindings.total, findings: filtered }
-  }, [allFindings, tableFilter, ruleFilter])
+  }, [allFindings, tableFilter, ruleFilter, instanceFilter])
 
   // ── Derived display label for active table filter ──────────────────────────
   const activeTableLabel = useMemo(() => {
@@ -149,11 +158,12 @@ export default function Findings() {
   }
 
   const clearAll = () => {
-    setSeverityFilter(''); setStatusFilter(''); setTableFilter(''); setRuleFilter(''); setScanIdFilter('')
+    setSeverityFilter(''); setStatusFilter(''); setTableFilter(''); setRuleFilter('')
+    setInstanceFilter(''); setScanIdFilter('')
     setSearchParams({})
   }
 
-  const anyFilter = severityFilter || statusFilter || tableFilter || ruleFilter || scanIdFilter
+  const anyFilter = severityFilter || statusFilter || tableFilter || ruleFilter || instanceFilter || scanIdFilter
 
   // ── Colour helpers ─────────────────────────────────────────────────────────
   const sevColor = (s: string) => ({
@@ -295,6 +305,12 @@ export default function Findings() {
                 <ShieldCheck className="w-3 h-3" />
                 {rulesData?.rules.find(r => r.code === ruleFilter)?.name ?? ruleFilter}
                 <button onClick={() => setRuleFilter('')} className="ml-1 hover:text-purple-900"><X className="w-3 h-3" /></button>
+              </span>
+            )}
+            {instanceFilter && (
+              <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                <ShieldCheck className="w-3 h-3" /> Rule Library instance
+                <button onClick={() => { setInstanceFilter(''); setSearchParams({}) }} className="ml-1 hover:text-purple-900"><X className="w-3 h-3" /></button>
               </span>
             )}
             {severityFilter && (

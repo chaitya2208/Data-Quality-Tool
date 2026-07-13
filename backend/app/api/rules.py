@@ -108,6 +108,29 @@ def get_rule_definition(definition_id: str):
     return definition
 
 
+class ToggleDefinitionRequest(BaseModel):
+    is_active: bool
+
+
+@router.patch("/definitions/{definition_id}", response_model=RuleDefinitionResponse)
+def toggle_rule_definition(definition_id: str, body: ToggleDefinitionRequest):
+    """Enable/disable a check concept — gates every instance under this
+    definition at execution time (see RuleEngine.get_active_instances),
+    not just this one row. Only active/disabled definitions are toggleable;
+    a proposed definition must be approved via Agent Workflow review first."""
+    definition = storage.get_definition(definition_id)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Rule definition not found")
+    if definition.status not in ("active", "disabled"):
+        raise HTTPException(status_code=400,
+                            detail=f"Only active/disabled definitions can be toggled (current: {definition.status})")
+    new_status = "active" if body.is_active else "disabled"
+    storage.update_definition(definition_id, status=new_status)
+    definition = storage.get_definition(definition_id)
+    definition.instance_count = storage.get_real_instance_counts().get(definition_id, 0)
+    return definition
+
+
 @router.get("/definitions/{definition_id}/instances", response_model=RuleInstanceListResponse)
 def list_definition_instances(
     definition_id: str,

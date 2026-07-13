@@ -15,6 +15,7 @@ export interface Finding {
   asset_id: string;
   scan_id: string;
   rule_id: string;
+  instance_id: string | null;
   title: string;
   description: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
@@ -205,6 +206,8 @@ export const ruleLibraryApi = {
     api.get<{ total: number; definitions: RuleDefinition[] }>('/rules/definitions', { params }),
   getDefinition: (id: string) =>
     api.get<RuleDefinition>(`/rules/definitions/${id}`),
+  toggleDefinition: (id: string, is_active: boolean) =>
+    api.patch<RuleDefinition>(`/rules/definitions/${id}`, { is_active }),
   listInstances: (definitionId: string) =>
     api.get<{ total: number; instances: RuleInstance[] }>(`/rules/definitions/${definitionId}/instances`),
   listExecutions: (instanceId: string) =>

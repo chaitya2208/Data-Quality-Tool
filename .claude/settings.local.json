@@ -130,7 +130,26 @@
       "Bash(awk 'NR>=27 && NR<=46' /tmp/mergecheck/app.ours)",
       "Bash(awk 'NR>=150 && NR<=178' /tmp/mergecheck/app.ours)",
       "Bash(git check-ignore *)",
-      "Bash(grep -rn *)"
+      "Bash(grep -rn *)",
+      "Bash(echo \"exit: $?\")",
+      "Skill(run)",
+      "Bash(./.venv/Scripts/python.exe -c \"import uvicorn, fastapi; print\\('uvicorn', uvicorn.__version__\\); print\\('fastapi', fastapi.__version__\\)\")",
+      "Bash(powershell -Command \"Get-NetTCPConnection -LocalPort 5173 -ErrorAction SilentlyContinue | Select-Object LocalPort, State, OwningProcess\")",
+      "Bash(powershell -Command \"Get-CimInstance Win32_Process -Filter 'ProcessId=16152' | Select-Object ProcessId, CommandLine\" 2>&1)",
+      "Bash(powershell -Command \"Stop-Process -Id 16152 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Get-NetTCPConnection -LocalPort 8001 -ErrorAction SilentlyContinue\" 2>&1)",
+      "Bash(powershell -Command \"Get-Process -Id 16152 -ErrorAction SilentlyContinue\" 2>&1)",
+      "Bash(powershell -Command \"Get-CimInstance Win32_Process -Filter 'ProcessId=16152' | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -Command \"Get-CimInstance Win32_Process -Filter 'ProcessId=6040' | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -Command \"Stop-Process -Id 16152,6040 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; netstat -ano | Select-String ':8001'\" 2>&1)",
+      "Bash(echo \"started pid $!\")",
+      "Bash(powershell -Command \"Stop-Process -Id 24124 -Force -ErrorAction SilentlyContinue; Stop-Process -Id 18344 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; netstat -ano | Select-String ':8001|:3000'\" 2>&1)",
+      "Bash(powershell -Command \"Get-Process -Id 24124 -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -Command \"Stop-Process -Id 21912 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; netstat -ano | Select-String ':8001|:3000'\")",
+      "Bash(echo \"done, exit: $?\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/api/rules.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/services/rule_engine.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/services/agents/findings_agent.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/schemas/finding.py', encoding='utf-8'\\).read\\(\\)\\)\")"
     ]
   }
 }

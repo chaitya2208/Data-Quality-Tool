@@ -1,12 +1,11 @@
 import { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, ShieldCheck, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Assets from './pages/Assets'
 import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
 import AIFix from './pages/AIFix'
-import Rules from './pages/Rules'
 import RuleLibrary from './pages/RuleLibrary'
 import DataExplorer from './pages/DataExplorer'
 import Connections from './pages/Connections'
@@ -23,7 +22,6 @@ function App() {
     { name: 'Data Explorer', href: '/explorer',     icon: Compass      },
     { name: 'Assets',        href: '/assets',       icon: Database     },
     { name: 'Findings',      href: '/findings',     icon: AlertCircle  },
-    { name: 'Rules',         href: '/rules',        icon: ShieldCheck  },
     { name: 'Rule Library',  href: '/rule-library', icon: Library      },
     { name: 'Workflow',      href: '/workflow',     icon: GitBranch    },
     { name: 'Settings',      href: '/settings',     icon: SettingsIcon },
@@ -147,7 +145,6 @@ function App() {
             <Route path="/findings"     element={<Findings />}      />
             <Route path="/workflow"     element={<AgentWorkflow />} />
             <Route path="/ai-fix"       element={<AIFix />}         />
-            <Route path="/rules"        element={<Rules />}         />
             <Route path="/rule-library" element={<RuleLibrary />}   />
             <Route path="/settings"     element={<SettingsPage />}  />
           </Routes>

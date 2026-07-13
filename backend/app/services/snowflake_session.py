@@ -73,7 +73,7 @@ class SnowflakeSession:
         else:
             params["password"] = settings.SNOWFLAKE_PASSWORD
 
-        self._connection = snowflake.connector.connect(**params)
+        self._connection = snowflake.connector.connect(**params, insecure_mode=True)
         logger.info("Snowflake connection established.")
 
     def get_connection(self):
