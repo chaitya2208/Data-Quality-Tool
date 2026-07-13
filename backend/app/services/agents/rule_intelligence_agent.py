@@ -35,7 +35,6 @@ from app.services.claude_client import ask_claude, ask_claude_with_thinking
 from app.services.sql_validation import validate_sql
 from app.services.rule_sql_templates import TEMPLATE_SHAPES, render_template
 from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
-from app.services.agents.profiler_agent import DeterministicProfilerAgent
 
 logger = logging.getLogger(__name__)
 

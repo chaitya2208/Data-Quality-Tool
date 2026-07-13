@@ -2,10 +2,9 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { agentRunsApi } from '../api/client'
-import type { AgentRun } from '../api/client'
 import {
   History, Loader2, CheckCircle2, AlertTriangle, BrainCircuit,
-  Wrench, Clock, Database, Search, Filter, ExternalLink,
+  Wrench, Database, Search, Filter, ExternalLink,
 } from 'lucide-react'
 
 type StatusFilter = 'all' | 'completed' | 'failed' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes'
@@ -36,18 +35,12 @@ function statusBadge(status: string) {
   }
 }
 
-function duration(run: AgentRun): string | null {
-  if (!run.started_at || !run.completed_at) return null
-  const s = (new Date(run.completed_at).getTime() - new Date(run.started_at).getTime()) / 1000
-  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${(s % 60).toFixed(0)}s`
-}
-
 export default function RunHistory() {
   const navigate = useNavigate()
   const [search, setSearch]           = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
 
-  const { data, isLoading, refetch } = useQuery({
+  const { data, isLoading } = useQuery({
     queryKey: ['agent-runs-history'],
     queryFn: () => agentRunsApi.list().then(r => r.data),
     refetchInterval: 10_000,
@@ -146,12 +139,10 @@ export default function RunHistory() {
               <span>Status</span>
               <span>Findings</span>
               <span>AI Rules</span>
-              <span>Duration</span>
+              <span></span>
             </div>
 
             {filtered.map(run => {
-              const d = duration(run)
-              const isActive = ['running', 'awaiting_rule_review', 'awaiting_fixes', 'pending'].includes(run.status)
               return (
                 <div
                   key={run.id}
@@ -206,19 +197,8 @@ export default function RunHistory() {
                       }
                     </div>
 
-                    {/* Duration + actions */}
-                    <div className="flex items-center gap-3">
-                      {d ? (
-                        <span className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-400">
-                          <Clock className="w-3 h-3" />{d}
-                        </span>
-                      ) : isActive ? (
-                        <span className="flex items-center gap-1 text-xs text-blue-500">
-                          <Loader2 className="w-3 h-3 animate-spin" />active
-                        </span>
-                      ) : (
-                        <span className="text-xs text-gray-300">—</span>
-                      )}
+                    {/* Actions */}
+                    <div className="flex items-center justify-end gap-3">
                       <button
                         onClick={() => navigate(`/workflow?run_id=${run.id}`)}
                         className="text-xs px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors flex-shrink-0"

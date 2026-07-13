@@ -8,7 +8,7 @@ import {
   GitBranch, Database, BrainCircuit, Shield, AlertCircle,
   Wrench, CheckCircle2, Loader2, ChevronDown, ChevronRight,
   AlertTriangle, ArrowRight, Clock, Play, ExternalLink,
-  RefreshCw, Sparkles, Network, LineChart, BarChart3,
+  RefreshCw, Sparkles, Network, BarChart3,
   BookmarkPlus, X,
 } from 'lucide-react'
 
@@ -50,16 +50,9 @@ const AGENTS = [
     name: 'profiling_agent',
     label: 'Profiling',
     icon: BarChart3,
-    desc: 'Profiles data — stats & anomalies for smarter rules',
+    desc: 'Profiles data — stats, anomalies & deterministic signals (uniqueness, freshness, closed sets) for smarter rules',
     parallel: true,
     parallelGroup: 'A',
-  },
-  {
-    name: 'profiler_agent',
-    label: 'Profiler',
-    icon: LineChart,
-    desc: 'Computes deterministic stats — uniqueness, freshness, closed value sets',
-    parallel: false,
   },
   {
     name: 'rule_intelligence_agent',
@@ -124,12 +117,12 @@ function fixIssuesStatus(runStatus: RunStatus): string {
 
 function nodeBorderColor(status: string) {
   switch (status) {
-    case 'running':   return 'border-blue-400 dark:border-blue-500/50 bg-blue-50 dark:bg-blue-950/40'
-    case 'completed': return 'border-green-400 dark:border-green-500/50 bg-green-50 dark:bg-green-950/40'
-    case 'failed':    return 'border-red-400 dark:border-red-500/50 bg-red-50 dark:bg-red-950/40'
+    case 'running':   return 'border-blue-400 dark:border-blue-500 bg-blue-50 dark:bg-blue-900/60'
+    case 'completed': return 'border-green-400 dark:border-green-500 bg-green-50 dark:bg-green-900/60'
+    case 'failed':    return 'border-red-400 dark:border-red-500 bg-red-50 dark:bg-red-900/60'
     case 'skipped':   return 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 opacity-50'
-    case 'active':    return 'border-primary-400 dark:border-primary-500/50 bg-primary-50 dark:bg-primary-950/40'
-    default:          return 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'
+    case 'active':    return 'border-primary-400 dark:border-primary-400 bg-primary-50 dark:bg-primary-900/60'
+    default:          return 'border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800'
   }
 }
 
@@ -139,7 +132,7 @@ function nodeIconColor(status: string) {
     case 'completed': return 'text-green-600'
     case 'failed':    return 'text-red-500'
     case 'active':    return 'text-primary-600'
-    default:          return 'text-gray-300'
+    default:          return 'text-gray-400 dark:text-gray-500'
   }
 }
 
@@ -156,7 +149,7 @@ function statusBadge(status: string) {
     case 'active':
       return <span className="flex items-center gap-1 text-primary-700 dark:text-primary-300 text-xs font-medium"><ArrowRight className="w-3 h-3" />Ready</span>
     default:
-      return <span className="text-gray-300 dark:text-gray-600 text-xs">Waiting</span>
+      return <span className="text-gray-400 dark:text-gray-400 text-xs">Waiting</span>
   }
 }
 
@@ -872,8 +865,6 @@ export default function AgentWorkflow() {
                   <AgentNode agentDef={getAgentDef('profiling_agent')} task={getTask('profiling_agent')}
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 </ParallelGroup>
-                <AgentNode agentDef={getAgentDef('profiler_agent')} task={getTask('profiler_agent')}
-                  isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 <AgentNode agentDef={getAgentDef('rule_intelligence_agent')} task={getTask('rule_intelligence_agent')}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 <AgentNode agentDef={getAgentDef('findings_agent')} task={getTask('findings_agent')}
@@ -1273,16 +1264,16 @@ export default function AgentWorkflow() {
 
       {/* Awaiting fixes banner */}
       {isAwaiting && activeRun?.scan_id && !verifyDone && (
-        <div className="bg-primary-50 border-2 border-primary-300 rounded-xl p-5">
+        <div className="bg-primary-50 dark:bg-gray-800 border-2 border-primary-300 dark:border-primary-500 rounded-xl p-5">
           <div className="flex items-start justify-between gap-4">
             <div>
-              <h3 className="font-semibold text-primary-900 text-base mb-1">
+              <h3 className="font-semibold text-primary-900 dark:text-primary-100 text-base mb-1">
                 🔧 Pipeline complete — fix the findings
               </h3>
-              <p className="text-sm text-primary-800">
+              <p className="text-sm text-primary-800 dark:text-gray-200">
                 {liveResolved !== null ? (
                   <>
-                    <strong className="text-green-700">{liveResolved} resolved</strong>
+                    <strong className="text-green-700 dark:text-green-400">{liveResolved} resolved</strong>
                     {' · '}
                     <strong>{liveRemaining} remaining</strong>
                     {' of '}
@@ -1307,7 +1298,7 @@ export default function AgentWorkflow() {
               </button>
               <button onClick={() => verifyMutation.mutate(activeRunId!)}
                 disabled={verifyMutation.isPending}
-                className="flex items-center gap-1.5 px-4 py-2 border border-primary-300 text-primary-700 rounded-lg text-sm font-medium hover:bg-primary-100 disabled:opacity-50 transition-colors">
+                className="flex items-center gap-1.5 px-4 py-2 border border-primary-300 dark:border-primary-500/40 text-primary-700 dark:text-primary-300 rounded-lg text-sm font-medium hover:bg-primary-100 dark:hover:bg-primary-900/40 disabled:opacity-50 transition-colors">
                 {verifyMutation.isPending
                   ? <><Loader2 className="w-4 h-4 animate-spin" />Verifying...</>
                   : <><RefreshCw className="w-4 h-4" />Verify Fixes</>
@@ -1315,7 +1306,7 @@ export default function AgentWorkflow() {
               </button>
               <button
                 onClick={() => setSaveWfOpen(true)}
-                className="flex items-center gap-1.5 px-4 py-2 border border-gray-300 text-gray-700 dark:text-gray-200 dark:border-gray-600 rounded-lg text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                className="flex items-center gap-1.5 px-4 py-2 border border-gray-300 text-gray-700 dark:text-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 rounded-lg text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
               >
                 <BookmarkPlus className="w-4 h-4" />
                 Save as Workflow
@@ -1404,7 +1395,7 @@ export default function AgentWorkflow() {
               <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">
                 Save as Workflow
               </h3>
-              <button onClick={() => setSaveWfOpen(false)} className="text-gray-400 hover:text-gray-600">
+              <button onClick={() => setSaveWfOpen(false)} className="text-gray-400 dark:text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -1451,7 +1442,7 @@ export default function AgentWorkflow() {
             <div className="mt-5 flex justify-end gap-2">
               <button
                 onClick={() => setSaveWfOpen(false)}
-                className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800"
+                className="px-4 py-2 text-sm text-gray-600 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100"
               >
                 Cancel
               </button>

@@ -1,9 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { findingsApi, scansApi, assetsApi, rulesApi } from '../api/client'
-import type { DatabaseFindingSummary } from '../api/client'
-import { AlertCircle, CheckCircle, Clock, Database, TrendingUp, ChevronRight, ArrowLeft, Table, ShieldCheck } from 'lucide-react'
+import { findingsApi, agentRunsApi, rulesApi } from '../api/client'
+import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck } from 'lucide-react'
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip,
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -38,14 +37,11 @@ export default function Dashboard() {
     queryFn: () => findingsApi.byDatabase().then(r => r.data),
   })
 
-  const { data: scansData } = useQuery({
-    queryKey: ['scans'],
-    queryFn: () => scansApi.list().then(r => r.data),
-  })
-
-  const { data: assetsData } = useQuery({
-    queryKey: ['assets'],
-    queryFn: () => assetsApi.list().then(r => r.data),
+  // Count workflow runs (same source as the Run History page) so the card
+  // matches that page's run count, not raw scan rows.
+  const { data: runsData } = useQuery({
+    queryKey: ['agent-runs'],
+    queryFn: () => agentRunsApi.list().then(r => r.data),
   })
 
   const { data: recentFindings } = useQuery({
@@ -158,11 +154,10 @@ export default function Dashboard() {
       </div>
 
       {/* Stat cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-6">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-6">
         <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           />
-        <StatCard title="Assets Scanned"   value={assetsData?.total ?? 0}          icon={Database}    color="bg-blue-500"   href="/assets"             />
-        <StatCard title="Scans Completed"  value={scansData?.total ?? 0}           icon={CheckCircle} color="bg-green-500"  href="/workflow"           />
         <StatCard title="Pending Issues"   value={stats?.by_status?.detected ?? 0} icon={Clock}       color="bg-yellow-500" href="/findings?status=detected" />
+        <StatCard title="Workflow Runs"    value={runsData?.runs?.length ?? 0}     icon={CheckCircle} color="bg-green-500"  href="/run-history"        />
       </div>
 
       {/* ── Database / Table issues chart ── */}

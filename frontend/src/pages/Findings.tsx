@@ -41,6 +41,33 @@ export default function Findings() {
     if (urlScanId)   setScanIdFilter(urlScanId)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Sync filter state → URL whenever a filter changes, so the current filters
+  // live in the URL. That way navigating away (e.g. to AI-Fix to resolve a
+  // finding) and coming Back restores the exact filtered view instead of
+  // resetting — handleGetAIFixes captures window.location.search as return_to.
+  // Uses replace so filter tweaks don't pile up in browser history.
+  useEffect(() => {
+    const next: Record<string, string> = {}
+    if (severityFilter) next.severity  = severityFilter
+    if (statusFilter)   next.status    = statusFilter
+    if (ruleFilter)     next.rule_code = ruleFilter
+    if (instanceFilter) next.instance  = instanceFilter
+    if (scanIdFilter)   next.scan_id   = scanIdFilter
+    // tableFilter is either a plain FQN (from the dropdown) or the
+    // "__table_name__<t>__db__<db>" sentinel (from a table_name/database URL).
+    // Persist both forms so Back-navigation restores the exact table filter.
+    if (tableFilter) {
+      if (tableFilter.startsWith('__table_name__')) {
+        const parts = tableFilter.split('__db__')
+        next.table_name = parts[0].replace('__table_name__', '')
+        if (parts[1]) next.database = parts[1]
+      } else {
+        next.table = tableFilter
+      }
+    }
+    setSearchParams(next, { replace: true })
+  }, [severityFilter, statusFilter, ruleFilter, instanceFilter, scanIdFilter, tableFilter]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Data fetching ──────────────────────────────────────────────────────────
   const { data: allFindings, isLoading } = useQuery({
     queryKey: ['findings', severityFilter, statusFilter, scanIdFilter],
@@ -230,8 +257,8 @@ export default function Findings() {
             <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1">
               Table ({uniqueTables.length})
             </label>
-            <select value={tableFilter.startsWith('__table_name__') ? tableFilter : tableFilter}
-              onChange={e => { setTableFilter(e.target.value); setSearchParams({}) }}
+            <select value={tableFilter}
+              onChange={e => setTableFilter(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Tables</option>
               {uniqueTables.map(t => (
@@ -292,13 +319,13 @@ export default function Findings() {
             {scanIdFilter && (
               <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800">
                 🔀 Workflow scan
-                <button onClick={() => { setScanIdFilter(''); setSearchParams({}) }} className="ml-1 hover:text-indigo-900"><X className="w-3 h-3" /></button>
+                <button onClick={() => setScanIdFilter('')} className="ml-1 hover:text-indigo-900"><X className="w-3 h-3" /></button>
               </span>
             )}
             {tableFilter && (
               <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium bg-primary-100 text-primary-800">
                 <Database className="w-3 h-3" /> {activeTableLabel}
-                <button onClick={() => { setTableFilter(''); setSearchParams({}) }} className="ml-1 hover:text-primary-900"><X className="w-3 h-3" /></button>
+                <button onClick={() => setTableFilter('')} className="ml-1 hover:text-primary-900"><X className="w-3 h-3" /></button>
               </span>
             )}
             {ruleFilter && (
@@ -311,7 +338,7 @@ export default function Findings() {
             {instanceFilter && (
               <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
                 <ShieldCheck className="w-3 h-3" /> Rule Library instance
-                <button onClick={() => { setInstanceFilter(''); setSearchParams({}) }} className="ml-1 hover:text-purple-900"><X className="w-3 h-3" /></button>
+                <button onClick={() => setInstanceFilter('')} className="ml-1 hover:text-purple-900"><X className="w-3 h-3" /></button>
               </span>
             )}
             {severityFilter && (

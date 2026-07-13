@@ -29,7 +29,6 @@ AGENT_ORDER = [
     "rules_fetch_agent",
     "relationship_discovery_agent",
     "profiling_agent",
-    "profiler_agent",
     "rule_intelligence_agent",
     "findings_agent",
     "fix_issues",          # UI-only node
@@ -42,7 +41,6 @@ DB_AGENT_ORDER = [
     "rules_fetch_agent",
     "relationship_discovery_agent",
     "profiling_agent",
-    "profiler_agent",
     "rule_intelligence_agent",
     "findings_agent",
     "verification_agent",
@@ -73,7 +71,7 @@ class WorkflowCoordinator:
         storage.update_agent_run(self.run_id, status="running", started_at=datetime.utcnow())
 
         all_downstream = [
-            "metadata_agent", "rules_fetch_agent", "relationship_discovery_agent", "profiler_agent",
+            "metadata_agent", "rules_fetch_agent", "relationship_discovery_agent",
             "rule_intelligence_agent", "findings_agent", "verification_agent",
         ]
 
@@ -116,7 +114,11 @@ class WorkflowCoordinator:
         meta_result    = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
         rules_result   = {"rule_codes": None, "error": None}
         reldisc_result = {"catalog": None, "error": None}
-        profile_result = {"profile": None, "error": None}
+        # profiling now yields BOTH the UI profile and the deterministic facts
+        # (column_stats/pk_shaped_candidates/freshness_signals/closed_set_columns)
+        # consumed by RuleIntelligenceAgent — computed in parallel, no longer a
+        # separate sequential Profiler step.
+        profile_result = {"profile": None, "facts": {}, "error": None}
 
         def _run_metadata():
             try:
@@ -169,23 +171,35 @@ class WorkflowCoordinator:
                 self._fail_task(reldisc_task, str(e))
 
         def _run_profiling():
-            # UI-facing profiling (anomaly surfacing / Data Explorer) — best-
-            # effort, and NOT consumed by RuleIntelligenceAgent (that agent
-            # gets its own deterministic column stats from ProfilerAgent,
-            # run sequentially below since it needs column_assets).
+            # One profiling pass produces BOTH the UI profile (anomaly surfacing
+            # / Data Explorer) AND the deterministic facts consumed by
+            # RuleIntelligenceAgent (column_stats / pk_shaped_candidates /
+            # freshness_signals / closed_set_columns). Runs in parallel — the
+            # facts are derived from (db, schema, table, connection_id), so this
+            # no longer waits for column metadata to be persisted.
             if not profile_task:
                 return
             try:
                 from app.services.agents.profiling_agent import ProfilingAgent
                 prof = ProfilingAgent(None).run(run.database, run.schema_name, run.table, run.connection_id)
                 profile_result["profile"] = prof
+                # Deterministic facts for RuleIntelligenceAgent (the 4 keys it reads).
+                profile_result["facts"] = {
+                    "column_stats":         prof.get("column_stats", {}),
+                    "pk_shaped_candidates": prof.get("pk_shaped_candidates", []),
+                    "freshness_signals":    prof.get("freshness_signals", []),
+                    "closed_set_columns":   prof.get("closed_set_columns", {}),
+                }
                 anomalies = prof.get("anomalies", [])
                 self._complete_task(profile_task, output={
-                    "columns_profiled": len(prof.get("columns", [])),
-                    "anomalies_found":  len(anomalies),
-                    "anomalies":        anomalies[:20],
-                    "row_count":        prof.get("table", {}).get("row_count"),
-                    "sampled":          prof.get("table", {}).get("is_sampled", False),
+                    "columns_profiled":     len(prof.get("columns", [])),
+                    "anomalies_found":      len(anomalies),
+                    "anomalies":            anomalies[:20],
+                    "pk_shaped_candidates": len(profile_result["facts"]["pk_shaped_candidates"]),
+                    "freshness_signals":    len(profile_result["facts"]["freshness_signals"]),
+                    "closed_set_columns":   len(profile_result["facts"]["closed_set_columns"]),
+                    "row_count":            prof.get("table", {}).get("row_count"),
+                    "sampled":              prof.get("table", {}).get("is_sampled", False),
                 })
             except Exception as e:
                 profile_result["error"] = str(e)
@@ -201,7 +215,7 @@ class WorkflowCoordinator:
         run = storage.get_agent_run(self.run_id)
 
         if meta_result["error"]:
-            self._skip_tasks(["profiler_agent", "rule_intelligence_agent", "findings_agent", "verification_agent"])
+            self._skip_tasks(["rule_intelligence_agent", "findings_agent", "verification_agent"])
             self._mark_run_failed(meta_result["error"])
             return
 
@@ -222,22 +236,12 @@ class WorkflowCoordinator:
             logger.warning(f"[Coordinator] Relationship discovery failed: {reldisc_result['error']}, continuing with no catalog")
         relationship_catalog = reldisc_result["catalog"] or []
 
-        # ── Profiler Agent — needs column_assets, so runs after the join ──────
-        profiler_task = self._get_task("profiler_agent")
-        self._start_task(profiler_task)
-        try:
-            from app.services.agents.profiler_agent import DeterministicProfilerAgent
-            profiler_result = DeterministicProfilerAgent().run(table_asset, column_assets)
-            self._complete_task(profiler_task, output={
-                "columns_profiled": len(profiler_result.get("column_stats", {})),
-                "pk_shaped_candidates": len(profiler_result.get("pk_shaped_candidates", [])),
-                "freshness_signals": len(profiler_result.get("freshness_signals", [])),
-                "closed_set_columns": len(profiler_result.get("closed_set_columns", {})),
-            })
-        except Exception as e:
-            logger.error(f"[Coordinator] ProfilerAgent failed: {e}")
-            self._fail_task(profiler_task, str(e))
-            profiler_result = {}
+        # Deterministic facts came from the parallel profiling agent (above) —
+        # no separate sequential profiler step. Empty dict if profiling failed
+        # (best-effort: RuleIntelligenceAgent handles a missing profiler_result).
+        if profile_result["error"]:
+            logger.warning(f"[Coordinator] Profiling failed: {profile_result['error']}, continuing with no deterministic facts")
+        profiler_result = profile_result["facts"] or {}
 
         # ── Rule Intelligence Agent ───────────────────────────────────────────
         intel_task = self._get_task("rule_intelligence_agent")
@@ -598,7 +602,7 @@ class WorkflowCoordinator:
 
         all_tasks = [
             "metadata_agent", "rules_fetch_agent", "relationship_discovery_agent",
-            "profiler_agent", "rule_intelligence_agent", "findings_agent", "verification_agent",
+            "profiling_agent", "rule_intelligence_agent", "findings_agent", "verification_agent",
         ]
 
         template = storage.get_workflow(run.workflow_template_id)
@@ -638,14 +642,14 @@ class WorkflowCoordinator:
         except Exception as e:
             self._fail_task(meta_task, str(e))
             self._skip_tasks(["rules_fetch_agent", "relationship_discovery_agent",
-                               "profiler_agent", "rule_intelligence_agent",
+                               "profiling_agent", "rule_intelligence_agent",
                                "findings_agent", "verification_agent"])
             self._mark_run_failed(str(e))
             return
 
         # Skip unused pipeline stages gracefully
         for skipped in ["rules_fetch_agent", "relationship_discovery_agent",
-                        "profiler_agent", "rule_intelligence_agent"]:
+                        "profiling_agent", "rule_intelligence_agent"]:
             t = self._get_task(skipped)
             if t:
                 self._skip_task(t)
