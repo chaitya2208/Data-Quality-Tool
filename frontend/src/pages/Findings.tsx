@@ -178,7 +178,6 @@ export default function Findings() {
 
   const stColor = (s: string) => ({
     detected:  'bg-red-50 text-red-700 border-red-200',
-    validated: 'bg-yellow-50 text-yellow-700 border-yellow-200',
     assigned:  'bg-blue-50 text-blue-700 border-blue-200',
     resolved:  'bg-green-50 text-green-700 border-green-200',
   }[s] ?? 'bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700')
@@ -281,7 +280,6 @@ export default function Findings() {
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Statuses</option>
               <option value="detected">Detected</option>
-              <option value="validated">Validated</option>
               <option value="assigned">Assigned</option>
               <option value="resolved">Resolved</option>
             </select>
@@ -451,15 +449,6 @@ export default function Findings() {
                     </div>
                   </div>
 
-                  <div className="flex-shrink-0">
-                    {finding.status === 'detected' && (
-                      <button
-                        onClick={() => updateMutation.mutate({ id: finding.id, data: { status: 'validated' } })}
-                        className="px-3 py-1.5 text-sm font-medium text-primary-700 bg-primary-50 rounded-lg hover:bg-primary-100">
-                        Validate
-                      </button>
-                    )}
-                  </div>
                 </div>
               </div>
             ))}

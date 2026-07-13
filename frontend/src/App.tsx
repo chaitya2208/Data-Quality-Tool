@@ -1,8 +1,7 @@
 import { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
-import Assets from './pages/Assets'
 import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
 import AIFix from './pages/AIFix'
@@ -11,6 +10,7 @@ import DataExplorer from './pages/DataExplorer'
 import Connections from './pages/Connections'
 import SettingsPage from './pages/Settings'
 import SavedWorkflows from './pages/SavedWorkflows'
+import RunHistory from './pages/RunHistory'
 import { useConnection } from './ConnectionContext'
 
 function App() {
@@ -19,14 +19,14 @@ function App() {
   const { connections, selectedId, setSelectedId, selected } = useConnection()
 
   const navigation = [
-    { name: 'Dashboard',     href: '/',             icon: Home         },
-    { name: 'Data Explorer', href: '/explorer',     icon: Compass      },
-    { name: 'Assets',        href: '/assets',       icon: Database     },
-    { name: 'Findings',      href: '/findings',     icon: AlertCircle  },
-    { name: 'Rule Library',  href: '/rule-library', icon: Library      },
-    { name: 'Workflow',      href: '/workflow',          icon: GitBranch    },
+    { name: 'Dashboard',       href: '/',                icon: Home         },
+    { name: 'Data Explorer',   href: '/explorer',        icon: Compass      },
+    { name: 'Findings',        href: '/findings',        icon: AlertCircle  },
+    { name: 'Rule Library',    href: '/rule-library',    icon: Library      },
+    { name: 'Workflow',        href: '/workflow',        icon: GitBranch    },
+    { name: 'Run History',     href: '/run-history',     icon: History      },
     { name: 'Saved Workflows', href: '/saved-workflows', icon: BookOpen     },
-    { name: 'Settings',      href: '/settings',          icon: SettingsIcon },
+    { name: 'Settings',        href: '/settings',        icon: SettingsIcon },
   ]
 
   const SidebarContent = ({ onNavClick }: { onNavClick?: () => void }) => (
@@ -140,16 +140,16 @@ function App() {
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8">
           <Routes>
-            <Route path="/"             element={<Dashboard />}     />
-            <Route path="/explorer"     element={<DataExplorer />}  />
-            <Route path="/connections"  element={<Connections />}   />
-            <Route path="/assets"       element={<Assets />}        />
-            <Route path="/findings"     element={<Findings />}      />
-            <Route path="/workflow"     element={<AgentWorkflow />} />
-            <Route path="/ai-fix"       element={<AIFix />}         />
-            <Route path="/rule-library"     element={<RuleLibrary />}     />
-            <Route path="/saved-workflows"  element={<SavedWorkflows />}  />
-            <Route path="/settings"         element={<SettingsPage />}    />
+            <Route path="/"                element={<Dashboard />}     />
+            <Route path="/explorer"        element={<DataExplorer />}  />
+            <Route path="/connections"     element={<Connections />}   />
+            <Route path="/findings"        element={<Findings />}      />
+            <Route path="/workflow"        element={<AgentWorkflow />} />
+            <Route path="/run-history"     element={<RunHistory />}    />
+            <Route path="/ai-fix"          element={<AIFix />}         />
+            <Route path="/rule-library"    element={<RuleLibrary />}   />
+            <Route path="/saved-workflows" element={<SavedWorkflows />}/>
+            <Route path="/settings"        element={<SettingsPage />}  />
           </Routes>
         </main>
       </div>

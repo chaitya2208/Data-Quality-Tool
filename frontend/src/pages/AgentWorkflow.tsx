@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { assetsApi, agentRunsApi, findingsApi, workflowsApi } from '../api/client'
 import type { AgentTask, RuleReviewEntry } from '../api/client'
 import { useConnection } from '../ConnectionContext'
@@ -323,8 +323,9 @@ const SCOPE_OPTIONS: { value: WorkflowScope; label: string; hint: string }[] = [
 ]
 
 export default function AgentWorkflow() {
-  const navigate    = useNavigate()
-  const queryClient = useQueryClient()
+  const navigate       = useNavigate()
+  const [searchParams]  = useSearchParams()
+  const queryClient    = useQueryClient()
   const { selectedId: connId } = useConnection()
 
   const [scope,            setScope]            = useState<WorkflowScope>('table')
@@ -379,6 +380,16 @@ export default function AgentWorkflow() {
     },
   })
 
+  // If navigated here with ?run_id=... (e.g. from Run History), load that run
+  useEffect(() => {
+    const runIdParam = searchParams.get('run_id')
+    if (runIdParam && runIdParam !== activeRunId) {
+      setActiveRunId(runIdParam)
+      setCollapsed(false)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
+
   // Self-heal: if the persisted active run can't be loaded (deleted / 404),
   // clear the stale id so the UI falls back to the start screen instead of
   // appearing stuck with no pipeline nodes.
@@ -409,12 +420,6 @@ export default function AgentWorkflow() {
   const isAwaiting   = runStatus === 'awaiting_fixes'
   const isCompleted  = runStatus === 'completed'
   const isFailed     = runStatus === 'failed'
-
-  const { data: recentRuns } = useQuery({
-    queryKey: ['agent-runs'],
-    queryFn: () => agentRunsApi.list().then(r => r.data),
-    refetchInterval: activeRunId ? 5000 : false,
-  })
 
   const startMutation = useMutation({
     mutationFn: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string; connection_id?: string | null }) =>
@@ -1237,6 +1242,60 @@ export default function AgentWorkflow() {
         </div>
       )}
 
+      {/* Awaiting fixes banner */}
+      {isAwaiting && activeRun?.scan_id && !verifyDone && (
+        <div className="bg-primary-50 border-2 border-primary-300 rounded-xl p-5">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h3 className="font-semibold text-primary-900 text-base mb-1">
+                🔧 Pipeline complete — fix the findings
+              </h3>
+              <p className="text-sm text-primary-800">
+                {liveResolved !== null ? (
+                  <>
+                    <strong className="text-green-700">{liveResolved} resolved</strong>
+                    {' · '}
+                    <strong>{liveRemaining} remaining</strong>
+                    {' of '}
+                    {liveTotal} total
+                  </>
+                ) : (
+                  <>
+                    <strong>{activeRun.findings_count}</strong> findings detected
+                    {activeRun.ai_rules_count > 0 && (
+                      <> · <strong>{activeRun.ai_rules_count}</strong> AI rules</>
+                    )}
+                  </>
+                )}.
+                Open Findings, select issues, get AI SQL fixes, then verify.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 flex-shrink-0">
+              <button onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}&status=detected`)}
+                className="flex items-center gap-1.5 px-4 py-2 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700 transition-colors">
+                <Wrench className="w-4 h-4" />
+                {liveRemaining > 0 ? `Fix ${liveRemaining} Remaining` : 'View Findings'}
+              </button>
+              <button onClick={() => verifyMutation.mutate(activeRunId!)}
+                disabled={verifyMutation.isPending}
+                className="flex items-center gap-1.5 px-4 py-2 border border-primary-300 text-primary-700 rounded-lg text-sm font-medium hover:bg-primary-100 disabled:opacity-50 transition-colors">
+                {verifyMutation.isPending
+                  ? <><Loader2 className="w-4 h-4 animate-spin" />Verifying...</>
+                  : <><RefreshCw className="w-4 h-4" />Verify Fixes</>
+                }
+              </button>
+              <button
+                onClick={() => setSaveWfOpen(true)}
+                className="flex items-center gap-1.5 px-4 py-2 border border-gray-300 text-gray-700 dark:text-gray-200 dark:border-gray-600 rounded-lg text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+              >
+                <BookmarkPlus className="w-4 h-4" />
+                Save as Workflow
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Findings Report — rules that fired vs rules that ran clean (mirrors
           the active/skipped split, but after findings ran) */}
       {findingsOutput && getTask('findings_agent')?.status === 'completed' &&
@@ -1303,60 +1362,6 @@ export default function AgentWorkflow() {
                   <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">Every executed rule found at least one issue.</p>
                 )}
               </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Awaiting fixes banner */}
-      {isAwaiting && activeRun?.scan_id && !verifyDone && (
-        <div className="bg-primary-50 border-2 border-primary-300 rounded-xl p-5">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <h3 className="font-semibold text-primary-900 text-base mb-1">
-                🔧 Pipeline complete — fix the findings
-              </h3>
-              <p className="text-sm text-primary-800">
-                {liveResolved !== null ? (
-                  <>
-                    <strong className="text-green-700">{liveResolved} resolved</strong>
-                    {' · '}
-                    <strong>{liveRemaining} remaining</strong>
-                    {' of '}
-                    {liveTotal} total
-                  </>
-                ) : (
-                  <>
-                    <strong>{activeRun.findings_count}</strong> findings detected
-                    {activeRun.ai_rules_count > 0 && (
-                      <> · <strong>{activeRun.ai_rules_count}</strong> AI rules</>
-                    )}
-                  </>
-                )}.
-                Open Findings, select issues, get AI SQL fixes, then verify.
-              </p>
-            </div>
-            <div className="flex flex-col gap-2 flex-shrink-0">
-              <button onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}&status=detected`)}
-                className="flex items-center gap-1.5 px-4 py-2 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700 transition-colors">
-                <Wrench className="w-4 h-4" />
-                {liveRemaining > 0 ? `Fix ${liveRemaining} Remaining` : 'View Findings'}
-              </button>
-              <button onClick={() => verifyMutation.mutate(activeRunId!)}
-                disabled={verifyMutation.isPending}
-                className="flex items-center gap-1.5 px-4 py-2 border border-primary-300 text-primary-700 rounded-lg text-sm font-medium hover:bg-primary-100 disabled:opacity-50 transition-colors">
-                {verifyMutation.isPending
-                  ? <><Loader2 className="w-4 h-4 animate-spin" />Verifying...</>
-                  : <><RefreshCw className="w-4 h-4" />Verify Fixes</>
-                }
-              </button>
-              <button
-                onClick={() => setSaveWfOpen(true)}
-                className="flex items-center gap-1.5 px-4 py-2 border border-gray-300 text-gray-700 dark:text-gray-200 dark:border-gray-600 rounded-lg text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
-              >
-                <BookmarkPlus className="w-4 h-4" />
-                Save as Workflow
-              </button>
             </div>
           </div>
         </div>
@@ -1436,59 +1441,6 @@ export default function AgentWorkflow() {
         </div>
       )}
 
-      {/* Recent runs — always visible so user can switch between runs */}
-      {recentRuns && recentRuns.runs.length > 0 && (
-        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
-          <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-4">Recent Runs</h2>
-          <div className="space-y-2">
-            {recentRuns.runs.slice(0, 8).map(run => {
-              const isSelected = run.id === activeRunId
-              return (
-                <button key={run.id}
-                  onClick={() => {
-                    if (isSelected) {
-                      setCollapsed(c => !c)  // toggle collapse if clicking active run
-                    } else {
-                      setActiveRunId(run.id)
-                      setActiveBatchId(run.batch_id ?? null)  // restore batch strip if part of one
-                      setCollapsed(false)    // expand when switching to a different run
-                    }
-                  }}
-                  className={`w-full flex items-center justify-between p-3 rounded-lg border text-left transition-colors ${
-                    isSelected
-                      ? 'border-primary-300 bg-primary-50'
-                      : 'border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/40'
-                  }`}>
-                  <div className="flex items-center gap-2 min-w-0">
-                    {isSelected && (
-                      collapsed
-                        ? <ChevronRight className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
-                        : <ChevronDown  className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
-                    )}
-                    <div className="min-w-0">
-                      <p className={`text-sm font-medium truncate ${isSelected ? 'text-primary-900' : 'text-gray-900 dark:text-gray-100'}`}>
-                        {run.database}.{run.schema_name}.{run.table}
-                      </p>
-                      <p className="text-xs text-gray-400 dark:text-gray-400 mt-0.5">{new Date(run.created_at).toLocaleString()}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-3 flex-shrink-0">
-                    <span className="text-xs text-gray-500 dark:text-gray-300">{run.findings_count} findings</span>
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                      run.status === 'completed'           ? 'bg-green-100 text-green-700' :
-                      run.status === 'failed'              ? 'bg-red-100 text-red-700' :
-                      run.status === 'running'             ? 'bg-blue-100 text-blue-700' :
-                      run.status === 'awaiting_rule_review'? 'bg-purple-100 text-purple-700' :
-                      run.status === 'awaiting_fixes'      ? 'bg-primary-100 text-primary-700' :
-                      'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300'
-                    }`}>{run.status.replace(/_/g, ' ')}</span>
-                  </div>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      )}
     </div>
   )
 }
