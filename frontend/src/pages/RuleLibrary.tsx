@@ -22,7 +22,7 @@ const CATEGORY_COLORS: Record<string, string> = {
   naming: 'bg-purple-100 text-purple-800 border-purple-200',
   documentation: 'bg-yellow-100 text-yellow-800 border-yellow-200',
   ownership: 'bg-green-100 text-green-800 border-green-200',
-  performance: 'bg-gray-100 text-gray-800 border-gray-200',
+  performance: 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 border-gray-200 dark:border-gray-700',
 }
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -30,14 +30,14 @@ const SEVERITY_COLORS: Record<string, string> = {
   high: 'bg-orange-100 text-orange-800',
   medium: 'bg-yellow-100 text-yellow-800',
   low: 'bg-blue-100 text-blue-800',
-  info: 'bg-gray-100 text-gray-800',
+  info: 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200',
 }
 
 const STATUS_STYLES: Record<string, { pill: string; label: string }> = {
   active: { pill: 'bg-green-100 text-green-700', label: 'Active' },
   proposed: { pill: 'bg-yellow-100 text-yellow-700', label: 'Proposed' },
   pending: { pill: 'bg-yellow-100 text-yellow-700', label: 'Pending' },
-  disabled: { pill: 'bg-gray-100 text-gray-500', label: 'Disabled' },
+  disabled: { pill: 'bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-300', label: 'Disabled' },
   rejected: { pill: 'bg-red-100 text-red-700', label: 'Rejected' },
 }
 
@@ -77,7 +77,7 @@ function formatTarget(scope: string, targetConfig: Record<string, any>): string 
 
 function CheckKindBadge({ checkKind }: { checkKind: string }) {
   return (
-    <span className="text-xs bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded font-medium flex items-center gap-1">
+    <span className="text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 px-1.5 py-0.5 rounded font-medium flex items-center gap-1">
       {checkKind === 'sql_template' ? <Code2 className="w-3 h-3" /> : <ShieldCheck className="w-3 h-3" />}
       {checkKind === 'sql_template' ? 'SQL' : 'Handler'}
     </span>
@@ -94,10 +94,10 @@ function executionDot(status: string) {
 
 function StatCard({ title, value, icon: Icon, color }: { title: string; value: number; icon: any; color: string }) {
   return (
-    <div className="bg-white rounded-lg shadow p-6 flex items-center justify-between">
+    <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6 flex items-center justify-between">
       <div>
-        <p className="text-sm font-medium text-gray-500">{title}</p>
-        <p className="mt-1 text-3xl font-bold text-gray-900">{value}</p>
+        <p className="text-sm font-medium text-gray-500 dark:text-gray-400">{title}</p>
+        <p className="mt-1 text-3xl font-bold text-gray-900 dark:text-gray-100">{value}</p>
       </div>
       <div className={`p-3 rounded-full ${color}`}>
         <Icon className="w-6 h-6 text-white" />
@@ -124,23 +124,23 @@ function InstanceRow({ instance }: { instance: RuleInstance }) {
     <div className="px-6 py-4">
       <div className="flex items-start gap-4">
         <div className="flex-shrink-0 mt-0.5 cursor-pointer" onClick={() => setExpanded(e => !e)}>
-          {expanded ? <ChevronDown className="w-4 h-4 text-gray-400" /> : <ChevronRight className="w-4 h-4 text-gray-400" />}
+          {expanded ? <ChevronDown className="w-4 h-4 text-gray-400 dark:text-gray-500" /> : <ChevronRight className="w-4 h-4 text-gray-400 dark:text-gray-500" />}
         </div>
         <div className="flex-1 min-w-0 cursor-pointer" onClick={() => setExpanded(e => !e)}>
           <div className="flex flex-wrap items-center gap-2 mb-1">
             <span className={`text-xs font-semibold px-2 py-0.5 rounded border ${SEVERITY_COLORS[instance.severity] ?? ''}`}>
               {instance.severity.toUpperCase()}
             </span>
-            <span className="text-sm font-semibold text-gray-900 font-mono">
+            <span className="text-sm font-semibold text-gray-900 dark:text-gray-100 font-mono">
               {instance.database_name}.{instance.schema_name}.{instance.table_name}
             </span>
-            <span className="text-xs text-gray-500">{formatTarget(instance.scope, instance.target_config)}</span>
+            <span className="text-xs text-gray-500 dark:text-gray-400">{formatTarget(instance.scope, instance.target_config)}</span>
           </div>
           {instance.rationale && (
-            <p className="text-sm text-gray-600">{instance.rationale}</p>
+            <p className="text-sm text-gray-600 dark:text-gray-300">{instance.rationale}</p>
           )}
           {instance.rejection_reason && (
-            <p className="text-xs text-red-600 bg-red-50 px-2 py-1 rounded mt-1 inline-block">
+            <p className="text-xs text-red-600 dark:text-red-300 bg-red-50 dark:bg-red-950/40 px-2 py-1 rounded mt-1 inline-block">
               ✗ Rejected: {instance.rejection_reason}
             </p>
           )}
@@ -163,32 +163,32 @@ function InstanceRow({ instance }: { instance: RuleInstance }) {
         <div className="mt-3 ml-8 space-y-3">
           {instance.rule_sql ? (
             <div>
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1 flex items-center gap-1">
+              <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1 flex items-center gap-1">
                 <Code2 className="w-3.5 h-3.5" /> SQL
               </p>
-              <pre className="text-xs bg-gray-900 text-green-400 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap">
+              <pre className="text-xs bg-gray-900 dark:bg-black text-green-400 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap border border-transparent dark:border-gray-700">
                 {instance.rule_sql}
               </pre>
             </div>
           ) : (
-            <p className="text-xs text-gray-400">No SQL rendered for this instance (python_handler check).</p>
+            <p className="text-xs text-gray-400 dark:text-gray-500">No SQL rendered for this instance (python_handler check).</p>
           )}
 
           <div>
-            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1 flex items-center gap-1">
+            <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1 flex items-center gap-1">
               <Clock className="w-3.5 h-3.5" /> Recent runs
             </p>
             {executionsData && executionsData.executions.length > 0 ? (
               <div className="flex items-center gap-2 flex-wrap">
                 {executionsData.executions.map(e => (
-                  <span key={e.id} className="flex items-center gap-1 text-xs text-gray-500" title={e.executed_at}>
+                  <span key={e.id} className="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400" title={e.executed_at}>
                     {executionDot(e.status)}
                     {new Date(e.executed_at).toLocaleDateString()}
                   </span>
                 ))}
               </div>
             ) : (
-              <p className="text-xs text-gray-400">No execution history yet.</p>
+              <p className="text-xs text-gray-400 dark:text-gray-500">No execution history yet.</p>
             )}
           </div>
         </div>
@@ -222,7 +222,7 @@ function DefinitionToggle({ definition }: { definition: RuleDefinition }) {
     >
       {definition.status === 'active'
         ? <ToggleRight className="w-6 h-6 text-green-500 hover:text-green-600" />
-        : <ToggleLeft className="w-6 h-6 text-gray-300 hover:text-gray-400" />}
+        : <ToggleLeft className="w-6 h-6 text-gray-300 dark:text-gray-600 hover:text-gray-400 dark:hover:text-gray-500" />}
     </button>
   )
 }
@@ -273,10 +273,10 @@ function TargetGroupChip({ group }: { group: TableTargetGroup }) {
   if (group.tableLevelCount > 0) parts.push(`${group.tableLevelCount} table-level`)
 
   return (
-    <span className="inline-flex items-center gap-1 text-xs font-medium bg-gray-100 text-gray-700 px-2.5 py-1 rounded-full border border-gray-200">
-      <Database className="w-3 h-3 text-gray-400" />
+    <span className="inline-flex items-center gap-1 text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 px-2.5 py-1 rounded-full border border-gray-200 dark:border-gray-600">
+      <Database className="w-3 h-3 text-gray-400 dark:text-gray-400" />
       <span className="font-mono">{group.label}</span>
-      <span className="text-gray-400">({parts.join(', ') || '0'})</span>
+      <span className="text-gray-400 dark:text-gray-400">({parts.join(', ') || '0'})</span>
     </span>
   )
 }
@@ -293,12 +293,12 @@ function InstancesView({ definition, onBack }: { definition: RuleDefinition; onB
 
   return (
     <div className="space-y-6">
-      <button onClick={onBack} className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-800">
+      <button onClick={onBack} className="flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">
         <ArrowLeft className="w-4 h-4" /> Back to Rule Library
       </button>
 
-      <div className={`bg-white rounded-xl shadow overflow-hidden`}>
-        <div className={`px-6 py-4 flex items-center gap-2 border-b ${CATEGORY_COLORS[definition.category] ?? 'bg-gray-50 text-gray-700 border-gray-200'}`}>
+      <div className={`bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden`}>
+        <div className={`px-6 py-4 flex items-center gap-2 border-b ${CATEGORY_COLORS[definition.category] ?? 'bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700'}`}>
           <DefinitionToggle definition={definition} />
           {CATEGORY_ICONS[definition.category] ?? <ShieldCheck className="w-4 h-4" />}
           <span className="text-base font-semibold">{definition.name}</span>
@@ -316,13 +316,13 @@ function InstancesView({ definition, onBack }: { definition: RuleDefinition; onB
           </span>
         </div>
         <div className="px-6 py-4">
-          <p className="text-sm text-gray-600">{definition.description}</p>
+          <p className="text-sm text-gray-600 dark:text-gray-300">{definition.description}</p>
           {definition.template_shape && (
-            <p className="text-xs text-gray-400 mt-2 font-mono">shape: {definition.template_shape}</p>
+            <p className="text-xs text-gray-400 dark:text-gray-500 mt-2 font-mono">shape: {definition.template_shape}</p>
           )}
           {targetGroups.length > 0 && (
-            <div className="mt-3 pt-3 border-t border-gray-100">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Applied to</p>
+            <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-700">
+              <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">Applied to</p>
               <div className="flex flex-wrap gap-2">
                 {targetGroups.map(g => <TargetGroupChip key={g.key} group={g} />)}
               </div>
@@ -331,13 +331,13 @@ function InstancesView({ definition, onBack }: { definition: RuleDefinition; onB
         </div>
       </div>
 
-      <div className="bg-white rounded-xl shadow overflow-hidden">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
         {isLoading ? (
-          <div className="p-12 text-center text-gray-400">Loading instances…</div>
+          <div className="p-12 text-center text-gray-400 dark:text-gray-500">Loading instances…</div>
         ) : !data || data.instances.length === 0 ? (
-          <div className="p-12 text-center text-gray-400">No instances of this definition yet.</div>
+          <div className="p-12 text-center text-gray-400 dark:text-gray-500">No instances of this definition yet.</div>
         ) : (
-          <div className="divide-y divide-gray-100">
+          <div className="divide-y divide-gray-100 dark:divide-gray-700">
             {data.instances.map(instance => (
               <InstanceRow key={instance.id} instance={instance} />
             ))}
@@ -461,8 +461,8 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
       {/* Title + Add Rule */}
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">Rule Library</h1>
-          <p className="mt-1 text-gray-500">
+          <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Rule Library</h1>
+          <p className="mt-1 text-gray-500 dark:text-gray-300">
             Check definitions (concepts) and the specific table/column instances applying them.
           </p>
         </div>
@@ -481,18 +481,18 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
       </div>
 
       {/* Search + Filters */}
-      <div className="bg-white rounded-xl shadow p-4 space-y-3">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3">
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 dark:text-gray-400 pointer-events-none" />
           <input
             type="text"
             placeholder="Search by name, description, or template shape…"
             value={search}
             onChange={e => setSearch(e.target.value)}
-            className="w-full pl-9 pr-9 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500"
+            className="w-full pl-9 pr-9 py-2.5 border border-gray-200 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500"
           />
           {search && (
-            <button onClick={() => setSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+            <button onClick={() => setSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-400 hover:text-gray-600">
               <X className="w-4 h-4" />
             </button>
           )}
@@ -500,13 +500,13 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
 
         <div className="flex flex-wrap gap-3">
           <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
-            className="px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:border-primary-500">
+            className="px-3 py-2 border border-gray-200 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:border-primary-500">
             <option value="">All Categories</option>
             {CATEGORIES.map(c => <option key={c} value={c}>{cap(c)}</option>)}
           </select>
 
           <select value={checkKindFilter} onChange={e => setCheckKindFilter(e.target.value)}
-            className="px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:border-primary-500">
+            className="px-3 py-2 border border-gray-200 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:border-primary-500">
             <option value="">All Check Kinds</option>
             <option value="sql_template">SQL</option>
             <option value="python_handler">Handler</option>
@@ -515,7 +515,7 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
           {anyFilter && (
             <button
               onClick={() => { setSearch(''); setCategoryFilter(''); setCheckKindFilter('') }}
-              className="flex items-center gap-1 px-3 py-2 text-sm text-gray-500 hover:text-gray-700 border border-dashed border-gray-300 rounded-lg"
+              className="flex items-center gap-1 px-3 py-2 text-sm text-gray-500 dark:text-gray-300 hover:text-gray-700 border border-dashed border-gray-300 dark:border-gray-600 rounded-lg"
             >
               <X className="w-3.5 h-3.5" /> Clear
             </button>
@@ -525,17 +525,17 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
 
       {/* Definitions grouped by category */}
       {isLoading ? (
-        <div className="bg-white rounded-xl shadow p-12 text-center text-gray-400">Loading definitions…</div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-12 text-center text-gray-400 dark:text-gray-500">Loading definitions…</div>
       ) : Object.keys(grouped).length === 0 ? (
-        <div className="bg-white rounded-xl shadow p-12 text-center text-gray-400">No definitions match the current filters.</div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-12 text-center text-gray-400 dark:text-gray-500">No definitions match the current filters.</div>
       ) : (
         Object.entries(grouped).map(([category, definitions]) => {
           const isCollapsed = collapsed[category] ?? false
           return (
-          <div key={category} className="bg-white rounded-xl shadow overflow-hidden">
+          <div key={category} className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
             <div
               onClick={() => setCollapsed(c => ({ ...c, [category]: !isCollapsed }))}
-              className={`px-6 py-3 flex items-center gap-2 border-b cursor-pointer select-none ${CATEGORY_COLORS[category] ?? 'bg-gray-50 text-gray-700 border-gray-200'}`}
+              className={`px-6 py-3 flex items-center gap-2 border-b cursor-pointer select-none ${CATEGORY_COLORS[category] ?? 'bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700'}`}
             >
               {isCollapsed ? <ChevronRight className="w-4 h-4 flex-shrink-0" /> : <ChevronDown className="w-4 h-4 flex-shrink-0" />}
               {CATEGORY_ICONS[category] ?? <ShieldCheck className="w-4 h-4" />}
@@ -544,7 +544,7 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
             </div>
 
             {!isCollapsed && (
-            <div className="divide-y divide-gray-100">
+            <div className="divide-y divide-gray-100 dark:divide-gray-700">
               {definitions
                 .slice()
                 .sort((a, b) => b.instance_count - a.instance_count)
@@ -552,12 +552,12 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                   <div
                     key={d.id}
                     onClick={() => onSelect(d)}
-                    className="px-6 py-4 flex items-start gap-4 hover:bg-gray-50 cursor-pointer transition-colors"
+                    className="px-6 py-4 flex items-start gap-4 hover:bg-gray-50 dark:hover:bg-gray-700/40 cursor-pointer transition-colors"
                   >
                     <div className="mt-0.5"><DefinitionToggle definition={d} /></div>
                     <div className="flex-1 min-w-0">
                       <div className="flex flex-wrap items-center gap-2 mb-1">
-                        <span className="text-sm font-semibold text-gray-900">{d.name}</span>
+                        <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{d.name}</span>
                         <CheckKindBadge checkKind={d.check_kind} />
                         {d.source === 'claude' && (
                           <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-medium flex items-center gap-1">
@@ -565,11 +565,11 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                           </span>
                         )}
                         {d.template_shape && (
-                          <span className="text-xs font-mono text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">{d.template_shape}</span>
+                          <span className="text-xs font-mono text-gray-400 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 rounded">{d.template_shape}</span>
                         )}
                       </div>
-                      <p className="text-sm text-gray-600 leading-relaxed">{d.description}</p>
-                      <div className="flex flex-wrap items-center gap-3 text-xs text-gray-400 mt-2">
+                      <p className="text-sm text-gray-600 dark:text-gray-300 leading-relaxed">{d.description}</p>
+                      <div className="flex flex-wrap items-center gap-3 text-xs text-gray-400 dark:text-gray-400 mt-2">
                         <span className="flex items-center gap-1"><Hash className="w-3 h-3" /> {d.instance_count} instance{d.instance_count !== 1 ? 's' : ''}</span>
                         <span className="flex items-center gap-1"><GitBranch className="w-3 h-3" /> {d.approval_count} approved</span>
                       </div>
@@ -578,7 +578,7 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                       <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${(STATUS_STYLES[d.status] ?? STATUS_STYLES.active).pill}`}>
                         {(STATUS_STYLES[d.status] ?? STATUS_STYLES.active).label}
                       </span>
-                      <ChevronRight className="w-4 h-4 text-gray-300" />
+                      <ChevronRight className="w-4 h-4 text-gray-300 dark:text-gray-600" />
                     </div>
                   </div>
                 ))}
@@ -592,22 +592,22 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
       {/* ── Add Rule Modal (AI-powered, ported from the old Rules.tsx) ────────── */}
       {showModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden">
 
             {/* Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 bg-gradient-to-r from-primary-50 to-purple-50">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-gradient-to-r from-primary-50 to-purple-50 dark:from-gray-800 dark:to-gray-800">
               <div>
-                <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100 flex items-center gap-2">
                   <Sparkles className="w-5 h-5 text-purple-500" />
                   {aiStep === 'prompt' ? 'Add Rule with AI' : 'Review AI-Generated Rule'}
                 </h2>
-                <p className="text-xs text-gray-500 mt-0.5">
+                <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">
                   {aiStep === 'prompt'
                     ? 'Describe what you want in plain English — Claude will create the rule structure'
                     : 'Edit any field, then submit for approval'}
                 </p>
               </div>
-              <button onClick={resetModal} className="text-gray-400 hover:text-gray-600 p-1 rounded">
+              <button onClick={resetModal} className="text-gray-400 dark:text-gray-400 hover:text-gray-600 p-1 rounded">
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -618,7 +618,7 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
               {aiStep === 'prompt' && (
                 <>
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
                       Describe the rule you want
                     </label>
                     <textarea
@@ -631,28 +631,28 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                         "• Status column should only have values: PENDING, ACTIVE, CLOSED\n" +
                         "• Every fact table should have a created_date column"
                       }
-                      className="w-full px-3 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none"
+                      className="w-full px-3 py-2.5 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none"
                     />
-                    <p className="text-xs text-gray-400 mt-1">
+                    <p className="text-xs text-gray-400 dark:text-gray-400 mt-1">
                       Be as specific as you like — column names, allowed values, business context all help.
                     </p>
                   </div>
 
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Your name / team <span className="text-gray-400 text-xs font-normal">(owner of this rule)</span>
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-1">
+                      Your name / team <span className="text-gray-400 dark:text-gray-400 text-xs font-normal">(owner of this rule)</span>
                     </label>
                     <input
                       type="text"
                       value={aiOwner}
                       onChange={e => setAiOwner(e.target.value)}
                       placeholder="e.g. data-governance-team or your name"
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
                     />
                   </div>
 
                   {generateMutation.isError && (
-                    <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">
+                    <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-800 dark:text-red-300">
                       {(generateMutation.error as any)?.response?.data?.detail || 'AI generation failed. Try again.'}
                     </div>
                   )}
@@ -664,15 +664,15 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                 <>
                   {/* Duplicate warning — shown when AI or similarity check finds a match */}
                   {generated.duplicate_of && (
-                    <div className="bg-amber-50 border border-amber-300 rounded-lg px-4 py-3 flex items-start gap-2">
+                    <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-lg px-4 py-3 flex items-start gap-2">
                       <span className="text-amber-500 text-base flex-shrink-0">⚠️</span>
                       <div>
-                        <p className="text-sm font-semibold text-amber-900">Similar rule already exists</p>
-                        <p className="text-xs text-amber-800 mt-0.5">
+                        <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">Similar rule already exists</p>
+                        <p className="text-xs text-amber-800 dark:text-amber-300 mt-0.5">
                           <span className="font-mono font-bold">{generated.duplicate_of.code}</span>
                           {' — '}{generated.duplicate_of.name}
                         </p>
-                        <p className="text-xs text-amber-700 mt-1">
+                        <p className="text-xs text-amber-700 dark:text-amber-400 mt-1">
                           Review the existing rule before submitting. If your requirement is genuinely different, edit the fields below and proceed.
                         </p>
                       </div>
@@ -680,65 +680,65 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                   )}
 
                   {/* AI rationale banner */}
-                  <div className="bg-purple-50 border border-purple-100 rounded-lg px-4 py-3">
-                    <p className="text-xs text-purple-800">
+                  <div className="bg-purple-50 dark:bg-purple-950/40 border border-purple-100 dark:border-purple-800 rounded-lg px-4 py-3">
+                    <p className="text-xs text-purple-800 dark:text-purple-300">
                       <span className="font-semibold">AI Rationale: </span>{generated.rationale}
                     </p>
                   </div>
 
                   {formError && (
-                    <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">{formError}</div>
+                    <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-800 dark:text-red-300">{formError}</div>
                   )}
 
                   {/* Code */}
                   <div>
-                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                    <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
                       Rule Code
                     </label>
                     <input type="text"
                       value={form.code}
                       onChange={e => setForm(f => ({ ...f, code: e.target.value.toUpperCase().replace(/\s+/g, '_') }))}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
+                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
                     />
                   </div>
 
                   {/* Name */}
                   <div>
-                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                    <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
                       Name
                     </label>
                     <input type="text"
                       value={form.name}
                       onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
                     />
                   </div>
 
                   {/* Description */}
                   <div>
-                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                    <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
                       Description
                     </label>
                     <textarea rows={3}
                       value={form.description}
                       onChange={e => setForm(f => ({ ...f, description: e.target.value }))}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary-500"
+                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary-500"
                     />
                   </div>
 
                   {/* Category + Severity */}
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Category</label>
+                      <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">Category</label>
                       <select value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))}
-                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500">
+                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500">
                         {CATEGORIES.map(c => <option key={c} value={c}>{cap(c)}</option>)}
                       </select>
                     </div>
                     <div>
-                      <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Severity</label>
+                      <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">Severity</label>
                       <select value={form.severity} onChange={e => setForm(f => ({ ...f, severity: e.target.value }))}
-                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500">
+                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500">
                         {Object.keys(SEVERITY_COLORS).map(s => <option key={s} value={s}>{cap(s)}</option>)}
                       </select>
                     </div>
@@ -746,14 +746,14 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
 
                   {/* Applies to */}
                   <div>
-                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Applies To</label>
+                    <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">Applies To</label>
                     <div className="flex gap-2">
                       {ASSET_TYPES.map(t => (
                         <button key={t} type="button" onClick={() => toggleAppliesTo(t)}
                           className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
                             form.applies_to.includes(t)
                               ? 'bg-primary-600 text-white border-primary-600'
-                              : 'bg-white text-gray-600 border-gray-300 hover:border-primary-400'
+                              : 'bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600 hover:border-primary-400'
                           }`}>{t}</button>
                       ))}
                     </div>
@@ -762,23 +762,23 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                   {/* Owner + Jira */}
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                      <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
                         Owner <span className="text-red-500">*</span>
                       </label>
                       <input type="text" placeholder="team or person"
                         value={form.owner ?? ''}
                         onChange={e => setForm(f => ({ ...f, owner: e.target.value }))}
-                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
                       />
                     </div>
                     <div>
-                      <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+                      <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
                         Jira Ticket
                       </label>
                       <input type="text" placeholder="e.g. DQ-123"
                         value={form.jira_ticket ?? ''}
                         onChange={e => setForm(f => ({ ...f, jira_ticket: e.target.value }))}
-                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
+                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
                       />
                     </div>
                   </div>
@@ -787,16 +787,16 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
             </div>
 
             {/* Footer */}
-            <div className="flex items-center justify-between px-6 py-4 border-t border-gray-200 bg-gray-50">
+            <div className="flex items-center justify-between px-6 py-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
               {aiStep === 'prompt' ? (
                 <>
-                  <p className="text-xs text-gray-400 flex items-center gap-1">
+                  <p className="text-xs text-gray-400 dark:text-gray-400 flex items-center gap-1">
                     <Sparkles className="w-3.5 h-3.5 text-purple-400" /> Powered by Claude
                   </p>
                   <div className="flex gap-3">
                     <button
                       onClick={() => { setShowModal(false); setAiPrompt(''); setAiOwner(''); setAiStep('prompt') }}
-                      className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
+                      className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/40"
                     >
                       Cancel
                     </button>
@@ -816,14 +816,14 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                 <>
                   <button
                     onClick={() => { setAiStep('prompt'); setGenerated(null); setFormError('') }}
-                    className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-800"
+                    className="flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100"
                   >
                     <RefreshCw className="w-3.5 h-3.5" /> Regenerate
                   </button>
                   <div className="flex gap-3">
                     <button
                       onClick={resetModal}
-                      className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
+                      className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/40"
                     >
                       Cancel
                     </button>
