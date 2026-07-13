@@ -66,6 +66,10 @@ class WorkflowCoordinator:
         if not run:
             raise ValueError(f"AgentRun {self.run_id} not found")
 
+        if run.workflow_template_id:
+            self._execute_with_template(run)
+            return
+
         storage.update_agent_run(self.run_id, status="running", started_at=datetime.utcnow())
 
         all_downstream = [
@@ -468,6 +472,22 @@ class WorkflowCoordinator:
 
         storage.update_agent_run(self.run_id, ai_rules_count=new_instances_approved)
 
+        # Back-fill outcome counts on the intelligence log so the vector store
+        # reflects whether Claude's proposals were accepted or rejected.
+        try:
+            new_instances_rejected = sum(
+                1 for e in skipped_entries if e.get("is_new_instance")
+            )
+            log = storage.get_intelligence_log_for_run(self.run_id)
+            if log:
+                storage.update_intelligence_log_outcomes(
+                    log.id,
+                    approved_count=new_instances_approved,
+                    rejected_count=new_instances_rejected,
+                )
+        except Exception as e:
+            logger.warning(f"[Coordinator] Could not update intelligence log outcomes: {e}")
+
         # ── Re-fetch assets ───────────────────────────────────────────────────
         scan = storage.get_scan(run.scan_id)
         if not scan:
@@ -563,6 +583,199 @@ class WorkflowCoordinator:
         schedule_verify(run.id)
         # Note: batch already advanced when this run reached rule review — do not
         # advance again here, or a table could be skipped.
+
+    # ── Template-based execution (saved workflow) ─────────────────────────────
+
+    def _execute_with_template(self, run: Any) -> None:
+        """
+        Run a scan using a saved workflow template — no rule intelligence, no
+        review pause. Each rule pattern is re-instantiated for the target table,
+        skipping patterns whose target column doesn't exist on this table or
+        whose scope is cross_table (those are specific to original relationships).
+        Findings run immediately after instantiation.
+        """
+        storage.update_agent_run(self.run_id, status="running", started_at=datetime.utcnow())
+
+        all_tasks = [
+            "metadata_agent", "rules_fetch_agent", "relationship_discovery_agent",
+            "profiler_agent", "rule_intelligence_agent", "findings_agent", "verification_agent",
+        ]
+
+        template = storage.get_workflow(run.workflow_template_id)
+        if not template:
+            self._skip_tasks(all_tasks)
+            self._mark_run_failed(f"Workflow template {run.workflow_template_id} not found")
+            return
+
+        coord_task = self._get_task("coordinator")
+        self._start_task(coord_task)
+        try:
+            from app.services.datasources import get_source
+            source = get_source(run.connection_id)
+            tables = source.list_tables(run.database, run.schema_name)
+            exists = any((t.get("name") or "").upper() == run.table.upper() for t in tables)
+            if not exists:
+                raise ValueError(f"Table {run.database}.{run.schema_name}.{run.table} not found")
+            self._complete_task(coord_task, output={"target": f"{run.database}.{run.schema_name}.{run.table}"})
+        except Exception as e:
+            self._fail_task(coord_task, str(e))
+            self._skip_tasks(all_tasks)
+            self._mark_run_failed(str(e))
+            return
+
+        # Metadata — need column list to filter patterns
+        meta_task = self._get_task("metadata_agent")
+        self._start_task(meta_task)
+        try:
+            from app.services.agents.metadata_agent import MetadataAgent
+            scan, table_asset, column_assets = MetadataAgent().run(
+                run.database, run.schema_name, run.table, run.connection_id
+            )
+            storage.update_agent_run(self.run_id, scan_id=scan.id)
+            self._complete_task(meta_task, output={
+                "scan_id": scan.id, "columns_found": len(column_assets),
+            })
+        except Exception as e:
+            self._fail_task(meta_task, str(e))
+            self._skip_tasks(["rules_fetch_agent", "relationship_discovery_agent",
+                               "profiler_agent", "rule_intelligence_agent",
+                               "findings_agent", "verification_agent"])
+            self._mark_run_failed(str(e))
+            return
+
+        # Skip unused pipeline stages gracefully
+        for skipped in ["rules_fetch_agent", "relationship_discovery_agent",
+                        "profiler_agent", "rule_intelligence_agent"]:
+            t = self._get_task(skipped)
+            if t:
+                self._skip_task(t)
+
+        existing_column_names = {c.column_name.upper() for c in column_assets}
+
+        # Re-instantiate each pattern for this target table
+        from app.services.rule_sql_templates import render_template
+        from app.services.sql_validation import validate_sql
+        from app.services.fingerprint import compute_fingerprint
+
+        approved_instance_ids = set()
+        skipped_patterns = []
+
+        for pattern in template.rule_patterns:
+            scope = pattern.get("scope", "table")
+
+            # Skip cross-table patterns — referential integrity rules are
+            # specific to the original table's relationships
+            if scope == "cross_table":
+                skipped_patterns.append({**pattern, "skip_reason": "cross_table scope not portable"})
+                continue
+
+            # Skip column-scoped patterns if the column doesn't exist here
+            target_config = pattern.get("target_config") or {}
+            column = target_config.get("column", "")
+            if scope == "column" and column and column.upper() not in existing_column_names:
+                skipped_patterns.append({**pattern, "skip_reason": f"column {column} not found"})
+                continue
+
+            definition_id = pattern.get("definition_id")
+            definition = storage.get_definition(definition_id) if definition_id else None
+            if not definition:
+                skipped_patterns.append({**pattern, "skip_reason": "definition not found"})
+                continue
+
+            threshold_config = pattern.get("threshold_config") or {}
+            template_shape = pattern.get("template_shape") or definition.template_shape
+
+            try:
+                rule_sql = render_template(
+                    template_shape,
+                    table_asset.database_name, table_asset.schema_name, table_asset.table_name,
+                    target_config, threshold_config,
+                )
+                result = validate_sql(rule_sql, allowed_tables=[
+                    f"{table_asset.database_name}.{table_asset.schema_name}.{table_asset.table_name}".upper()
+                ])
+                if not result.is_valid:
+                    skipped_patterns.append({**pattern, "skip_reason": f"SQL invalid: {result.errors}"})
+                    continue
+            except Exception as e:
+                skipped_patterns.append({**pattern, "skip_reason": str(e)})
+                continue
+
+            fingerprint = compute_fingerprint(
+                definition_id=definition_id,
+                scope=scope,
+                database_name=table_asset.database_name,
+                schema_name=table_asset.schema_name,
+                table_name=table_asset.table_name,
+                target_config=target_config,
+                threshold_config=threshold_config,
+            )
+
+            # Reuse existing active instance if fingerprint already exists
+            existing = storage.get_instance_by_fingerprint(fingerprint)
+            if existing and existing.status == "active":
+                approved_instance_ids.add(existing.id)
+                continue
+
+            instance = storage.create_instance(
+                definition_id=definition_id,
+                scope=scope,
+                database_name=table_asset.database_name,
+                schema_name=table_asset.schema_name,
+                table_name=table_asset.table_name,
+                fingerprint=fingerprint,
+                severity=pattern.get("severity", definition.default_severity or "medium"),
+                target_config=target_config,
+                threshold_config=threshold_config,
+                rule_sql=rule_sql,
+                rationale=f"Applied from workflow template: {template.label}",
+                status="active",
+                is_active=True,
+                owner="workflow_template",
+                created_by="workflow_template",
+                source_run_id=run.id,
+            )
+            storage.approve_instance(instance.id)
+            approved_instance_ids.add(instance.id)
+
+        logger.info(
+            f"[Coordinator] Template run — {len(approved_instance_ids)} patterns applied, "
+            f"{len(skipped_patterns)} skipped on {table_asset.fqn}"
+        )
+
+        # Findings
+        findings_task = self._get_task("findings_agent")
+        self._start_task(findings_task)
+        try:
+            from app.services.agents.findings_agent import FindingsAgent
+            findings = FindingsAgent().run(
+                scan, table_asset, column_assets,
+                allowed_instance_ids=approved_instance_ids,
+                severity_overrides={},
+                run_id=run.id,
+            )
+            storage.update_agent_run(self.run_id, findings_count=len(findings))
+            self._complete_task(findings_task, output={
+                "findings_count": len(findings),
+                "rules_applied": len(approved_instance_ids),
+                "patterns_skipped": len(skipped_patterns),
+                "skipped_reasons": skipped_patterns,
+            })
+        except Exception as e:
+            self._fail_task(findings_task, str(e))
+            t = self._get_task("verification_agent")
+            if t:
+                self._skip_task(t)
+            self._mark_run_failed(str(e), advance=False)
+            return
+
+        storage.update_agent_run(
+            self.run_id, status="awaiting_fixes", completed_at=datetime.utcnow()
+        )
+        self._advance_batch()
+
+        from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
+        schedule_verify(run.id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

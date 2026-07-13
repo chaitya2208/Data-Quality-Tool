@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Assets from './pages/Assets'
 import Findings from './pages/Findings'
@@ -10,6 +10,7 @@ import RuleLibrary from './pages/RuleLibrary'
 import DataExplorer from './pages/DataExplorer'
 import Connections from './pages/Connections'
 import SettingsPage from './pages/Settings'
+import SavedWorkflows from './pages/SavedWorkflows'
 import { useConnection } from './ConnectionContext'
 
 function App() {
@@ -23,8 +24,9 @@ function App() {
     { name: 'Assets',        href: '/assets',       icon: Database     },
     { name: 'Findings',      href: '/findings',     icon: AlertCircle  },
     { name: 'Rule Library',  href: '/rule-library', icon: Library      },
-    { name: 'Workflow',      href: '/workflow',     icon: GitBranch    },
-    { name: 'Settings',      href: '/settings',     icon: SettingsIcon },
+    { name: 'Workflow',      href: '/workflow',          icon: GitBranch    },
+    { name: 'Saved Workflows', href: '/saved-workflows', icon: BookOpen     },
+    { name: 'Settings',      href: '/settings',          icon: SettingsIcon },
   ]
 
   const SidebarContent = ({ onNavClick }: { onNavClick?: () => void }) => (
@@ -145,8 +147,9 @@ function App() {
             <Route path="/findings"     element={<Findings />}      />
             <Route path="/workflow"     element={<AgentWorkflow />} />
             <Route path="/ai-fix"       element={<AIFix />}         />
-            <Route path="/rule-library" element={<RuleLibrary />}   />
-            <Route path="/settings"     element={<SettingsPage />}  />
+            <Route path="/rule-library"     element={<RuleLibrary />}     />
+            <Route path="/saved-workflows"  element={<SavedWorkflows />}  />
+            <Route path="/settings"         element={<SettingsPage />}    />
           </Routes>
         </main>
       </div>

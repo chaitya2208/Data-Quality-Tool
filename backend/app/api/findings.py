@@ -4,8 +4,24 @@ from app.services import storage
 from app.schemas.finding import FindingResponse, FindingListResponse, FindingUpdate
 from datetime import datetime
 from collections import defaultdict
+import logging
+import time
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Simple TTL cache — avoids re-hitting Snowflake on every page visit
+_findings_cache: dict = {}   # key → (expires_at, payload)
+_CACHE_TTL = 30              # seconds
+
+
+def _cache_key(asset_id, scan_id, status, severity, skip, limit):
+    return f"{asset_id}|{scan_id}|{status}|{severity}|{skip}|{limit}"
+
+
+def _invalidate_findings_cache():
+    _findings_cache.clear()
 
 
 @router.get("", response_model=FindingListResponse)
@@ -18,11 +34,24 @@ def list_findings(
     limit: int = 5000,
 ):
     """List all findings with optional filters"""
-    total, findings = storage.list_findings(
+    key = _cache_key(asset_id, scan_id, status, severity, skip, limit)
+    cached = _findings_cache.get(key)
+    if cached and cached[0] > time.time():
+        return cached[1]
+
+    total, raw_findings = storage.list_findings(
         asset_id=asset_id, scan_id=scan_id, status=status, severity=severity,
         skip=skip, limit=limit,
     )
-    return FindingListResponse(total=total, findings=findings)
+    findings = []
+    for f in raw_findings:
+        try:
+            findings.append(FindingResponse.model_validate(f, from_attributes=True))
+        except Exception as e:
+            logger.warning(f"[findings] Skipping unserializable finding {getattr(f, 'id', '?')}: {e}")
+    result = FindingListResponse(total=total, findings=findings)
+    _findings_cache[key] = (time.time() + _CACHE_TTL, result)
+    return result
 
 
 @router.get("/{finding_id}", response_model=FindingResponse)
@@ -57,7 +86,9 @@ def update_finding(finding_id: str, update_data: FindingUpdate):
     if update_data.resolution_notes is not None:
         fields["resolution_notes"] = update_data.resolution_notes
 
-    return storage.update_finding(finding_id, **fields)
+    result = storage.update_finding(finding_id, **fields)
+    _invalidate_findings_cache()
+    return result
 
 
 @router.get("/stats/by-database")

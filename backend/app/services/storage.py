@@ -28,11 +28,14 @@ from __future__ import annotations
 import datetime
 import decimal
 import json
+import logging
 import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from app.services.snowflake_session import session as sf_session
+
+logger = logging.getLogger(__name__)
 
 
 def _new_id() -> str:
@@ -61,7 +64,10 @@ def _parse_json(value: Any) -> Any:
         return None
     if isinstance(value, (dict, list)):
         return value  # already parsed by the driver
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -432,7 +438,13 @@ def list_findings(
         """,
         {**params, "limit": limit, "skip": skip},
     )
-    return total, [_finding_from_row(r) for r in rows]
+    result = []
+    for r in rows:
+        try:
+            result.append(_finding_from_row(r))
+        except Exception as e:
+            logger.warning(f"[storage] Skipping malformed finding {r.get('ID')}: {e}")
+    return total, result
 
 
 def list_findings_by_scan(scan_id: str) -> list[SimpleNamespace]:
@@ -1270,6 +1282,7 @@ def _agent_run_from_row(row: dict, tasks: Optional[list] = None) -> SimpleNamesp
         instance_review_state=_parse_json(row.get("INSTANCE_REVIEW_STATE")),
         error_message=row["ERROR_MESSAGE"],
         created_at=row["CREATED_AT"],
+        workflow_template_id=row.get("WORKFLOW_TEMPLATE_ID"),
         tasks=tasks if tasks is not None else [],
     )
 
@@ -1297,16 +1310,17 @@ def create_agent_run(
     batch_index: int = 0,
     run_id: Optional[str] = None,
     connection_id: Optional[str] = None,
+    workflow_template_id: Optional[str] = None,
 ) -> SimpleNamespace:
     run_id = run_id or _new_id()
     sf_session.execute(
         """
         INSERT INTO AGENT_RUNS
             (ID, CONNECTION_ID, BATCH_ID, BATCH_INDEX, DATABASE_NAME, SCHEMA_NAME,
-             TABLE_NAME, STATUS)
+             TABLE_NAME, STATUS, WORKFLOW_TEMPLATE_ID)
         VALUES
             (%(id)s, %(connection_id)s, %(batch_id)s, %(batch_index)s, %(database)s,
-             %(schema_name)s, %(table)s, %(status)s)
+             %(schema_name)s, %(table)s, %(status)s, %(workflow_template_id)s)
         """,
         {
             "id": run_id,
@@ -1317,6 +1331,7 @@ def create_agent_run(
             "schema_name": schema_name,
             "table": table,
             "status": status,
+            "workflow_template_id": workflow_template_id,
         },
     )
     return get_agent_run(run_id)
@@ -1345,7 +1360,13 @@ def list_agent_runs(limit: int = 20) -> list[SimpleNamespace]:
     rows = sf_session.query(
         "SELECT * FROM AGENT_RUNS ORDER BY CREATED_AT DESC LIMIT %(limit)s", {"limit": limit}
     )
-    return [_agent_run_from_row(r, tasks=list_agent_tasks(r["ID"])) for r in rows]
+    result = []
+    for r in rows:
+        try:
+            result.append(_agent_run_from_row(r, tasks=list_agent_tasks(r["ID"])))
+        except Exception as e:
+            logger.warning(f"[storage] Skipping malformed run {r.get('ID')}: {e}")
+    return result
 
 
 def list_agent_runs_by_batch(batch_id: str) -> list[SimpleNamespace]:
@@ -1648,3 +1669,262 @@ def upsert_setting(key: str, value: Any) -> None:
         """,
         {"k": key, "v": _json_or_null(value)},
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WORKFLOW TEMPLATES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _workflow_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        label=row["LABEL"],
+        description=row.get("DESCRIPTION"),
+        rule_patterns=_parse_json(row.get("RULE_PATTERNS")) or [],
+        created_by=row.get("CREATED_BY"),
+        created_at=row["CREATED_AT"],
+        updated_at=row["UPDATED_AT"],
+    )
+
+
+def create_workflow(
+    label: str,
+    rule_patterns: list,
+    description: str = "",
+    created_by: str = "",
+) -> SimpleNamespace:
+    wf_id = _new_id()
+    sf_session.execute(
+        """
+        INSERT INTO WORKFLOW_TEMPLATES (ID, LABEL, DESCRIPTION, RULE_PATTERNS, CREATED_BY)
+        SELECT %(id)s, %(label)s, %(description)s, PARSE_JSON(%(patterns)s), %(created_by)s
+        """,
+        {
+            "id": wf_id,
+            "label": label,
+            "description": description,
+            "patterns": _json_or_null(rule_patterns),
+            "created_by": created_by,
+        },
+    )
+    return get_workflow(wf_id)
+
+
+def get_workflow(workflow_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM WORKFLOW_TEMPLATES WHERE ID = %(id)s", {"id": workflow_id}
+    )
+    return _workflow_from_row(rows[0]) if rows else None
+
+
+def list_workflows() -> list[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM WORKFLOW_TEMPLATES ORDER BY CREATED_AT DESC"
+    )
+    return [_workflow_from_row(r) for r in rows]
+
+
+def update_workflow(
+    workflow_id: str,
+    label: str = None,
+    description: str = None,
+    rule_patterns: list = None,
+) -> SimpleNamespace:
+    fields = []
+    params: dict = {"id": workflow_id}
+    if label is not None:
+        fields.append("LABEL = %(label)s")
+        params["label"] = label
+    if description is not None:
+        fields.append("DESCRIPTION = %(description)s")
+        params["description"] = description
+    if rule_patterns is not None:
+        fields.append("RULE_PATTERNS = PARSE_JSON(%(patterns)s)")
+        params["patterns"] = _json_or_null(rule_patterns)
+    fields.append("UPDATED_AT = CURRENT_TIMESTAMP()")
+    sf_session.execute(
+        f"UPDATE WORKFLOW_TEMPLATES SET {', '.join(fields)} WHERE ID = %(id)s",
+        params,
+    )
+    return get_workflow(workflow_id)
+
+
+def delete_workflow(workflow_id: str) -> None:
+    sf_session.execute(
+        "DELETE FROM WORKFLOW_TEMPLATES WHERE ID = %(id)s", {"id": workflow_id}
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RULE INTELLIGENCE LOGS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _intelligence_log_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        run_id=row["RUN_ID"],
+        table_fqn=row["TABLE_FQN"],
+        table_type=row["TABLE_TYPE"],
+        table_type_confidence=row["TABLE_TYPE_CONFIDENCE"],
+        thinking=row["THINKING"],
+        signals_used=_parse_json(row.get("SIGNALS_USED")),
+        proposals_count=row["PROPOSALS_COUNT"] or 0,
+        suppressed_count=row["SUPPRESSED_COUNT"] or 0,
+        approved_count=row["APPROVED_COUNT"] or 0,
+        rejected_count=row["REJECTED_COUNT"] or 0,
+        model_used=row["MODEL_USED"],
+        created_at=row["CREATED_AT"],
+    )
+
+
+def create_intelligence_log(
+    run_id: str,
+    table_fqn: str,
+    table_type: str,
+    table_type_confidence: int,
+    thinking: str,
+    signals_used: dict,
+    proposals_count: int = 0,
+    suppressed_count: int = 0,
+    model_used: str = "us.anthropic.claude-opus-4-8",
+) -> SimpleNamespace:
+    log_id = _new_id()
+    sf_session.execute(
+        """
+        INSERT INTO RULE_INTELLIGENCE_LOGS
+            (ID, RUN_ID, TABLE_FQN, TABLE_TYPE, TABLE_TYPE_CONFIDENCE,
+             THINKING, SIGNALS_USED, PROPOSALS_COUNT, SUPPRESSED_COUNT,
+             APPROVED_COUNT, REJECTED_COUNT, MODEL_USED)
+        SELECT
+            %(id)s, %(run_id)s, %(table_fqn)s, %(table_type)s,
+            %(table_type_confidence)s, %(thinking)s,
+            PARSE_JSON(%(signals_used)s),
+            %(proposals_count)s, %(suppressed_count)s, 0, 0, %(model_used)s
+        """,
+        {
+            "id": log_id,
+            "run_id": run_id,
+            "table_fqn": table_fqn,
+            "table_type": table_type,
+            "table_type_confidence": table_type_confidence,
+            "thinking": thinking,
+            "signals_used": _json_or_null(signals_used),
+            "proposals_count": proposals_count,
+            "suppressed_count": suppressed_count,
+            "model_used": model_used,
+        },
+    )
+    return get_intelligence_log(log_id)
+
+
+def get_intelligence_log(log_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM RULE_INTELLIGENCE_LOGS WHERE ID = %(id)s", {"id": log_id}
+    )
+    return _intelligence_log_from_row(rows[0]) if rows else None
+
+
+def get_intelligence_log_for_run(run_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM RULE_INTELLIGENCE_LOGS WHERE RUN_ID = %(run_id)s LIMIT 1",
+        {"run_id": run_id},
+    )
+    return _intelligence_log_from_row(rows[0]) if rows else None
+
+
+def update_intelligence_log_outcomes(
+    log_id: str, approved_count: int, rejected_count: int
+) -> None:
+    sf_session.execute(
+        """
+        UPDATE RULE_INTELLIGENCE_LOGS
+        SET APPROVED_COUNT = %(approved)s,
+            REJECTED_COUNT = %(rejected)s
+        WHERE ID = %(id)s
+        """,
+        {"id": log_id, "approved": approved_count, "rejected": rejected_count},
+    )
+
+
+def search_similar_intelligence(table_fqn: str, limit: int = 5) -> list[SimpleNamespace]:
+    """
+    Find past intelligence logs for tables similar to table_fqn.
+
+    Cortex Search (semantic/vector) is the preferred path — uncomment the block
+    below and comment out the SQL fallback once CORTEX_USER is granted:
+
+    # try:
+    #     query = f"data quality analysis for table {table_fqn}"
+    #     rows = sf_session.query(
+    #         \"\"\"
+    #         SELECT *
+    #         FROM TABLE(
+    #             SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+    #                 'DQ_APP.RULE_INTELLIGENCE_SEARCH',
+    #                 %(query)s,
+    #                 %(limit)s
+    #             )
+    #         )
+    #         \"\"\",
+    #         {"query": query, "limit": limit},
+    #     )
+    #     return [_intelligence_log_from_row(r) for r in rows]
+    # except Exception:
+    #     return []
+
+    SQL fallback (no CORTEX_USER grant needed). Three match tiers:
+    1. Same table name in a different schema/db (same concept, different env)
+    2. Table name shares a keyword (ORDER in ORDERS, ORDER_ITEMS, PURCHASE_ORDERS)
+    3. Same table type classification with at least one past approval
+    Results ranked: tier first, then approved_count, then most recent.
+    """
+    try:
+        # Extract the bare table name from db.schema.table
+        parts = table_fqn.upper().split(".")
+        table_name = parts[-1] if parts else table_fqn.upper()
+
+        # Keyword: longest word in the table name that is >3 chars
+        # (strips common suffixes like _STG, _FACT, _DIM for better matching)
+        words = [w for w in table_name.replace("_", " ").split() if len(w) > 3]
+        keyword = words[0] if words else table_name
+
+        rows = sf_session.query(
+            """
+            WITH scored AS (
+                SELECT *,
+                    CASE
+                        -- Tier 1: same bare table name (different env/schema)
+                        WHEN UPPER(SPLIT_PART(TABLE_FQN, '.', 3)) = %(table_name)s
+                            THEN 3
+                        -- Tier 2: table name contains the same keyword
+                        WHEN UPPER(SPLIT_PART(TABLE_FQN, '.', 3)) ILIKE %(keyword_like)s
+                            THEN 2
+                        -- Tier 3: same table type with at least one approval
+                        WHEN TABLE_TYPE = (
+                            SELECT TABLE_TYPE FROM RULE_INTELLIGENCE_LOGS
+                            WHERE TABLE_FQN = %(fqn)s
+                            ORDER BY CREATED_AT DESC LIMIT 1
+                        ) AND APPROVED_COUNT > 0
+                            THEN 1
+                        ELSE 0
+                    END AS match_tier
+                FROM RULE_INTELLIGENCE_LOGS
+                WHERE TABLE_FQN != %(fqn)s
+                  AND THINKING IS NOT NULL
+                  AND LENGTH(THINKING) > 0
+            )
+            SELECT * FROM scored
+            WHERE match_tier > 0
+            ORDER BY match_tier DESC, APPROVED_COUNT DESC, CREATED_AT DESC
+            LIMIT %(limit)s
+            """,
+            {
+                "fqn": table_fqn,
+                "table_name": table_name,
+                "keyword_like": f"%{keyword}%",
+                "limit": limit,
+            },
+        )
+        return [_intelligence_log_from_row(r) for r in rows]
+    except Exception:
+        return []

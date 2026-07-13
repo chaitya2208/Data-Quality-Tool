@@ -27,6 +27,8 @@ export default function Findings() {
   const urlDatabase  = searchParams.get('database')   || ''
 
   const [selectedFindings, setSelectedFindings] = useState<string[]>([])
+  const [page, setPage] = useState(1)
+  const PAGE_SIZE = 50
 
   // Sync URL params → filter state once on mount
   useEffect(() => {
@@ -48,6 +50,7 @@ export default function Findings() {
       scan_id:  scanIdFilter   || undefined,
       limit:    5000,
     }).then(r => r.data),
+    staleTime: 60_000,
   })
 
   const { data: assetsData } = useQuery({
@@ -91,18 +94,15 @@ export default function Findings() {
   }, [allFindings])
 
   // ── Client-side filtering ──────────────────────────────────────────────────
-  const data = useMemo(() => {
-    if (!allFindings) return allFindings
+  const filteredFindings = useMemo(() => {
+    if (!allFindings) return []
 
-    const filtered = allFindings.findings.filter(f => {
-      // Table filter — two modes:
-      // 1. FQN mode (from findings filter dropdown)
-      // 2. table_name+database mode (from Dashboard drill-down)
+    return allFindings.findings.filter(f => {
       if (tableFilter) {
         if (tableFilter.startsWith('__table_name__')) {
-          const parts   = tableFilter.split('__db__')
-          const tName   = parts[0].replace('__table_name__', '')
-          const dbName  = parts[1] || ''
+          const parts  = tableFilter.split('__db__')
+          const tName  = parts[0].replace('__table_name__', '')
+          const dbName = parts[1] || ''
           if (f.context?.table_name !== tName) return false
           if (dbName && f.context?.database_name !== dbName) return false
         } else {
@@ -110,15 +110,18 @@ export default function Findings() {
           if (fqn !== tableFilter) return false
         }
       }
-      // Rule filter
       if (ruleFilter && f.context?.rule_code !== ruleFilter) return false
-      // Instance filter (from Rule Library — exact match, works for every check kind)
       if (instanceFilter && f.instance_id !== instanceFilter) return false
       return true
     })
-
-    return { total: allFindings.total, findings: filtered }
   }, [allFindings, tableFilter, ruleFilter, instanceFilter])
+
+  // Reset to page 1 whenever filters change
+  useEffect(() => { setPage(1) }, [severityFilter, statusFilter, scanIdFilter, tableFilter, ruleFilter, instanceFilter])
+
+  const totalPages = Math.max(1, Math.ceil(filteredFindings.length / PAGE_SIZE))
+  const pagedFindings = filteredFindings.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const data = allFindings ? { total: allFindings.total, findings: filteredFindings } : undefined
 
   // ── Derived display label for active table filter ──────────────────────────
   const activeTableLabel = useMemo(() => {
@@ -141,9 +144,9 @@ export default function Findings() {
 
   const handleSelectAll = () =>
     setSelectedFindings(
-      selectedFindings.length === data?.findings.length
+      selectedFindings.length === filteredFindings.length
         ? []
-        : data?.findings.map(f => f.id) || []
+        : filteredFindings.map(f => f.id)
     )
 
   const handleSelectFinding = (id: string) =>
@@ -330,15 +333,15 @@ export default function Findings() {
       </div>
 
       {/* Bulk select bar */}
-      {data?.findings && data.findings.length > 0 && (
+      {filteredFindings.length > 0 && (
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4 flex items-center justify-between">
           <label className="flex items-center cursor-pointer">
             <input type="checkbox"
-              checked={selectedFindings.length === data.findings.length}
+              checked={selectedFindings.length === filteredFindings.length && filteredFindings.length > 0}
               onChange={handleSelectAll}
               className="w-4 h-4 text-primary-600 border-gray-300 dark:border-gray-600 rounded focus:ring-primary-500" />
             <span className="ml-2 text-sm font-medium text-gray-700 dark:text-gray-200">
-              Select All ({data.findings.length})
+              Select All ({filteredFindings.length})
             </span>
           </label>
           {selectedFindings.length > 0 && (
@@ -357,7 +360,7 @@ export default function Findings() {
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600 mx-auto mb-4" />
             <p className="text-gray-500 dark:text-gray-300">Loading findings…</p>
           </div>
-        ) : data?.findings.length === 0 ? (
+        ) : filteredFindings.length === 0 ? (
           <div className="p-12 text-center">
             <AlertCircle className="w-16 h-16 text-gray-300 mx-auto mb-4" />
             {anyFilter ? (
@@ -380,7 +383,7 @@ export default function Findings() {
           </div>
         ) : (
           <div className="divide-y divide-gray-200 dark:divide-gray-700">
-            {data?.findings.map(finding => (
+            {pagedFindings.map(finding => (
               <div key={finding.id} className="p-6 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
                 <div className="flex items-start gap-4">
                   <div className="flex-shrink-0 pt-1">
@@ -463,6 +466,47 @@ export default function Findings() {
           </div>
         )}
       </div>
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between bg-white dark:bg-gray-800 rounded-lg shadow px-4 py-3">
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, filteredFindings.length)} of {filteredFindings.length}
+          </p>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page === 1}
+              className="px-3 py-1.5 text-sm rounded-lg border border-gray-300 dark:border-gray-600 disabled:opacity-40 hover:bg-gray-50 dark:hover:bg-gray-700"
+            >
+              ← Prev
+            </button>
+            {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
+              // Show pages around current; always show first/last
+              let p: number
+              if (totalPages <= 7) p = i + 1
+              else if (i === 0) p = 1
+              else if (i === 6) p = totalPages
+              else p = Math.min(Math.max(page - 2 + i, 2), totalPages - 1)
+              return (
+                <button key={p} onClick={() => setPage(p)}
+                  className={`w-8 h-8 text-sm rounded-lg ${p === page
+                    ? 'bg-primary-600 text-white font-semibold'
+                    : 'border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300'}`}>
+                  {p}
+                </button>
+              )
+            })}
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page === totalPages}
+              className="px-3 py-1.5 text-sm rounded-lg border border-gray-300 dark:border-gray-600 disabled:opacity-40 hover:bg-gray-50 dark:hover:bg-gray-700"
+            >
+              Next →
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

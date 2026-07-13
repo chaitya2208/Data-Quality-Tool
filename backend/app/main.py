@@ -34,6 +34,11 @@ async def lifespan(app: FastAPI):
             seed_default_connection()
         except Exception as seed_err:
             logger.warning(f"Default connection seed skipped: {seed_err}")
+        try:
+            from app.services.migrations import run_migrations
+            run_migrations()
+        except Exception as mig_err:
+            logger.warning(f"Migrations skipped: {mig_err}")
     except Exception as e:
         logger.error(f"Snowflake startup failed: {e}")
     yield

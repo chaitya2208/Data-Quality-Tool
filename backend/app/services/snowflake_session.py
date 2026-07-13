@@ -15,6 +15,32 @@ import snowflake.connector
 from snowflake.connector import DictCursor
 from app.core.config import settings
 import logging
+import ssl
+import os
+
+# Corporate proxy intercepts HTTPS (including S3 result-batch downloads) with
+# its own cert. insecure_mode=True on connect() covers the Snowflake API call
+# but not the result-batch S3 fetches which go through the vendored urllib3.
+# Patch the full SSL chain here so every download in this process skips
+# cert verification — acceptable since insecure_mode is already on.
+os.environ.setdefault("PYTHONHTTPSVERIFY", "0")
+ssl._create_default_https_context = ssl._create_unverified_context  # stdlib path
+
+# Patch Snowflake's vendored pyopenssl — the S3 result-batch downloader uses
+# this path and it bypasses the stdlib ssl._create_default_https_context hook.
+try:
+    import snowflake.connector.vendored.urllib3.contrib.pyopenssl as _sf_pyopenssl
+    _orig_wrap = _sf_pyopenssl.PyOpenSSLContext.wrap_socket
+    def _insecure_wrap(self, *args, **kwargs):
+        try:
+            from OpenSSL import SSL as _SSL
+            self._ctx.set_verify(_SSL.VERIFY_NONE, lambda *a: True)
+        except Exception:
+            pass
+        return _orig_wrap(self, *args, **kwargs)
+    _sf_pyopenssl.PyOpenSSLContext.wrap_socket = _insecure_wrap
+except Exception as _e:
+    logging.getLogger(__name__).debug(f"pyopenssl patch skipped: {_e}")
 
 logger = logging.getLogger(__name__)
 

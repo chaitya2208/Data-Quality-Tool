@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { assetsApi, agentRunsApi, findingsApi } from '../api/client'
+import { assetsApi, agentRunsApi, findingsApi, workflowsApi } from '../api/client'
 import type { AgentTask, RuleReviewEntry } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import {
@@ -9,6 +9,7 @@ import {
   Wrench, CheckCircle2, Loader2, ChevronDown, ChevronRight,
   AlertTriangle, ArrowRight, Clock, Play, ExternalLink,
   RefreshCw, Sparkles, Network, LineChart, BarChart3,
+  BookmarkPlus, X,
 } from 'lucide-react'
 
 // ── Pipeline definition ───────────────────────────────────────────────────────
@@ -340,23 +341,28 @@ export default function AgentWorkflow() {
   const [editForm,      setEditForm]      = useState<Partial<RuleReviewEntry>>({})
   const [selectedIds,   setSelectedIds]   = useState<Set<string>>(new Set())
   const [approvedIds,   setApprovedIds]   = useState<Set<string>>(new Set()) // AI rules explicitly approved by the user
+  const [saveWfOpen,    setSaveWfOpen]    = useState(false)
+  const [saveWfLabel,   setSaveWfLabel]   = useState('')
+  const [saveWfDesc,    setSaveWfDesc]    = useState('')
 
   const { data: databases } = useQuery({
     queryKey: ['databases', connId],
     queryFn: () => assetsApi.discoverDatabases(connId).then(r => r.data),
     staleTime: 5 * 60 * 1000,
   })
-  const { data: schemas } = useQuery({
+  const { data: schemas, isFetching: schemasFetching, isError: schemasError } = useQuery({
     queryKey: ['schemas', connId, selectedDatabase],
     queryFn: () => assetsApi.discoverSchemas(selectedDatabase, connId).then(r => r.data),
     enabled: !!selectedDatabase,
     staleTime: 5 * 60 * 1000,
+    retry: false,
   })
-  const { data: tables } = useQuery({
+  const { data: tables, isFetching: tablesFetching, isError: tablesError } = useQuery({
     queryKey: ['tables', connId, selectedDatabase, selectedSchema],
     queryFn: () => assetsApi.discoverTables(selectedDatabase, selectedSchema, connId).then(r => r.data),
     enabled: !!selectedDatabase && !!selectedSchema,
     staleTime: 5 * 60 * 1000,
+    retry: false,
   })
 
   const { data: activeRun, error: activeRunError } = useQuery({
@@ -452,6 +458,35 @@ export default function AgentWorkflow() {
       queryClient.invalidateQueries({ queryKey: ['agent-run', activeRunId] })
       const iv = setInterval(() => queryClient.invalidateQueries({ queryKey: ['agent-run', activeRunId] }), 2000)
       setTimeout(() => clearInterval(iv), 60000)
+    },
+  })
+
+  const saveWorkflowMutation = useMutation({
+    mutationFn: () => {
+      // Use server-persisted approved list — local reviewActive is cleared after review
+      const approved = activeRun?.instance_review_state?.active ?? reviewActive
+      const patterns = approved.map((entry: any) => ({
+        definition_id: entry.definition_id,
+        definition_name: entry.name,
+        scope: entry.scope,
+        target_config: entry.target_config || {},
+        threshold_config: entry.threshold_config || {},
+        severity: entry.severity,
+        template_shape: entry.template_shape || null,
+        rationale: entry.reason || '',
+      }))
+      return workflowsApi.create({
+        label: saveWfLabel.trim(),
+        description: saveWfDesc.trim(),
+        rule_patterns: patterns,
+        created_by: '',
+      })
+    },
+    onSuccess: () => {
+      setSaveWfOpen(false)
+      setSaveWfLabel('')
+      setSaveWfDesc('')
+      queryClient.invalidateQueries({ queryKey: ['workflows'] })
     },
   })
 
@@ -563,8 +598,6 @@ export default function AgentWorkflow() {
     return formatDuration(s)
   })()
 
-  // Rule Intelligence summary from task output
-  const intelOutput = getTask('rule_intelligence_agent')?.output
   const findingsOutput = getTask('findings_agent')?.output
 
   return (
@@ -619,9 +652,16 @@ export default function AgentWorkflow() {
             <select value={selectedSchema}
               onChange={e => { setSelectedSchema(e.target.value); setSelectedTable('') }}
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 disabled:bg-gray-50"
-              disabled={!selectedDatabase || isRunning || scope === 'database'}>
-              <option value="">{scope === 'database' ? 'All schemas' : 'Choose schema...'}</option>
-              {schemas?.schemas.map(s => <option key={s} value={s}>{s}</option>)}
+              disabled={!selectedDatabase || isRunning || scope === 'database' || schemasFetching}>
+              {schemasFetching
+                ? <option value="">Loading schemas...</option>
+                : schemasError
+                  ? <option value="">Unable to load schemas</option>
+                  : <>
+                      <option value="">{scope === 'database' ? 'All schemas' : schemas?.schemas.length === 0 ? 'No schemas found' : 'Choose schema...'}</option>
+                      {schemas?.schemas.map(s => <option key={s} value={s}>{s}</option>)}
+                    </>
+              }
             </select>
           </div>
           <div>
@@ -631,9 +671,16 @@ export default function AgentWorkflow() {
             <select value={selectedTable}
               onChange={e => setSelectedTable(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 disabled:bg-gray-50"
-              disabled={!selectedSchema || isRunning || scope !== 'table'}>
-              <option value="">{scope !== 'table' ? 'All tables' : 'Choose table...'}</option>
-              {tables?.tables.map(t => <option key={t} value={t}>{t}</option>)}
+              disabled={!selectedSchema || isRunning || scope !== 'table' || tablesFetching}>
+              {tablesFetching
+                ? <option value="">Loading tables...</option>
+                : tablesError
+                  ? <option value="">Unable to load tables</option>
+                  : <>
+                      <option value="">{scope !== 'table' ? 'All tables' : tables?.tables.length === 0 ? 'No tables found' : 'Choose table...'}</option>
+                      {tables?.tables.map(t => <option key={t} value={t}>{t}</option>)}
+                    </>
+              }
             </select>
           </div>
         </div>
@@ -806,7 +853,7 @@ export default function AgentWorkflow() {
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                   <AgentNode agentDef={getAgentDef('relationship_discovery_agent')} task={getTask('relationship_discovery_agent')}
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
-                  <AgentNode agentDef={AGENTS[3]} task={getTask('profiling_agent')}
+                  <AgentNode agentDef={getAgentDef('profiling_agent')} task={getTask('profiling_agent')}
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 </ParallelGroup>
                 <AgentNode agentDef={getAgentDef('profiler_agent')} task={getTask('profiler_agent')}
@@ -861,6 +908,55 @@ export default function AgentWorkflow() {
           )}
         </div>
       )}
+
+      {/* Verification result banner — directly below pipeline */}
+      {(isAwaiting || isCompleted) && verifyDone && verifyOutput && (() => {
+        const resolved  = liveResolved  ?? verifyOutput.resolved  ?? 0
+        const total     = (liveTotal || verifyOutput.total_findings) ?? 0
+        const remaining = liveRemaining ?? verifyOutput.remaining ?? 0
+        const pct       = total > 0 ? Math.round(resolved / total * 100) : 0
+        const newAuto   = verifyOutput.newly_auto_resolved ?? 0
+        const allDone   = remaining === 0
+        return (
+          <div className={`border-2 rounded-xl p-5 ${allDone ? 'bg-green-50 border-green-300' : 'bg-blue-50 border-blue-300'}`}>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h3 className={`font-semibold text-base mb-1 ${allDone ? 'text-green-900' : 'text-blue-900'}`}>
+                  {allDone
+                    ? '✅ All issues resolved — workflow complete!'
+                    : `📊 Verification: ${resolved}/${total} fixed (${pct}%) — ${remaining} remaining`
+                  }
+                </h3>
+                <p className={`text-sm ${allDone ? 'text-green-800' : 'text-blue-800'}`}>
+                  {allDone
+                    ? 'Every finding has been resolved. Great work!'
+                    : `${remaining} finding${remaining !== 1 ? 's' : ''} still need attention.`
+                  }
+                </p>
+                {newAuto > 0 && (
+                  <p className="text-xs mt-1.5 text-green-700 font-medium">
+                    ✓ {newAuto} auto-resolved by live Snowflake re-scan
+                  </p>
+                )}
+              </div>
+              {!allDone && (
+                <div className="flex flex-col gap-2 flex-shrink-0">
+                  <button onClick={() => navigate(`/findings?scan_id=${activeRun?.scan_id}&status=detected`)}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
+                    <Wrench className="w-3.5 h-3.5" />Fix Remaining
+                  </button>
+                  <button onClick={() => verifyMutation.mutate(activeRunId!)}
+                    disabled={verifyMutation.isPending}
+                    className="flex items-center gap-1.5 px-3 py-2 border border-blue-300 text-blue-700 rounded-lg text-sm font-medium hover:bg-blue-50 disabled:opacity-50 transition-colors">
+                    <RefreshCw className={`w-3.5 h-3.5 ${verifyMutation.isPending ? 'animate-spin' : ''}`} />
+                    Verify Again
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      })()}
 
       {/* ── RULE REVIEW PANEL (shown when awaiting_rule_review) ─────────────── */}
       {isReviewing && activeRunId && (
@@ -1141,58 +1237,6 @@ export default function AgentWorkflow() {
         </div>
       )}
 
-      {/* Rule Intelligence summary (shown after it completes) */}
-      {intelOutput && getTask('rule_intelligence_agent')?.status === 'completed' && (
-        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <BrainCircuit className="w-5 h-5 text-purple-600" />
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Rule Intelligence Report</h2>
-            <span className="text-xs bg-purple-50 border border-purple-200 text-purple-700 px-2 py-0.5 rounded-full font-medium">
-              {intelOutput.table_type} · {intelOutput.table_type_confidence}% confidence
-            </span>
-          </div>
-          <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">{intelOutput.table_type_reason}</p>
-
-          <div className="grid grid-cols-3 gap-6">
-            <div className="text-center">
-              <p className="text-2xl font-bold text-gray-900 dark:text-gray-100">{intelOutput.existing_instances_evaluated}</p>
-              <p className="text-xs text-gray-500 dark:text-gray-400">Existing checks evaluated</p>
-            </div>
-            <div className="text-center">
-              <p className="text-2xl font-bold text-purple-600 flex items-center justify-center gap-1">
-                <Sparkles className="w-5 h-5" />{intelOutput.new_instances_proposed}
-              </p>
-              <p className="text-xs text-gray-500 dark:text-gray-400">New instances proposed</p>
-            </div>
-            <div className="text-center">
-              <p className="text-2xl font-bold text-gray-400">{intelOutput.suppressed_duplicates?.length ?? 0}</p>
-              <p className="text-xs text-gray-500 dark:text-gray-400">Duplicates suppressed</p>
-            </div>
-          </div>
-
-          {/* Suppressed duplicates — this is the memory/dedup gap made visible */}
-          {intelOutput.suppressed_duplicates && intelOutput.suppressed_duplicates.length > 0 && (
-            <div className="mt-4 pt-4 border-t border-gray-100 dark:border-gray-700">
-              <h3 className="text-xs font-semibold text-gray-700 dark:text-gray-200 uppercase tracking-wide mb-2">
-                Suppressed as duplicates ({intelOutput.suppressed_duplicates.length})
-              </h3>
-              <div className="flex flex-wrap gap-2">
-                {intelOutput.suppressed_duplicates.map((s: any, i: number) => (
-                  <span key={i}
-                    className="text-xs px-2 py-1 rounded-full font-medium border bg-gray-50 dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-300"
-                    title={`fingerprint ${s.fingerprint}`}>
-                    {s.reason.replace(/_/g, ' ')}
-                  </span>
-                ))}
-              </div>
-              <p className="text-xs text-gray-400 dark:text-gray-400 mt-2">
-                Claude proposed these again, but they already match an active, pending, or rejected check for this exact target.
-              </p>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Findings Report — rules that fired vs rules that ran clean (mirrors
           the active/skipped split, but after findings ran) */}
       {findingsOutput && getTask('findings_agent')?.status === 'completed' &&
@@ -1219,15 +1263,15 @@ export default function AgentWorkflow() {
                 Rules Used ({findingsOutput.rules_used_count})
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
-                {findingsOutput.rules_used.map((r: any) => (
-                  <div key={r.code} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
+                {findingsOutput.rules_used.map((r: any, i: number) => (
+                  <div key={r.instance_id ?? r.code ?? i} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
                     <div className="min-w-0">
                       <span className="font-mono text-xs font-bold text-gray-700 dark:text-gray-200">{r.code}</span>
                       <p className="text-xs text-gray-600 dark:text-gray-300 truncate">{r.name}</p>
                     </div>
                     {activeRun?.scan_id && (
                       <button
-                        onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}&rule_code=${encodeURIComponent(r.code)}`)}
+                        onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}&instance=${r.instance_id}`)}
                         className="flex-shrink-0 text-xs px-1.5 py-1 text-orange-700 dark:text-orange-300 border border-orange-300 dark:border-orange-500/40 rounded hover:bg-orange-100 dark:hover:bg-orange-500/20 font-medium"
                         title="View these findings"
                       >
@@ -1249,8 +1293,8 @@ export default function AgentWorkflow() {
                 Rules Clean ({findingsOutput.rules_unused_count})
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
-                {(findingsOutput.rules_unused || []).map((r: any) => (
-                  <div key={r.code} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm">
+                {(findingsOutput.rules_unused || []).map((r: any, i: number) => (
+                  <div key={r.instance_id ?? r.code ?? i} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm">
                     <span className="font-mono text-xs font-bold text-gray-500 dark:text-gray-300">{r.code}</span>
                     <p className="text-xs text-gray-500 dark:text-gray-300 truncate">{r.name}</p>
                   </div>
@@ -1306,60 +1350,91 @@ export default function AgentWorkflow() {
                   : <><RefreshCw className="w-4 h-4" />Verify Fixes</>
                 }
               </button>
+              <button
+                onClick={() => setSaveWfOpen(true)}
+                className="flex items-center gap-1.5 px-4 py-2 border border-gray-300 text-gray-700 dark:text-gray-200 dark:border-gray-600 rounded-lg text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+              >
+                <BookmarkPlus className="w-4 h-4" />
+                Save as Workflow
+              </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Verification result banner */}
-      {(isAwaiting || isCompleted) && verifyDone && verifyOutput && (() => {
-        // Prefer live counts over stale verify snapshot
-        const resolved  = liveResolved  ?? verifyOutput.resolved  ?? 0
-        const total     = (liveTotal || verifyOutput.total_findings) ?? 0
-        const remaining = liveRemaining ?? verifyOutput.remaining ?? 0
-        const pct       = total > 0 ? Math.round(resolved / total * 100) : 0
-        const newAuto   = verifyOutput.newly_auto_resolved ?? 0
-        const allDone   = remaining === 0
-        return (
-          <div className={`border-2 rounded-xl p-5 ${allDone ? 'bg-green-50 border-green-300' : 'bg-blue-50 border-blue-300'}`}>
-            <div className="flex items-start justify-between gap-4">
+      {/* ── Save as Workflow modal ─────────────────────────────────────────── */}
+      {saveWfOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl w-full max-w-md p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">
+                Save as Workflow
+              </h3>
+              <button onClick={() => setSaveWfOpen(false)} className="text-gray-400 hover:text-gray-600">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+              {(() => {
+                const n = (activeRun?.instance_review_state?.active ?? reviewActive).length
+                return `Saves ${n} approved rule pattern${n !== 1 ? 's' : ''} from this run as a reusable workflow. You can run it on any table or schema later.`
+              })()}
+            </p>
+            <div className="space-y-3">
               <div>
-                <h3 className={`font-semibold text-base mb-1 ${allDone ? 'text-green-900' : 'text-blue-900'}`}>
-                  {allDone
-                    ? '✅ All issues resolved — workflow complete!'
-                    : `📊 Verification: ${resolved}/${total} fixed (${pct}%) — ${remaining} remaining`
-                  }
-                </h3>
-                <p className={`text-sm ${allDone ? 'text-green-800' : 'text-blue-800'}`}>
-                  {allDone
-                    ? 'Every finding has been resolved. Great work!'
-                    : `${remaining} finding${remaining !== 1 ? 's' : ''} still need attention.`
-                  }
-                </p>
-                {newAuto > 0 && (
-                  <p className="text-xs mt-1.5 text-green-700 font-medium">
-                    ✓ {newAuto} auto-resolved by live Snowflake re-scan
-                  </p>
-                )}
+                <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  Workflow Label <span className="text-red-500">*</span>
+                </label>
+                <input
+                  value={saveWfLabel}
+                  onChange={e => setSaveWfLabel(e.target.value)}
+                  placeholder="e.g. Orders Table Standard Checks"
+                  className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+                  autoFocus
+                />
               </div>
-              {!allDone && (
-                <div className="flex flex-col gap-2 flex-shrink-0">
-                  <button onClick={() => navigate(`/findings?scan_id=${activeRun?.scan_id}&status=detected`)}
-                    className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
-                    <Wrench className="w-3.5 h-3.5" />Fix Remaining
-                  </button>
-                  <button onClick={() => verifyMutation.mutate(activeRunId!)}
-                    disabled={verifyMutation.isPending}
-                    className="flex items-center gap-1.5 px-3 py-2 border border-blue-300 text-blue-700 rounded-lg text-sm font-medium hover:bg-blue-50 disabled:opacity-50 transition-colors">
-                    <RefreshCw className={`w-3.5 h-3.5 ${verifyMutation.isPending ? 'animate-spin' : ''}`} />
-                    Verify Again
-                  </button>
-                </div>
-              )}
+              <div>
+                <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  Description <span className="text-gray-400">(optional)</span>
+                </label>
+                <textarea
+                  value={saveWfDesc}
+                  onChange={e => setSaveWfDesc(e.target.value)}
+                  rows={2}
+                  placeholder="What does this workflow check for?"
+                  className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+                />
+              </div>
+            </div>
+            {saveWorkflowMutation.isError && (
+              <p className="mt-3 text-xs text-red-600">
+                {(saveWorkflowMutation.error as any)?.response?.data?.detail || 'Failed to save workflow'}
+              </p>
+            )}
+            {saveWorkflowMutation.isSuccess && (
+              <p className="mt-3 text-xs text-green-600">Workflow saved! View it in Saved Workflows.</p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => setSaveWfOpen(false)}
+                className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => saveWorkflowMutation.mutate()}
+                disabled={saveWorkflowMutation.isPending || !saveWfLabel.trim()}
+                className="flex items-center gap-2 px-4 py-2 text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50"
+              >
+                {saveWorkflowMutation.isPending
+                  ? <><Loader2 className="w-4 h-4 animate-spin" />Saving...</>
+                  : <><BookmarkPlus className="w-4 h-4" />Save Workflow</>
+                }
+              </button>
             </div>
           </div>
-        )
-      })()}
+        </div>
+      )}
 
       {/* Recent runs — always visible so user can switch between runs */}
       {recentRuns && recentRuns.runs.length > 0 && (

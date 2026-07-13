@@ -149,7 +149,9 @@
       "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/api/rules.py', encoding='utf-8'\\).read\\(\\)\\)\")",
       "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/services/rule_engine.py', encoding='utf-8'\\).read\\(\\)\\)\")",
       "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/services/agents/findings_agent.py', encoding='utf-8'\\).read\\(\\)\\)\")",
-      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/schemas/finding.py', encoding='utf-8'\\).read\\(\\)\\)\")"
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/schemas/finding.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(.venv/Scripts/pip install *)",
+      "Bash(.venv/Scripts/pip uninstall *)"
     ]
   }
 }

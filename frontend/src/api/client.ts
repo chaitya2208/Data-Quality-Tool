@@ -530,6 +530,38 @@ export interface AgentRun {
 
 export type WorkflowScope = 'table' | 'schema' | 'database';
 
+export interface RulePattern {
+  definition_id: string;
+  definition_name: string;
+  scope: string;
+  target_config: Record<string, any>;
+  threshold_config: Record<string, any>;
+  severity: string;
+  template_shape: string | null;
+  rationale?: string;
+}
+
+export interface WorkflowTemplate {
+  id: string;
+  label: string;
+  description: string | null;
+  rule_patterns: RulePattern[];
+  pattern_count: number;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export const workflowsApi = {
+  list: () => api.get<WorkflowTemplate[]>('/agent/workflows'),
+  get: (id: string) => api.get<WorkflowTemplate>(`/agent/workflows/${id}`),
+  create: (data: { label: string; description?: string; rule_patterns: RulePattern[]; created_by?: string }) =>
+    api.post<WorkflowTemplate>('/agent/workflows', data),
+  update: (id: string, data: { label?: string; description?: string; rule_patterns?: RulePattern[] }) =>
+    api.put<WorkflowTemplate>(`/agent/workflows/${id}`, data),
+  delete: (id: string) => api.delete(`/agent/workflows/${id}`),
+};
+
 export interface AgentBatch {
   batch_id: string;
   scope: WorkflowScope;
@@ -542,7 +574,7 @@ export interface AgentBatch {
 export const agentRunsApi = {
   start: (data: { database: string; schema_name: string; table: string; connection_id?: string | null }) =>
     api.post<AgentRun>('/agent/runs', data),
-  startBatch: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string; connection_id?: string | null }) =>
+  startBatch: (data: { scope: WorkflowScope; database: string; schema_name?: string; table?: string; connection_id?: string | null; workflow_template_id?: string | null }) =>
     api.post<AgentBatch>('/agent/runs/batch', data),
   getBatch: (batchId: string) =>
     api.get<AgentBatch>(`/agent/runs/batch/${batchId}`),

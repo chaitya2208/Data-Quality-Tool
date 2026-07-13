@@ -137,6 +137,7 @@ def start_batch(request: AgentBatchCreateRequest):
             status="pending",
             batch_id=batch_id,
             batch_index=idx,
+            workflow_template_id=request.workflow_template_id,
         )
         storage.create_agent_tasks(run.id, DB_AGENT_ORDER)
         runs.append(storage.get_agent_run(run.id))
@@ -390,3 +391,71 @@ def trigger_verification(run_id: str, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_run_verification)
     return {"message": "Verification started", "run_id": run_id}
+
+
+# ── Workflow Templates ────────────────────────────────────────────────────────
+
+@router.get("/workflows")
+def list_workflows():
+    workflows = storage.list_workflows()
+    return [_workflow_response(w) for w in workflows]
+
+
+@router.get("/workflows/{workflow_id}")
+def get_workflow(workflow_id: str):
+    w = storage.get_workflow(workflow_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return _workflow_response(w)
+
+
+@router.post("/workflows", status_code=201)
+def create_workflow(request: dict):
+    label = request.get("label", "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label is required")
+    patterns = request.get("rule_patterns", [])
+    if not patterns:
+        raise HTTPException(status_code=400, detail="rule_patterns must not be empty")
+    w = storage.create_workflow(
+        label=label,
+        description=request.get("description", ""),
+        rule_patterns=patterns,
+        created_by=request.get("created_by", ""),
+    )
+    return _workflow_response(w)
+
+
+@router.put("/workflows/{workflow_id}")
+def update_workflow(workflow_id: str, request: dict):
+    w = storage.get_workflow(workflow_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    w = storage.update_workflow(
+        workflow_id,
+        label=request.get("label"),
+        description=request.get("description"),
+        rule_patterns=request.get("rule_patterns"),
+    )
+    return _workflow_response(w)
+
+
+@router.delete("/workflows/{workflow_id}", status_code=204)
+def delete_workflow(workflow_id: str):
+    w = storage.get_workflow(workflow_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    storage.delete_workflow(workflow_id)
+
+
+def _workflow_response(w) -> dict:
+    return {
+        "id": w.id,
+        "label": w.label,
+        "description": w.description,
+        "rule_patterns": w.rule_patterns,
+        "created_by": w.created_by,
+        "created_at": w.created_at.isoformat() if w.created_at else None,
+        "updated_at": w.updated_at.isoformat() if w.updated_at else None,
+        "pattern_count": len(w.rule_patterns or []),
+    }

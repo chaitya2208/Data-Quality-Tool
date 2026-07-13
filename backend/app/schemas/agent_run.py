@@ -18,12 +18,15 @@ class AgentBatchCreateRequest(BaseModel):
       - scope="table"    : requires database, schema_name, table
       - scope="schema"   : requires database, schema_name  (all tables in schema)
       - scope="database" : requires database               (all tables, all schemas)
+    When workflow_template_id is provided the run uses the saved rule patterns
+    directly — rule intelligence is skipped and no rule review pause occurs.
     """
     scope: str  # "table" | "schema" | "database"
     database: str
     schema_name: Optional[str] = None
     table: Optional[str] = None
     connection_id: Optional[str] = None
+    workflow_template_id: Optional[str] = None
 
 
 class AgentTaskResponse(BaseModel):

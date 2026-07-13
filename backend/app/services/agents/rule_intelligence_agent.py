@@ -31,7 +31,7 @@ from typing import List, Optional, Dict, Any, Set
 from app.services import storage
 from app.services.fingerprint import compute_fingerprint
 from app.services.snowflake_session import session as sf_session
-from app.services.claude_client import ask_claude
+from app.services.claude_client import ask_claude, ask_claude_with_thinking
 from app.services.sql_validation import validate_sql
 from app.services.rule_sql_templates import TEMPLATE_SHAPES, render_template
 from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
@@ -145,6 +145,11 @@ silently removed before the check can run) ===
 
 === ALREADY ACTIVE OR PENDING ON THIS TABLE (do NOT re-propose these) ===
 {existing_instances}
+
+=== PAST INTELLIGENCE — what was learned from similar tables in prior scans
+(use this to avoid repeating mistakes, re-proposing previously rejected
+patterns, and to recognise table types you have seen before) ===
+{past_context}
 
 Respond with this JSON:
 {{
@@ -311,6 +316,8 @@ class RuleIntelligenceAgent:
         relationships_text = self._format_relationships(table_asset, relationship_catalog)
         closed_sets_text = self._format_closed_sets(self._closed_set_columns)
 
+        past_context_text = self._format_past_context(table_asset)
+
         prompt = USER_PROMPT_TEMPLATE.format(
             fqn=table_asset.fqn,
             row_count=table_asset.row_count or "unknown",
@@ -323,9 +330,10 @@ class RuleIntelligenceAgent:
             sample_data=sample_data,
             definitions=definitions_text,
             existing_instances=existing_text,
+            past_context=past_context_text,
         )
 
-        raw = self._call_model(prompt)
+        raw, thinking = self._call_model(prompt)
         parsed = self._extract_json(raw)
 
         # A parse failure (malformed/truncated response) is NOT the same as a
@@ -343,7 +351,7 @@ class RuleIntelligenceAgent:
                 "Respond again with ONLY a single valid JSON object matching the "
                 "schema above — no markdown fences, no prose before or after."
             )
-            raw = self._call_model(repair_prompt)
+            raw, _retry_thinking = self._call_model(repair_prompt)
             parsed = self._extract_json(raw)
 
         if not parsed:
@@ -361,6 +369,32 @@ class RuleIntelligenceAgent:
             "definitions_evaluated": parsed.get("definitions_evaluated", {}),
             "signals_evaluated":     parsed.get("signals_evaluated", {}),
         }
+
+        # Persist the intelligence log (Option B) — best-effort, never blocks
+        # the pipeline if it fails. The log id is stored on the result so the
+        # coordinator can back-fill approved/rejected counts after user review.
+        intelligence_log_id = None
+        try:
+            signals_used = {
+                "pk_shaped_candidates": profiler_result.get("pk_shaped_candidates", []),
+                "freshness_signals": profiler_result.get("freshness_signals", []),
+                "closed_set_columns": list((profiler_result.get("closed_set_columns") or {}).keys()),
+                "relationships": len(relationship_catalog),
+            }
+            log = storage.create_intelligence_log(
+                run_id=run_id,
+                table_fqn=table_asset.fqn,
+                table_type=classification["table_type"],
+                table_type_confidence=classification["table_type_confidence"],
+                thinking=thinking,
+                signals_used=signals_used,
+                proposals_count=len(parsed.get("new_instances", [])),
+                suppressed_count=len(suppressed),
+            )
+            intelligence_log_id = log.id
+            logger.info(f"[RuleIntelligence] Intelligence log saved: {intelligence_log_id}")
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] Could not save intelligence log: {e}")
 
         # Normalize: fill missing decisions with default (keep_running=True)
         for inst in existing_instances:
@@ -411,6 +445,7 @@ class RuleIntelligenceAgent:
             "suppressed": suppressed,
             "signals_missed": signals_missed,
             "parse_failed": parse_failed,
+            "intelligence_log_id": intelligence_log_id,
         }
 
     # ── Existing-state gathering ──────────────────────────────────────────
@@ -865,6 +900,24 @@ class RuleIntelligenceAgent:
 
     # ── Formatting helpers ────────────────────────────────────────────────
 
+    def _format_past_context(self, table_asset: Any) -> str:
+        """Retrieve semantically similar past intelligence logs and format
+        them as context. Falls back gracefully if Cortex Search is not set up."""
+        try:
+            past_logs = storage.search_similar_intelligence(table_asset.fqn, limit=3)
+        except Exception:
+            past_logs = []
+        if not past_logs:
+            return "  (no past intelligence available yet — this is the first scan of a similar table)"
+        lines = []
+        for log in past_logs:
+            outcome = f"approved={log.approved_count}, rejected={log.rejected_count}"
+            lines.append(
+                f"  Table: {log.table_fqn}  type={log.table_type}  {outcome}\n"
+                f"  Reasoning: {(log.thinking or '')[:600]}"
+            )
+        return "\n\n".join(lines)
+
     def _fetch_sample(self, table_asset: Any) -> str:
         try:
             fqn = table_asset.fqn
@@ -986,23 +1039,29 @@ class RuleIntelligenceAgent:
             lines.append(f"  definition_id={inst.definition_id} \"{name}\" [{inst.status}] {target_str}")
         return "\n".join(lines)
 
-    def _call_model(self, prompt: str) -> str:
+    def _call_model(self, prompt: str) -> tuple[str, str]:
+        """
+        Returns (text, thinking). Bedrock with extended thinking is the primary
+        path — it gives us Claude's raw deliberation for the intelligence log
+        and avoids Cortex's output-token cap. Falls back to ask_claude (no
+        thinking) if extended thinking fails for any reason.
+        """
         try:
-            # ask_cortex has no separate system-prompt channel, so the system
-            # prompt MUST be prepended to the user prompt here — otherwise the
-            # (default) Cortex path runs with none of the constraints, output
-            # schema, or grounding rules in SYSTEM_PROMPT, while only the
-            # Bedrock fallback below gets them. Keep both paths equivalent.
-            cortex_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
-            return sf_session.ask_cortex(cortex_prompt, model="claude-opus-4-8")
+            result = ask_claude_with_thinking(
+                prompt,
+                system=SYSTEM_PROMPT,
+                max_tokens=16000,
+                thinking_budget=8000,
+            )
+            return result["text"], result["thinking"]
         except Exception as e:
-            logger.warning(f"[RuleIntelligence] Cortex failed ({e}), using Claude/Bedrock")
-        # Bedrock fallback: the 2-arg CORTEX.COMPLETE path has a low,
-        # unraisable output cap that can truncate the large rule-
-        # classification response, so the fallback uses a much higher
-        # ceiling — ask_claude streams internally, so the full response
-        # comes back intact even near 32k tokens.
-        return ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=32000)
+            logger.warning(f"[RuleIntelligence] Extended thinking failed ({e}), falling back to standard Bedrock")
+        try:
+            text = ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=32000)
+            return text, ""
+        except Exception as e:
+            logger.error(f"[RuleIntelligence] Bedrock fallback also failed: {e}")
+            raise
 
     @staticmethod
     def _extract_json(text: str) -> dict:

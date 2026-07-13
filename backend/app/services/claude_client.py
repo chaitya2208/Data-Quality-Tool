@@ -57,3 +57,43 @@ def ask_claude(prompt: str, system: str = None, max_tokens: int = 32000) -> str:
     return "".join(
         block.text for block in message.content if getattr(block, "type", None) == "text"
     )
+
+
+def ask_claude_with_thinking(
+    prompt: str,
+    system: str = None,
+    max_tokens: int = 16000,
+    thinking_budget: int = 8000,
+) -> dict:
+    """
+    Call Claude via Bedrock with extended thinking enabled.
+    Returns {"thinking": str, "text": str} — thinking is Claude's raw
+    deliberation before it committed to its answer; text is the final output.
+
+    max_tokens must be > thinking_budget (Anthropic requirement).
+    thinking_budget controls how many tokens Claude can spend deliberating —
+    higher = more thorough reasoning but slower and more expensive.
+    Extended thinking disables streaming (SDK limitation), so this uses a
+    blocking messages.create() call.
+    """
+    client = get_claude_client()
+    kwargs = {
+        "model": DEFAULT_MODEL,
+        "max_tokens": max_tokens,
+        "thinking": {"type": "enabled", "budget_tokens": thinking_budget},
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        kwargs["system"] = system
+
+    message = client.messages.create(**kwargs)
+
+    thinking_text = "".join(
+        block.thinking for block in message.content
+        if getattr(block, "type", None) == "thinking"
+    )
+    output_text = "".join(
+        block.text for block in message.content
+        if getattr(block, "type", None) == "text"
+    )
+    return {"thinking": thinking_text, "text": output_text}
