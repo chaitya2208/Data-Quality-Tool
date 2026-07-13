@@ -340,8 +340,9 @@ export default function AgentWorkflow() {
   const [reviewSkipped, setReviewSkipped] = useState<RuleReviewEntry[]>([])
   const [editingRule,   setEditingRule]   = useState<string | null>(null) // instance_id being edited
   const [editForm,      setEditForm]      = useState<Partial<RuleReviewEntry>>({})
-  const [selectedIds,   setSelectedIds]   = useState<Set<string>>(new Set())
-  const [approvedIds,   setApprovedIds]   = useState<Set<string>>(new Set()) // AI rules explicitly approved by the user
+  const [selectedActiveIds,  setSelectedActiveIds]  = useState<Set<string>>(new Set())
+  const [selectedSkippedIds, setSelectedSkippedIds] = useState<Set<string>>(new Set())
+  const [approvedIds,        setApprovedIds]        = useState<Set<string>>(new Set()) // AI rules explicitly approved by the user
   const [saveWfOpen,    setSaveWfOpen]    = useState(false)
   const [saveWfLabel,   setSaveWfLabel]   = useState('')
   const [saveWfDesc,    setSaveWfDesc]    = useState('')
@@ -521,7 +522,7 @@ export default function AgentWorkflow() {
     if (!rule) return
     setReviewActive(prev => prev.filter(r => r.instance_id !== instanceId))
     setReviewSkipped(prev => [...prev, { ...rule, reason: rule.reason || 'Rejected by user' }])
-    setSelectedIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
+    setSelectedActiveIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
     setApprovedIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
   }
 
@@ -529,7 +530,7 @@ export default function AgentWorkflow() {
   // records the affirmative decision for clear visual feedback).
   const approveRule = (instanceId: string) => {
     setApprovedIds(prev => new Set(prev).add(instanceId))
-    setSelectedIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
+    setSelectedActiveIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
   }
 
   // Move a rule from skipped → active (activate/approve a skipped one)
@@ -538,6 +539,7 @@ export default function AgentWorkflow() {
     if (!rule) return
     setReviewSkipped(prev => prev.filter(r => r.instance_id !== instanceId))
     setReviewActive(prev => [...prev, rule])
+    setSelectedSkippedIds(prev => { const n = new Set(prev); n.delete(instanceId); return n })
   }
 
   // Save edits to a new instance/definition
@@ -549,8 +551,8 @@ export default function AgentWorkflow() {
     setEditForm({})
   }
 
-  const toggleSelected = (instanceId: string) => {
-    setSelectedIds(prev => {
+  const toggleActiveSelected = (instanceId: string) => {
+    setSelectedActiveIds(prev => {
       const n = new Set(prev)
       if (n.has(instanceId)) n.delete(instanceId)
       else n.add(instanceId)
@@ -558,20 +560,29 @@ export default function AgentWorkflow() {
     })
   }
 
-  const bulkReject = (ids: Set<string>) => {
+  const toggleSkippedSelected = (instanceId: string) => {
+    setSelectedSkippedIds(prev => {
+      const n = new Set(prev)
+      if (n.has(instanceId)) n.delete(instanceId)
+      else n.add(instanceId)
+      return n
+    })
+  }
+
+  const bulkSkip = (ids: Set<string>) => {
     const toMove = reviewActive.filter(r => ids.has(r.instance_id))
     if (toMove.length === 0) return
     setReviewActive(prev => prev.filter(r => !ids.has(r.instance_id)))
-    setReviewSkipped(prev => [...prev, ...toMove.map(r => ({ ...r, reason: r.reason || 'Bulk-rejected by user' }))])
-    setSelectedIds(new Set())
+    setReviewSkipped(prev => [...prev, ...toMove.map(r => ({ ...r, reason: r.reason || 'Bulk-skipped by user' }))])
+    setSelectedActiveIds(new Set())
   }
 
-  const bulkApprove = (ids: Set<string>) => {
+  const bulkActivate = (ids: Set<string>) => {
     const toMove = reviewSkipped.filter(r => ids.has(r.instance_id))
     if (toMove.length === 0) return
     setReviewSkipped(prev => prev.filter(r => !ids.has(r.instance_id)))
     setReviewActive(prev => [...prev, ...toMove])
-    setSelectedIds(new Set())
+    setSelectedSkippedIds(new Set())
   }
 
   const getTask = (name: string): AgentTask | undefined =>
@@ -994,29 +1005,6 @@ export default function AgentWorkflow() {
                 }
               </button>
             </div>
-            {selectedIds.size > 0 && (
-              <div className="mt-3 flex items-center gap-2 bg-white border border-purple-200 rounded-lg px-3 py-2">
-                <span className="text-xs font-medium text-purple-800">{selectedIds.size} selected</span>
-                <button
-                  onClick={() => bulkApprove(selectedIds)}
-                  className="ml-auto flex items-center gap-1 text-xs px-2.5 py-1 bg-green-600 text-white rounded hover:bg-green-700"
-                >
-                  <CheckCircle2 className="w-3 h-3" />Approve Selected
-                </button>
-                <button
-                  onClick={() => bulkReject(selectedIds)}
-                  className="flex items-center gap-1 text-xs px-2.5 py-1 bg-red-600 text-white rounded hover:bg-red-700"
-                >
-                  <AlertTriangle className="w-3 h-3" />Reject Selected
-                </button>
-                <button
-                  onClick={() => setSelectedIds(new Set())}
-                  className="text-xs px-2 py-1 text-purple-500 hover:text-purple-800"
-                >
-                  Clear
-                </button>
-              </div>
-            )}
           </div>
 
           {/* Parse-failure warning — "0 proposals" may be a broken response, not full coverage */}
@@ -1054,19 +1042,37 @@ export default function AgentWorkflow() {
           )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100 dark:divide-gray-700">
-            {/* Active Instances column */}
+            {/* Active Rules column */}
             <div className="p-5">
-              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
-                Active Rules ({reviewActive.length})
-              </h3>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
+                  Active Rules ({reviewActive.length})
+                </h3>
+              </div>
+              {selectedActiveIds.size > 0 && (
+                <div className="mb-2 flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg px-3 py-1.5">
+                  <span className="text-xs font-medium text-red-800">{selectedActiveIds.size} selected</span>
+                  <button
+                    onClick={() => bulkSkip(selectedActiveIds)}
+                    className="ml-auto flex items-center gap-1 text-xs px-2.5 py-1 bg-red-600 text-white rounded hover:bg-red-700"
+                  >
+                    <AlertTriangle className="w-3 h-3" />Skip Selected
+                  </button>
+                  <button
+                    onClick={() => setSelectedActiveIds(new Set())}
+                    className="text-xs px-2 py-1 text-red-400 hover:text-red-700"
+                  >
+                    Clear
+                  </button>
+                </div>
+              )}
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewActive.map(rule => (
                   <div key={rule.instance_id} className={`rounded-lg border p-3 text-sm ${
                     rule.is_new_instance ? 'border-purple-200 bg-purple-50/40' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'
                   }`}>
                     {editingRule === rule.instance_id ? (
-                      /* Edit form for new instances */
                       <div className="space-y-2">
                         <input
                           value={editForm.name ?? rule.name}
@@ -1105,8 +1111,8 @@ export default function AgentWorkflow() {
                       <div className="flex items-start justify-between gap-2">
                         <input
                           type="checkbox"
-                          checked={selectedIds.has(rule.instance_id)}
-                          onChange={() => toggleSelected(rule.instance_id)}
+                          checked={selectedActiveIds.has(rule.instance_id)}
+                          onChange={() => toggleActiveSelected(rule.instance_id)}
                           className="mt-1 flex-shrink-0"
                         />
                         <div className="min-w-0 flex-1">
@@ -1151,7 +1157,6 @@ export default function AgentWorkflow() {
                             </button>
                           )}
                           {rule.is_new_instance ? (
-                            /* AI-generated rule: explicit Approve + Reject pair */
                             <>
                               <button
                                 onClick={() => approveRule(rule.instance_id)}
@@ -1175,7 +1180,6 @@ export default function AgentWorkflow() {
                               </button>
                             </>
                           ) : (
-                            /* Existing check: keep the single Skip control */
                             <button
                               onClick={() => rejectRule(rule.instance_id)}
                               className="text-xs px-1.5 py-1 text-red-600 border border-red-200 rounded hover:bg-red-50"
@@ -1195,16 +1199,41 @@ export default function AgentWorkflow() {
               </div>
             </div>
 
-            {/* Skipped Instances column */}
+            {/* Skipped Rules column */}
             <div className="p-5">
-              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />
-                Skipped Rules ({reviewSkipped.length})
-              </h3>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />
+                  Skipped Rules ({reviewSkipped.length})
+                </h3>
+              </div>
+              {selectedSkippedIds.size > 0 && (
+                <div className="mb-2 flex items-center gap-2 bg-green-50 border border-green-200 rounded-lg px-3 py-1.5">
+                  <span className="text-xs font-medium text-green-800">{selectedSkippedIds.size} selected</span>
+                  <button
+                    onClick={() => bulkActivate(selectedSkippedIds)}
+                    className="ml-auto flex items-center gap-1 text-xs px-2.5 py-1 bg-green-600 text-white rounded hover:bg-green-700"
+                  >
+                    <CheckCircle2 className="w-3 h-3" />Activate Selected
+                  </button>
+                  <button
+                    onClick={() => setSelectedSkippedIds(new Set())}
+                    className="text-xs px-2 py-1 text-green-400 hover:text-green-700"
+                  >
+                    Clear
+                  </button>
+                </div>
+              )}
               <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
                 {reviewSkipped.map(rule => (
                   <div key={rule.instance_id} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-3 text-sm opacity-75">
                     <div className="flex items-start justify-between gap-2">
+                      <input
+                        type="checkbox"
+                        checked={selectedSkippedIds.has(rule.instance_id)}
+                        onChange={() => toggleSkippedSelected(rule.instance_id)}
+                        className="mt-1 flex-shrink-0"
+                      />
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
                           {rule.is_new_definition ? (
@@ -1226,7 +1255,7 @@ export default function AgentWorkflow() {
                       <button
                         onClick={() => activateRule(rule.instance_id)}
                         className="flex-shrink-0 text-xs px-1.5 py-1 text-green-600 border border-green-200 rounded hover:bg-green-50"
-                        title="Activate this instance"
+                        title="Activate this rule"
                       >
                         Activate
                       </button>
