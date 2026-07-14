@@ -422,6 +422,11 @@ def list_findings(
     if status:
         where.append("STATUS = %(status)s")
         params["status"] = status
+    else:
+        # 'superseded' findings are stale rows replaced by a newer scan's run —
+        # never surface them by default (they'd inflate totals and clutter the
+        # list). Only shown if explicitly filtered for.
+        where.append("STATUS <> 'superseded'")
     if severity:
         where.append("SEVERITY = %(severity)s")
         params["severity"] = severity
@@ -466,6 +471,58 @@ def update_finding(finding_id: str, **fields: Any) -> SimpleNamespace:
     return get_finding(finding_id)
 
 
+def update_finding_evidence(finding_id: str, evidence: dict) -> None:
+    """Update the EVIDENCE VARIANT column for a finding using PARSE_JSON."""
+    sf_session.execute(
+        """
+        UPDATE FINDINGS
+        SET EVIDENCE = PARSE_JSON(%(evidence)s), UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE ID = %(id)s
+        """,
+        {"id": finding_id, "evidence": _json_or_null(evidence)},
+    )
+
+
+# Open (non-closed) finding statuses — anything not here is considered resolved/
+# closed and won't be superseded or shown under "Detected".
+_OPEN_FINDING_STATUSES = ("detected", "validated", "in_progress")
+
+
+def supersede_open_findings(
+    table_asset_id: str,
+    instance_ids,
+    except_scan_id: str,
+) -> int:
+    """
+    Mark still-open findings from PRIOR scans as 'superseded' when a new scan is
+    about to re-create findings for the same instances. Without this, re-running
+    a workflow on a table leaves stale 'detected' twins from the old scan, so one
+    real issue appears in both Detected and Resolved.
+    """
+    ids = [i for i in (instance_ids or []) if i]
+    if not ids:
+        return 0
+    in_open = ", ".join(f"'{s}'" for s in _OPEN_FINDING_STATUSES)
+    placeholders = ", ".join(f"%(iid{n})s" for n in range(len(ids)))
+    params = {"except_scan": except_scan_id}
+    for n, iid in enumerate(ids):
+        params[f"iid{n}"] = iid
+    affected = sf_session.execute(
+        f"""
+        UPDATE FINDINGS
+        SET STATUS = 'superseded', CLOSED_AT = CURRENT_TIMESTAMP(),
+            UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE INSTANCE_ID IN ({placeholders})
+          AND STATUS IN ({in_open})
+          AND (SCAN_ID IS NULL OR SCAN_ID <> %(except_scan)s)
+        """,
+        params,
+    )
+    if affected:
+        logger.info(f"[storage] Superseded {affected} stale open findings for table asset {table_asset_id}")
+    return affected or 0
+
+
 def findings_with_asset_not_closed() -> list[tuple[SimpleNamespace, SimpleNamespace]]:
     """(finding, asset) pairs for every finding not RESOLVED/CLOSED — dashboard chart."""
     rows = sf_session.query(
@@ -474,7 +531,7 @@ def findings_with_asset_not_closed() -> list[tuple[SimpleNamespace, SimpleNamesp
                a.TABLE_NAME AS A_TABLE_NAME, a.FQN AS A_FQN
         FROM FINDINGS f
         JOIN ASSETS a ON a.ID = f.ASSET_ID
-        WHERE f.STATUS NOT IN ('resolved', 'closed')
+        WHERE f.STATUS NOT IN ('resolved', 'closed', 'superseded')
         """
     )
     result = []
@@ -491,14 +548,16 @@ def findings_with_asset_not_closed() -> list[tuple[SimpleNamespace, SimpleNamesp
 
 
 def findings_summary() -> dict:
-    """total / by_status / by_severity counts — dashboard stats."""
-    total_rows = sf_session.query("SELECT COUNT(*) AS CNT FROM FINDINGS")
+    """total / by_status / by_severity counts — dashboard stats. Excludes
+    'superseded' (stale rows replaced by a newer scan) so counts reflect real
+    current findings, not re-scan duplicates."""
+    total_rows = sf_session.query("SELECT COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded'")
     total = total_rows[0]["CNT"] if total_rows else 0
 
-    status_rows = sf_session.query("SELECT STATUS, COUNT(*) AS CNT FROM FINDINGS GROUP BY STATUS")
+    status_rows = sf_session.query("SELECT STATUS, COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded' GROUP BY STATUS")
     by_status = {r["STATUS"]: r["CNT"] for r in status_rows}
 
-    severity_rows = sf_session.query("SELECT SEVERITY, COUNT(*) AS CNT FROM FINDINGS GROUP BY SEVERITY")
+    severity_rows = sf_session.query("SELECT SEVERITY, COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded' GROUP BY SEVERITY")
     by_severity = {r["SEVERITY"]: r["CNT"] for r in severity_rows}
 
     return {"total": total, "by_status": by_status, "by_severity": by_severity}
@@ -1504,7 +1563,7 @@ def create_cache_entry(
             "impact": impact,
         },
     )
-    return get_cache_entry(entry_id)
+    return get_cache_entry(cache_key)
 
 
 def increment_cache_hit(cache_key: str) -> None:
@@ -1684,6 +1743,10 @@ def _workflow_from_row(row: dict) -> SimpleNamespace:
         created_by=row.get("CREATED_BY"),
         created_at=row["CREATED_AT"],
         updated_at=row["UPDATED_AT"],
+        origin_scope=row.get("ORIGIN_SCOPE"),
+        origin_database=row.get("ORIGIN_DATABASE"),
+        origin_schema=row.get("ORIGIN_SCHEMA"),
+        origin_table=row.get("ORIGIN_TABLE"),
     )
 
 
@@ -1692,12 +1755,19 @@ def create_workflow(
     rule_patterns: list,
     description: str = "",
     created_by: str = "",
+    origin_scope: Optional[str] = None,
+    origin_database: Optional[str] = None,
+    origin_schema: Optional[str] = None,
+    origin_table: Optional[str] = None,
 ) -> SimpleNamespace:
     wf_id = _new_id()
     sf_session.execute(
         """
-        INSERT INTO WORKFLOW_TEMPLATES (ID, LABEL, DESCRIPTION, RULE_PATTERNS, CREATED_BY)
-        SELECT %(id)s, %(label)s, %(description)s, PARSE_JSON(%(patterns)s), %(created_by)s
+        INSERT INTO WORKFLOW_TEMPLATES
+            (ID, LABEL, DESCRIPTION, RULE_PATTERNS, CREATED_BY,
+             ORIGIN_SCOPE, ORIGIN_DATABASE, ORIGIN_SCHEMA, ORIGIN_TABLE)
+        SELECT %(id)s, %(label)s, %(description)s, PARSE_JSON(%(patterns)s), %(created_by)s,
+               %(origin_scope)s, %(origin_database)s, %(origin_schema)s, %(origin_table)s
         """,
         {
             "id": wf_id,
@@ -1705,6 +1775,10 @@ def create_workflow(
             "description": description,
             "patterns": _json_or_null(rule_patterns),
             "created_by": created_by,
+            "origin_scope": origin_scope,
+            "origin_database": origin_database,
+            "origin_schema": origin_schema,
+            "origin_table": origin_table,
         },
     )
     return get_workflow(wf_id)
@@ -1753,6 +1827,114 @@ def delete_workflow(workflow_id: str) -> None:
     sf_session.execute(
         "DELETE FROM WORKFLOW_TEMPLATES WHERE ID = %(id)s", {"id": workflow_id}
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SCHEDULES
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SCHEDULE_COLS = {
+    "name", "enabled", "connection_id", "scope", "database_name", "schema_name",
+    "table_name", "workflow_template_id", "cadence", "time_of_day", "day_of_week",
+    "day_of_month", "month_of_year", "interval_value", "interval_unit",
+    "next_run_at", "last_run_at", "last_batch_id", "last_status", "last_error",
+    "created_by",
+}
+
+
+def _schedule_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        name=row["NAME"],
+        enabled=bool(row["ENABLED"]),
+        connection_id=row.get("CONNECTION_ID"),
+        scope=row["SCOPE"],
+        database_name=row.get("DATABASE_NAME"),
+        schema_name=row.get("SCHEMA_NAME"),
+        table_name=row.get("TABLE_NAME"),
+        workflow_template_id=row.get("WORKFLOW_TEMPLATE_ID"),
+        cadence=row["CADENCE"],
+        time_of_day=row.get("TIME_OF_DAY"),
+        day_of_week=row.get("DAY_OF_WEEK"),
+        day_of_month=row.get("DAY_OF_MONTH"),
+        month_of_year=row.get("MONTH_OF_YEAR"),
+        interval_value=row.get("INTERVAL_VALUE"),
+        interval_unit=row.get("INTERVAL_UNIT"),
+        next_run_at=row.get("NEXT_RUN_AT"),
+        last_run_at=row.get("LAST_RUN_AT"),
+        last_batch_id=row.get("LAST_BATCH_ID"),
+        last_status=row.get("LAST_STATUS"),
+        last_error=row.get("LAST_ERROR"),
+        created_at=row.get("CREATED_AT"),
+        created_by=row.get("CREATED_BY"),
+    )
+
+
+def create_schedule(**fields: Any) -> SimpleNamespace:
+    schedule_id = fields.pop("id", None) or _new_id()
+    cols = {k: v for k, v in fields.items() if k in _SCHEDULE_COLS}
+    cols["id"] = schedule_id
+    col_names = ", ".join(k.upper() for k in cols)
+    placeholders = ", ".join(f"%({k})s" for k in cols)
+    sf_session.execute(
+        f"INSERT INTO SCHEDULES ({col_names}) VALUES ({placeholders})", cols
+    )
+    return get_schedule(schedule_id)
+
+
+def get_schedule(schedule_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM SCHEDULES WHERE ID = %(id)s", {"id": schedule_id})
+    return _schedule_from_row(rows[0]) if rows else None
+
+
+def list_schedules(enabled_only: bool = False) -> list[SimpleNamespace]:
+    where = "WHERE ENABLED = TRUE" if enabled_only else ""
+    rows = sf_session.query(f"SELECT * FROM SCHEDULES {where} ORDER BY CREATED_AT DESC")
+    return [_schedule_from_row(r) for r in rows]
+
+
+def update_schedule(schedule_id: str, **fields: Any) -> Optional[SimpleNamespace]:
+    sets, params = [], {"id": schedule_id}
+    for key, value in fields.items():
+        if key not in _SCHEDULE_COLS:
+            continue
+        sets.append(f"{key.upper()} = %({key})s")
+        params[key] = value
+    if sets:
+        sf_session.execute(
+            f"UPDATE SCHEDULES SET {', '.join(sets)} WHERE ID = %(id)s", params
+        )
+    return get_schedule(schedule_id)
+
+
+def delete_schedule(schedule_id: str) -> None:
+    sf_session.execute("DELETE FROM SCHEDULES WHERE ID = %(id)s", {"id": schedule_id})
+
+
+def list_due_schedules(now: Any) -> list[SimpleNamespace]:
+    rows = sf_session.query(
+        """
+        SELECT * FROM SCHEDULES
+        WHERE ENABLED = TRUE
+          AND NEXT_RUN_AT IS NOT NULL
+          AND NEXT_RUN_AT <= %(now)s
+        ORDER BY NEXT_RUN_AT ASC
+        """,
+        {"now": now},
+    )
+    return [_schedule_from_row(r) for r in rows]
+
+
+def claim_schedule(schedule_id: str, expected_next_run_at: Any, new_next_run_at: Any) -> bool:
+    rowcount = sf_session.execute(
+        """
+        UPDATE SCHEDULES
+        SET NEXT_RUN_AT = %(new_next)s, LAST_RUN_AT = CURRENT_TIMESTAMP()
+        WHERE ID = %(id)s AND NEXT_RUN_AT = %(expected)s
+        """,
+        {"id": schedule_id, "new_next": new_next_run_at, "expected": expected_next_run_at},
+    )
+    return (rowcount or 0) > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1814,7 +1996,19 @@ def create_intelligence_log(
             "model_used": model_used,
         },
     )
-    return get_intelligence_log(log_id)
+    # Return a minimal namespace with just the id — avoids INSERT→SELECT
+    # timing issues where Snowflake hasn't made the row visible yet.
+    result = get_intelligence_log(log_id)
+    if result:
+        return result
+    ns = SimpleNamespace(
+        id=log_id, run_id=run_id, table_fqn=table_fqn,
+        table_type=table_type, table_type_confidence=table_type_confidence,
+        thinking=thinking, proposals_count=proposals_count,
+        suppressed_count=suppressed_count, approved_count=0, rejected_count=0,
+        model_used=model_used, signals_used=signals_used,
+    )
+    return ns
 
 
 def get_intelligence_log(log_id: str) -> Optional[SimpleNamespace]:
@@ -1830,6 +2024,74 @@ def get_intelligence_log_for_run(run_id: str) -> Optional[SimpleNamespace]:
         {"run_id": run_id},
     )
     return _intelligence_log_from_row(rows[0]) if rows else None
+
+
+def log_critique_drop(
+    run_id: str,
+    table_fqn: str,
+    proposal: dict,
+    scores: dict,
+    mean_score: float,
+    drop_reason: str,
+) -> None:
+    """Persist a self-critique drop so future runs can see the shapes that
+    keep getting cut and why. Best-effort — never blocks the pipeline."""
+    try:
+        proposal_name = (
+            (proposal.get("new_definition") or {}).get("name")
+            or proposal.get("definition_id")
+            or ""
+        )[:500]
+        sf_session.execute(
+            """
+            INSERT INTO RULE_CRITIQUE_DROPS
+                (ID, RUN_ID, TABLE_FQN, PROPOSAL_NAME, DEFINITION_ID,
+                 COLUMN_NAME, TEMPLATE_SHAPE, EVIDENCE_SCORE, IMPACT_SCORE,
+                 APPROVAL_SCORE, MEAN_SCORE, DROP_REASON, PROPOSAL_JSON)
+            SELECT %(id)s, %(run_id)s, %(table_fqn)s, %(proposal_name)s,
+                   %(definition_id)s, %(column_name)s, %(template_shape)s,
+                   %(evidence)s, %(impact)s, %(approval)s, %(mean)s,
+                   %(reason)s, PARSE_JSON(%(proposal_json)s)
+            """,
+            {
+                "id": _new_id(),
+                "run_id": run_id,
+                "table_fqn": table_fqn,
+                "proposal_name": proposal_name,
+                "definition_id": (proposal.get("definition_id") or "")[:500],
+                "column_name": (proposal.get("column_name") or "")[:500],
+                "template_shape": (proposal.get("template_shape") or "")[:100],
+                "evidence": scores.get("evidence"),
+                "impact": scores.get("impact"),
+                "approval": scores.get("approval"),
+                "mean": mean_score,
+                "reason": (drop_reason or "")[:2000],
+                "proposal_json": _json_or_null(proposal),
+            },
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[storage] log_critique_drop failed: {e}")
+
+
+def get_intelligence_logs_for_table(table_fqn: str, limit: int = 3) -> list:
+    """Most recent intelligence logs for THIS exact table — used by
+    _format_past_context to inject same-table history into the prompt so
+    Claude can see what it decided last time on the same target instead of
+    silently re-deriving everything."""
+    try:
+        rows = sf_session.query(
+            """
+            SELECT * FROM RULE_INTELLIGENCE_LOGS
+            WHERE TABLE_FQN = %(fqn)s
+            ORDER BY CREATED_AT DESC
+            LIMIT %(limit)s
+            """,
+            {"fqn": table_fqn, "limit": limit},
+        )
+        return [_intelligence_log_from_row(r) for r in rows]
+    except Exception:
+        return []
 
 
 def append_intelligence_log_lessons(

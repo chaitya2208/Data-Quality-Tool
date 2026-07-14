@@ -31,12 +31,10 @@ from typing import List, Optional, Dict, Any, Set
 from app.services import storage
 from app.services.fingerprint import compute_fingerprint
 from app.services.snowflake_session import session as sf_session
-from app.services.claude_client import ask_claude, ask_claude_with_thinking, ask_claude_agentic
+from app.services.claude_client import ask_claude, ask_claude_agentic
 from app.services.sql_validation import validate_sql
 from app.services.rule_sql_templates import TEMPLATE_SHAPES, render_template
 from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
-from app.services.agents.profiler_agent import DeterministicProfilerAgent
-
 logger = logging.getLogger(__name__)
 
 # Server-side statement timeout (seconds) for running a candidate check's SQL
@@ -219,6 +217,7 @@ Respond with this JSON:
   "table_type": "fact|dimension|staging|config|audit|reference|unknown",
   "table_type_confidence": <0-100>,
   "table_type_reason": "one sentence",
+  "reasoning": "your full first-person deliberation for this analysis — what signals you examined and what each told you, why each proposal is justified by the specific stats/signals, what you considered but ruled out and why, and any caveats. Continuous prose, no headers/bullets. Every sentence must cite a specific column/stat/signal — no preamble, no restating fields already in this JSON, no closing summary. Keep it dense; skip filler.",
   "definitions_evaluated": {{
     "<definition_id>": {{
       "keep_running": true/false,
@@ -393,7 +392,7 @@ class RuleIntelligenceAgent:
             past_context=past_context_text,
         )
 
-        raw, thinking, tool_calls = self._call_model(prompt, table_asset)
+        raw, tool_calls = self._call_model(prompt, table_asset)
         parsed = self._extract_json(raw)
 
         # A parse failure (malformed/truncated response) is NOT the same as a
@@ -417,7 +416,7 @@ class RuleIntelligenceAgent:
                 "Respond again with ONLY a single valid JSON object matching the "
                 "schema above — no markdown fences, no prose before or after."
             )
-            raw, _retry_thinking, _retry_tools = self._call_model(repair_prompt, table_asset)
+            raw, _retry_tools = self._call_model(repair_prompt, table_asset)
             parsed = self._extract_json(raw)
 
         if not parsed:
@@ -438,6 +437,7 @@ class RuleIntelligenceAgent:
                 proposals=parsed["new_instances"],
                 table_asset=table_asset,
                 column_stats_text=column_stats_text,
+                run_id=run_id,
             )
 
         classification = {
@@ -466,9 +466,9 @@ class RuleIntelligenceAgent:
             log = storage.create_intelligence_log(
                 run_id=run_id,
                 table_fqn=table_asset.fqn,
-                table_type=classification["table_type"],
-                table_type_confidence=classification["table_type_confidence"],
-                thinking=thinking,
+                table_type=classification["table_type"] or "unknown",
+                table_type_confidence=int(classification["table_type_confidence"] or 0),
+                thinking=parsed.get("reasoning") or "",
                 signals_used=signals_used,
                 proposals_count=len(parsed.get("new_instances", [])),
                 suppressed_count=len(suppressed),
@@ -476,7 +476,8 @@ class RuleIntelligenceAgent:
             intelligence_log_id = log.id
             logger.info(f"[RuleIntelligence] Intelligence log saved: {intelligence_log_id}")
         except Exception as e:
-            logger.warning(f"[RuleIntelligence] Could not save intelligence log: {e}")
+            import traceback
+            logger.warning(f"[RuleIntelligence] Could not save intelligence log: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
         # Normalize: fill missing decisions with default (keep_running=True)
         for inst in existing_instances:
@@ -528,6 +529,7 @@ class RuleIntelligenceAgent:
             "signals_missed": signals_missed,
             "parse_failed": parse_failed,
             "intelligence_log_id": intelligence_log_id,
+            "tool_calls": tool_calls,
         }
 
     # ── Existing-state gathering ──────────────────────────────────────────
@@ -893,29 +895,60 @@ class RuleIntelligenceAgent:
         if definition_id:
             definition = storage.get_definition(definition_id)
             if not definition:
-                logger.warning(f"[RuleIntelligence] Claude referenced unknown definition_id={definition_id}")
-                return None
-        elif template_shape and storage.get_definition_by_template_shape(template_shape):
-            # Deterministic backstop — checked BEFORE the fuzzy-similarity
-            # path so it works even for a candidate Claude never attaches a
-            # definition_id to. A canonical definition for this shape already
-            # exists system-wide; always reuse it instead of letting a new
-            # per-table/per-column duplicate spawn. The candidate's own
-            # name/description (if any) is discarded — its business-specific
-            # rationale is preserved separately via RULE_INSTANCES.RATIONALE.
-            definition = storage.get_definition_by_template_shape(template_shape)
-        elif new_definition_data:
-            # Check if this "new" concept actually matches an existing one by
-            # name/description similarity — Claude sometimes re-describes a
-            # concept that already has a definition under a different id.
-            matched = self._find_similar_definition(new_definition_data, existing_definitions)
-            if matched:
-                definition = matched
+                # Claude referenced a definition that doesn't exist — instead
+                # of dropping the candidate, promote it: try the template_shape
+                # canonical, then similarity-match new_definition_data, then
+                # synthesize a new_definition from rationale so the intent
+                # survives to the reviewer. Same fall-through paths the "no
+                # definition_id" branches below already use.
+                logger.info(
+                    f"[RuleIntelligence] Unknown definition_id={definition_id} — "
+                    "promoting candidate via template_shape/similarity/synthesis"
+                )
+                definition_id = None
+
+        if not definition and not definition_id:
+            if template_shape and storage.get_definition_by_template_shape(template_shape):
+                # Deterministic backstop — checked BEFORE the fuzzy-similarity
+                # path so it works even for a candidate Claude never attaches a
+                # definition_id to. A canonical definition for this shape already
+                # exists system-wide; always reuse it instead of letting a new
+                # per-table/per-column duplicate spawn. The candidate's own
+                # name/description (if any) is discarded — its business-specific
+                # rationale is preserved separately via RULE_INSTANCES.RATIONALE.
+                definition = storage.get_definition_by_template_shape(template_shape)
+            elif new_definition_data:
+                # Check if this "new" concept actually matches an existing one by
+                # name/description similarity — Claude sometimes re-describes a
+                # concept that already has a definition under a different id.
+                matched = self._find_similar_definition(new_definition_data, existing_definitions)
+                if matched:
+                    definition = matched
+                else:
+                    definition = None  # not persisted yet — staged below
+                    is_new_definition = True
+            elif candidate.get("rationale"):
+                # No definition_id, no template_shape-backed canonical, no
+                # explicit new_definition — but rationale exists. Synthesize a
+                # new_definition from the rationale so the reviewer sees a
+                # named concept instead of us silently discarding the proposal.
+                # Similarity-match first: rationale often paraphrases an
+                # existing definition and we don't want library bloat.
+                rationale_text = candidate.get("rationale", "").strip()
+                synthesized = {
+                    "name": rationale_text[:60].rstrip(".,;:") or "AI-proposed check",
+                    "description": rationale_text[:500],
+                    "category": "data_quality",
+                }
+                matched = self._find_similar_definition(synthesized, existing_definitions)
+                if matched:
+                    definition = matched
+                else:
+                    new_definition_data = synthesized
+                    candidate["new_definition"] = synthesized  # so downstream persist path sees it
+                    is_new_definition = True
             else:
-                definition = None  # not persisted yet — staged below
-                is_new_definition = True
-        else:
-            return None
+                return None
 
         severity = candidate.get("severity") or (definition.default_severity if definition else "medium")
         if severity not in VALID_SEVERITIES:
@@ -1066,7 +1099,8 @@ class RuleIntelligenceAgent:
         proposals: list,
         table_asset: Any,
         column_stats_text: str,
-        min_score: int = 3,
+        run_id: str,
+        min_score: float = 2.0,
     ) -> list:
         """Second-pass call: Claude reads its own proposals and scores each
         1-5 on three dimensions:
@@ -1125,9 +1159,21 @@ class RuleIntelligenceAgent:
                 reason = score_entry.get("drop_reason") or f"mean score {mean:.1f} < {min_score}"
                 logger.info(
                     f"[RuleIntelligence] Self-critique dropped proposal[{i}] "
-                    f"'{proposal.get('new_definition', {}).get('name') or proposal.get('definition_id', '?')}' "
+                    f"'{(proposal.get('new_definition') or {}).get('name') or proposal.get('definition_id', '?')}' "
                     f"— {reason} (evidence={score_entry.get('evidence')}, "
                     f"impact={score_entry.get('impact')}, approval={score_entry.get('approval')})"
+                )
+                storage.log_critique_drop(
+                    run_id=run_id,
+                    table_fqn=table_asset.fqn,
+                    proposal=proposal,
+                    scores={
+                        "evidence": score_entry.get("evidence"),
+                        "impact":   score_entry.get("impact"),
+                        "approval": score_entry.get("approval"),
+                    },
+                    mean_score=mean,
+                    drop_reason=reason,
                 )
 
         dropped = len(proposals) - len(kept)
@@ -1142,13 +1188,36 @@ class RuleIntelligenceAgent:
         intelligence logs and format them as grounded guidance.
 
         Injection order (most actionable first):
-          1. Synthesised feedback memo — cross-run patterns Claude distilled
+          1. Same-table history — what YOU decided on THIS exact table before.
+          2. Synthesised feedback memo — cross-run patterns Claude distilled
              from many human decisions, e.g. "always approve non-negative on
              AMOUNT columns; always reject column-comment checks here."
-          2. Raw approve/reject lessons — individual human decisions.
-          3. Past thinking blobs from similar tables.
+          3. Raw approve/reject lessons — individual human decisions.
+          4. Past thinking blobs from similar tables.
         """
         parts = []
+
+        # ── Same-table history (highest signal — your own past decisions) ─
+        try:
+            same_table_logs = storage.get_intelligence_logs_for_table(table_asset.fqn, limit=3)
+        except Exception:
+            same_table_logs = []
+
+        if same_table_logs:
+            latest = same_table_logs[0]
+            older = same_table_logs[1:]
+            lines = [
+                "  YOUR LAST RUN ON THIS EXACT TABLE:",
+                f"    table_type={latest.table_type} (confidence={latest.table_type_confidence})  "
+                f"proposals={latest.proposals_count}  "
+                f"approved={latest.approved_count}  rejected={latest.rejected_count}  "
+                f"at={latest.created_at}",
+            ]
+            if latest.thinking:
+                lines.append(f"    Prior reasoning: {latest.thinking[:800]}")
+            if older:
+                lines.append(f"  Earlier runs on this table: {len(older)} more log(s) in RULE_INTELLIGENCE_LOGS")
+            parts.append("\n".join(lines))
 
         # ── Synthesised feedback memo (highest signal) ───────────────────
         try:
@@ -1372,12 +1441,12 @@ class RuleIntelligenceAgent:
 
     def _call_model(self, prompt: str, table_asset: Any) -> tuple:
         """
-        Returns (text, thinking, tool_calls).
+        Returns (text, tool_calls).
 
-        Primary path: agentic loop with adaptive thinking + get_sample_rows tool.
-        Bedrock redacts thinking block content even when adaptive thinking is
-        enabled, so we make a second call after the main one to reconstruct the
-        reasoning explicitly — see _generate_thinking().
+        Agentic loop with adaptive thinking + get_sample_rows tool. Reasoning
+        is emitted as a `reasoning` field in the JSON response (see
+        USER_PROMPT_TEMPLATE) — no separate reconstruction call, since Bedrock
+        redacts the actual thinking block content anyway.
         Falls back to ask_claude (no tools) if the agentic call fails.
         """
         def tool_executor(name: str, inputs: dict) -> str:
@@ -1406,60 +1475,7 @@ class RuleIntelligenceAgent:
                 logger.error(f"[RuleIntelligence] Bedrock fallback also failed: {e2}")
                 raise
 
-        thinking = self._generate_thinking(prompt, text)
-        return text, thinking, tool_calls
-
-    _THINKING_SYSTEM = (
-        "You are a senior data quality architect. You have just completed a "
-        "rule intelligence analysis for a Snowflake table. Write out your full "
-        "reasoning process in depth — not a summary or bullet points, but your "
-        "actual chain of thought in continuous prose: what signals you examined "
-        "and what each told you, the trade-offs you weighed, why each rule "
-        "proposal is justified by the specific data characteristics, what you "
-        "considered but ruled out and why, and any caveats or uncertainties. "
-        "Write entirely in first person. Be deeply specific to the actual "
-        "statistics and signals in the analysis — avoid generic advice."
-    )
-
-    def _generate_thinking(self, original_prompt: str, model_output: str) -> str:
-        """
-        Ask Claude to write out its full reasoning chain for the analysis it
-        just completed. Bedrock doesn't expose thinking block content, so we
-        reconstruct it from the prompt + output as a second call.
-        Returns "" on any failure so the pipeline is never blocked.
-        """
-        thinking_prompt = (
-            f"You were given this data quality analysis task:\n\n"
-            f"---\n{original_prompt}\n---\n\n"
-            f"You produced this output:\n\n"
-            f"---\n{model_output}\n---\n\n"
-            f"Now write your complete, detailed reasoning process for how you "
-            f"arrived at that output. You must cover every significant decision:\n"
-            f"- How you classified the table type, which signals drove that "
-            f"conclusion, and what alternative classifications you considered\n"
-            f"- For each definition you evaluated: why it was or wasn't relevant "
-            f"to this table's specific business purpose and data characteristics\n"
-            f"- Which column statistics stood out and exactly how they shaped "
-            f"your proposals (reference actual numbers from the stats)\n"
-            f"- For every proposed rule instance: the precise reasoning — why "
-            f"this column, why this threshold, why this severity, what failure "
-            f"mode it guards against, and whether current data already violates it\n"
-            f"- What you considered proposing but decided against, and why those "
-            f"were weaker than what you kept\n"
-            f"Write as continuous prose — no headers, no bullet points. "
-            f"Be specific to this table, not generic."
-        )
-        try:
-            thinking = ask_claude(
-                thinking_prompt,
-                system=self._THINKING_SYSTEM,
-                max_tokens=4000,
-            )
-            logger.info(f"[RuleIntelligence] Generated thinking ({len(thinking)} chars)")
-            return thinking
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] Thinking generation failed ({e}) — continuing without")
-            return ""
+        return text, tool_calls
 
     @staticmethod
     def _extract_json(text: str) -> dict:

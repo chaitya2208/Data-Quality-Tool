@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { findingsApi, aiApi } from '../api/client'
 import {
   Sparkles, CheckCircle, XCircle, Loader2, Copy,
-  AlertTriangle, ArrowLeft, Check, Server, ShieldCheck, ChevronDown
+  AlertTriangle, ArrowLeft, Check, Server, ShieldCheck, ChevronDown, RefreshCw
 } from 'lucide-react'
 
 export default function AIFix() {
@@ -21,6 +21,9 @@ export default function AIFix() {
   const [approvedFixes, setApprovedFixes] = useState<string[]>([])
   const [executedFixes, setExecutedFixes] = useState<string[]>([])
   const [copiedSQL, setCopiedSQL] = useState<string | null>(null)
+  // Per-finding edited SQL. Keyed by finding id; when a key exists it overrides
+  // the AI's recommended sql_query so the user can tweak before executing.
+  const [editedSql, setEditedSql] = useState<Record<string, string>>({})
 
   // Single call — served from backend startup cache, instant
   const { data: sfContext, isLoading: loadingContext } = useQuery({
@@ -67,9 +70,25 @@ export default function AIFix() {
 
   const isLoading = loadingFindings || loadingRecommendations
 
+  // Fast source-type lookup — resolves immediately from scan/connection data,
+  // no Claude call. Drives whether to show Snowflake role/warehouse or the
+  // Postgres connection pill before recommendations even load.
+  const { data: sourceTypeData } = useQuery({
+    queryKey: ['ai-source-type', findingIds],
+    queryFn: () => aiApi.getSourceType(findingIds).then(r => r.data),
+    enabled: findingIds.length > 0,
+    staleTime: Infinity,
+  })
+
+  const isPostgres     = sourceTypeData?.source_type === 'postgres'
+  const connectionName = sourceTypeData?.connection_name ?? recommendations?.[0]?.connection_name ?? ''
+  const connectionUser = sourceTypeData?.connection_user ?? recommendations?.[0]?.connection_user ?? ''
+
   const executeMutation = useMutation({
     mutationFn: ({ findingId, sqlQuery }: { findingId: string; sqlQuery: string }) =>
-      aiApi.executeSQL(findingId, sqlQuery, effectiveWarehouse, effectiveRole),
+      isPostgres
+        ? aiApi.executeSQL(findingId, sqlQuery)
+        : aiApi.executeSQL(findingId, sqlQuery, effectiveWarehouse, effectiveRole),
     onSuccess: (_, variables) => {
       setExecutedFixes(prev => [...prev, variables.findingId])
       queryClient.invalidateQueries({ queryKey: ['findings'] })
@@ -92,7 +111,8 @@ export default function AIFix() {
     else navigate(`/ai-fix?findings=${remaining.join(',')}&return_to=${encodeURIComponent(returnTo)}`)
   }
 
-  const canExecute = !!effectiveWarehouse && !!effectiveRole
+  // Postgres needs no Snowflake context; Snowflake needs a role + warehouse.
+  const canExecute = isPostgres || (!!effectiveWarehouse && !!effectiveRole)
 
   if (loadingFindings) {
     return (
@@ -134,7 +154,8 @@ export default function AIFix() {
             </p>
           </div>
 
-          {/* Role + Warehouse dropdowns */}
+          {/* Role + Warehouse dropdowns — Snowflake only, hidden until source type resolves */}
+          {sourceTypeData && !isPostgres && (
           <div className="flex flex-wrap items-end gap-3">
             {/* Role dropdown */}
             <div className="flex flex-col gap-1">
@@ -190,11 +211,25 @@ export default function AIFix() {
               </div>
             </div>
           </div>
+          )}
+
+          {/* Postgres/RDS: show which connection fixes run on */}
+          {isPostgres && (
+            <div className="flex flex-col gap-1 items-end">
+              <label className="text-xs font-medium text-gray-500 dark:text-gray-300 flex items-center gap-1">
+                <Server className="w-3 h-3 text-primary-500" /> Runs on
+              </label>
+              <span className="inline-flex items-center gap-1.5 px-3 py-2 border-2 border-primary-200 dark:border-primary-500/40 rounded-lg bg-white dark:bg-gray-800 text-sm font-medium text-gray-900 dark:text-gray-100">
+                {connectionName || 'Postgres connection'}
+                {connectionUser && <span className="text-gray-400 dark:text-gray-400">· {connectionUser}</span>}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Active context pill */}
-      {canExecute && (
+      {/* Active context pill — Snowflake role+warehouse */}
+      {sourceTypeData && !isPostgres && canExecute && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <span className="flex items-center gap-1.5 bg-purple-50 border border-purple-200 text-purple-800 px-3 py-1.5 rounded-full font-medium">
             <ShieldCheck className="w-3.5 h-3.5" /> {effectiveRole}
@@ -210,8 +245,19 @@ export default function AIFix() {
         </div>
       )}
 
-      {!canExecute && !loadingWarehouses && !loadingRoles && (
-        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-sm text-yellow-800">
+      {/* Postgres/RDS context pill */}
+      {isPostgres && (
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="flex items-center gap-1.5 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-500/40 text-blue-800 dark:text-blue-300 px-3 py-1.5 rounded-full font-medium">
+            <Server className="w-3.5 h-3.5" /> {connectionName || 'Postgres/RDS'}
+            {connectionUser && <span className="opacity-80">· {connectionUser}</span>}
+          </span>
+          <span className="text-gray-400 dark:text-gray-400 italic hidden sm:inline">— fixes run on this connection</span>
+        </div>
+      )}
+
+      {sourceTypeData && !isPostgres && !canExecute && !loadingWarehouses && !loadingRoles && (
+        <div className="bg-yellow-50 dark:bg-yellow-950/40 border border-yellow-200 dark:border-yellow-500/40 rounded-lg p-3 text-sm text-yellow-800 dark:text-yellow-300">
           ⚠️ Could not load warehouse or role from Snowflake. Check your connection.
         </div>
       )}
@@ -219,10 +265,13 @@ export default function AIFix() {
       {/* Info banner */}
       <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 flex items-start gap-3">
         <Sparkles className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
-        <p className="text-sm text-blue-800">
+        <p className="text-sm text-blue-800 dark:text-blue-300">
           <span className="font-semibold">Review each fix carefully before approving.</span>{' '}
-          The AI generates SQL based on the detected issue. Once you execute, the fix runs in Snowflake
-          under the role and warehouse selected above, and the finding is marked resolved.
+          The AI generates SQL based on the detected issue. Once you execute, the fix runs{' '}
+          {isPostgres
+            ? <>on <span className="font-medium">{connectionName || 'the Postgres connection'}</span>{connectionUser ? <> as <span className="font-medium">{connectionUser}</span></> : null}</>
+            : <>in Snowflake under the role and warehouse selected above</>}
+          , and the finding is marked resolved.
         </p>
       </div>
 
@@ -258,7 +307,9 @@ export default function AIFix() {
           const isApproved = approvedFixes.includes(finding.id)
           const isExecuting = executeMutation.isPending && executeMutation.variables?.findingId === finding.id
           const isExecuted = executedFixes.includes(finding.id)
-          const sql = rec?.sql_query ?? ''
+          const originalSql = rec?.sql_query ?? ''
+          const sql = editedSql[finding.id] ?? originalSql
+          const isEdited = editedSql[finding.id] !== undefined && editedSql[finding.id] !== originalSql
 
           return (
             <div key={finding.id}
@@ -343,21 +394,47 @@ export default function AIFix() {
                       </div>
                     </div>
 
-                    {/* SQL block */}
+                    {/* SQL block — editable in place */}
                     <div>
                       <div className="flex items-center justify-between mb-1.5">
-                        <span className="text-sm font-medium text-gray-700 dark:text-gray-200">Suggested SQL Fix</span>
-                        <button onClick={() => handleCopySQL(sql)}
-                          className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
-                          {copiedSQL === sql
-                            ? <><Check className="w-3.5 h-3.5 text-green-500" /><span className="text-green-600">Copied!</span></>
-                            : <><Copy className="w-3.5 h-3.5" />Copy</>
-                          }
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium text-gray-700 dark:text-gray-200">Suggested SQL Fix</span>
+                          {isEdited && (
+                            <span className="text-xs bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-700 text-amber-700 dark:text-amber-300 px-1.5 py-0.5 rounded-full font-medium">
+                              edited
+                            </span>
+                          )}
+                          {!isExecuted && (
+                            <span className="text-xs text-gray-400 dark:text-gray-500">— editable</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {isEdited && !isExecuted && (
+                            <button
+                              onClick={() => setEditedSql(p => { const n = { ...p }; delete n[finding.id]; return n })}
+                              className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                              title="Revert to the AI-recommended SQL"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />Reset
+                            </button>
+                          )}
+                          <button onClick={() => handleCopySQL(sql)}
+                            className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-400 hover:text-gray-700 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
+                            {copiedSQL === sql
+                              ? <><Check className="w-3.5 h-3.5 text-green-500" /><span className="text-green-600">Copied!</span></>
+                              : <><Copy className="w-3.5 h-3.5" />Copy</>
+                            }
+                          </button>
+                        </div>
                       </div>
-                      <pre className="bg-gray-900 text-green-400 p-4 rounded-lg text-sm overflow-x-auto font-mono leading-relaxed whitespace-pre-wrap">
-{sql}
-                      </pre>
+                      <textarea
+                        value={sql}
+                        onChange={e => setEditedSql(p => ({ ...p, [finding.id]: e.target.value }))}
+                        readOnly={isExecuted}
+                        spellCheck={false}
+                        rows={Math.min(Math.max(sql.split('\n').length, 3), 18)}
+                        className="w-full bg-gray-900 text-green-400 p-4 rounded-lg text-sm font-mono leading-relaxed resize-y border border-gray-700 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 disabled:opacity-70"
+                      />
                     </div>
 
                     {/* Impact */}
@@ -399,19 +476,21 @@ export default function AIFix() {
                         className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700 transition-colors"
                       >
                         <Server className="w-4 h-4" />
-                        Execute as <span className="font-bold">{effectiveRole}</span> on <span className="font-bold">{effectiveWarehouse}</span>
+                        {isPostgres
+                          ? <>Execute Fix{connectionName ? <> on <span className="font-bold">{connectionName}</span></> : null}</>
+                          : <>Execute as <span className="font-bold">{effectiveRole}</span> on <span className="font-bold">{effectiveWarehouse}</span></>}
                       </button>
                     )}
 
                     {isExecuting && (
-                      <div className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-primary-50 text-primary-700 font-medium rounded-lg">
+                      <div className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-primary-50 dark:bg-primary-900/40 text-primary-700 dark:text-primary-300 font-medium rounded-lg">
                         <Loader2 className="w-4 h-4 animate-spin" />
-                        Running on {effectiveWarehouse}...
+                        {isPostgres ? `Running on ${connectionName || 'Postgres'}...` : `Running on ${effectiveWarehouse}...`}
                       </div>
                     )}
 
                     {isExecuted && (
-                      <div className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-green-50 text-green-800 font-medium rounded-lg">
+                      <div className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-green-50 dark:bg-green-950/40 text-green-800 dark:text-green-300 font-medium rounded-lg">
                         <CheckCircle className="w-4 h-4" />
                         Executed — finding resolved
                       </div>

@@ -145,22 +145,30 @@ class FindingsExplanationAgent:
             logger.debug(f"[FindingsExplanation] Parse failed for {instance_id}: {e}")
             return
 
-        # Store explanation on every finding for this instance
-        explanation_note = (
-            f"[AI Analysis] Root cause: {explanation.get('root_cause', '')} | "
-            f"Scope: {explanation.get('affected_scope', '')} | "
-            f"Fix: {explanation.get('fix_action', '')} | "
-            f"Confidence: {explanation.get('confidence', '')}"
-        )
+        # Parse sample_text into structured rows for the UI
+        sample_rows = self._parse_sample_text(sample_text)
+
+        # Store structured evidence on every finding for this instance.
+        # evidence holds the AI analysis + sample rows so the UI can render
+        # them properly. resolution_notes is left for human notes only.
+        evidence_payload = {
+            "ai_explanation": {
+                "root_cause":      explanation.get("root_cause", ""),
+                "affected_scope":  explanation.get("affected_scope", ""),
+                "fix_action":      explanation.get("fix_action", ""),
+                "confidence":      explanation.get("confidence", ""),
+            },
+            "sample_rows": sample_rows,
+        }
 
         for finding in instance_findings:
             finding_id = getattr(finding, "id", None)
             if finding_id:
                 try:
-                    storage.update_finding(
-                        finding_id,
-                        resolution_notes=explanation_note[:2000],
-                    )
+                    # Merge with any existing evidence (e.g. rule execution metadata)
+                    existing = getattr(finding, "evidence", None) or {}
+                    existing.update(evidence_payload)
+                    storage.update_finding_evidence(finding_id, existing)
                 except Exception as e:
                     logger.debug(f"[FindingsExplanation] Could not update finding {finding_id}: {e}")
 
@@ -169,6 +177,20 @@ class FindingsExplanationAgent:
             f"({finding_count} finding(s), scope={explanation.get('affected_scope', '?')}, "
             f"confidence={explanation.get('confidence', '?')})"
         )
+
+    def _parse_sample_text(self, sample_text: str) -> list:
+        """Convert the pipe-delimited sample text into a list of dicts for the UI."""
+        if not sample_text or sample_text.startswith("("):
+            return []
+        lines = [l for l in sample_text.strip().splitlines() if l and not l.startswith("-")]
+        if len(lines) < 2:
+            return []
+        headers = [h.strip() for h in lines[0].split("|")]
+        rows = []
+        for line in lines[1:]:
+            values = [v.strip() for v in line.split("|")]
+            rows.append(dict(zip(headers, values)))
+        return rows
 
     def _fetch_violating_rows(
         self,

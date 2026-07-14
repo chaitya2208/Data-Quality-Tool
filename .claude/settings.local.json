@@ -168,7 +168,14 @@
       "Bash(taskkill *)",
       "Bash(.\\\\venv\\\\Scripts\\\\pip install *)",
       "Bash(./venv/Scripts/pip install *)",
-      "Bash(/C/D/Agentic-App-v2/Data-Quality-Tool/backend/.venv/Scripts/pip install *)"
+      "Bash(/C/D/Agentic-App-v2/Data-Quality-Tool/backend/.venv/Scripts/pip install *)",
+      "Bash(cp /tmp/schedules_api.py \"C:/D/Agentic-App-v2/Data-Quality-Tool/backend/app/api/schedules.py\")",
+      "Bash(cp /tmp/schedule_schema.py \"C:/D/Agentic-App-v2/Data-Quality-Tool/backend/app/schemas/schedule.py\")",
+      "Bash(cp /tmp/batch_runner.py \"C:/D/Agentic-App-v2/Data-Quality-Tool/backend/app/services/batch_runner.py\")",
+      "Bash(cp /tmp/schedule_calc.py \"C:/D/Agentic-App-v2/Data-Quality-Tool/backend/app/services/schedule_calc.py\")",
+      "Bash(cp /tmp/schedule_runner.py \"C:/D/Agentic-App-v2/Data-Quality-Tool/backend/app/services/schedule_runner.py\")",
+      "Bash(grep -v \"//\\\\|animate-spin\\\\|icon: Clock\\\\|Clock }\\\\|Clock,\")",
+      "Bash(/C/D/Agentic-App-v2/Data-Quality-Tool/backend/.venv/Scripts/python.exe -)"
     ]
   }
 }

@@ -1,14 +1,14 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { assetsApi, agentRunsApi, findingsApi, workflowsApi } from '../api/client'
+import { assetsApi, agentRunsApi, findingsApi } from '../api/client'
 import type { AgentTask, RuleReviewEntry } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import {
   GitBranch, Database, BrainCircuit, Shield, AlertCircle,
   Wrench, CheckCircle2, Loader2, ChevronDown, ChevronRight,
   AlertTriangle, ArrowRight, Clock, Play, ExternalLink,
-  RefreshCw, Sparkles, Network, LineChart, BarChart3,
+  RefreshCw, Sparkles, Network, BarChart3,
   BookmarkPlus, X,
 } from 'lucide-react'
 
@@ -50,16 +50,9 @@ const AGENTS = [
     name: 'profiling_agent',
     label: 'Profiling',
     icon: BarChart3,
-    desc: 'Profiles data — stats & anomalies for smarter rules',
+    desc: 'Profiles data — stats, anomalies & deterministic signals (uniqueness, freshness, closed sets) for smarter rules',
     parallel: true,
     parallelGroup: 'A',
-  },
-  {
-    name: 'profiler_agent',
-    label: 'Profiler',
-    icon: LineChart,
-    desc: 'Computes deterministic stats — uniqueness, freshness, closed value sets',
-    parallel: false,
   },
   {
     name: 'rule_intelligence_agent',
@@ -468,26 +461,16 @@ export default function AgentWorkflow() {
   })
 
   const saveWorkflowMutation = useMutation({
-    mutationFn: () => {
-      // Use server-persisted approved list — local reviewActive is cleared after review
-      const approved = activeRun?.instance_review_state?.active ?? reviewActive
-      const patterns = approved.map((entry: any) => ({
-        definition_id: entry.definition_id,
-        definition_name: entry.name,
-        scope: entry.scope,
-        target_config: entry.target_config || {},
-        threshold_config: entry.threshold_config || {},
-        severity: entry.severity,
-        template_shape: entry.template_shape || null,
-        rationale: entry.reason || '',
-      }))
-      return workflowsApi.create({
+    // Build patterns server-side from the run's active rule instances. Works for
+    // every run type (AI pipeline, saved-workflow template, scheduled) — it does
+    // not depend on instance_review_state, which only exists for runs that
+    // paused for review. Origin (scope/db/schema/table) is captured server-side.
+    mutationFn: () =>
+      agentRunsApi.saveAsWorkflow(activeRunId!, {
         label: saveWfLabel.trim(),
         description: saveWfDesc.trim(),
-        rule_patterns: patterns,
         created_by: '',
-      })
-    },
+      }),
     onSuccess: () => {
       setSaveWfOpen(false)
       setSaveWfLabel('')
@@ -872,8 +855,6 @@ export default function AgentWorkflow() {
                   <AgentNode agentDef={getAgentDef('profiling_agent')} task={getTask('profiling_agent')}
                     isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 </ParallelGroup>
-                <AgentNode agentDef={getAgentDef('profiler_agent')} task={getTask('profiler_agent')}
-                  isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 <AgentNode agentDef={getAgentDef('rule_intelligence_agent')} task={getTask('rule_intelligence_agent')}
                   isLast={false} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
                 <AgentNode agentDef={getAgentDef('findings_agent')} task={getTask('findings_agent')}
@@ -1409,10 +1390,8 @@ export default function AgentWorkflow() {
               </button>
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
-              {(() => {
-                const n = (activeRun?.instance_review_state?.active ?? reviewActive).length
-                return `Saves ${n} approved rule pattern${n !== 1 ? 's' : ''} from this run as a reusable workflow. You can run it on any table or schema later.`
-              })()}
+              Saves the active rules applied on this run's table as a reusable workflow.
+              You can run it on any table or schema later.
             </p>
             <div className="space-y-3">
               <div>

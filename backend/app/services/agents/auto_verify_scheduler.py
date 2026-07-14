@@ -74,20 +74,24 @@ def _fire(run_id: str) -> None:
         from app.services.agents.verification_agent import VerificationAgent
         result = VerificationAgent().run(run, task)
 
-        storage.update_agent_task(
-            task.id, status="completed", completed_at=datetime.utcnow(),
-            output={**result, "auto_verified": True},
-        )
-
         if result.get("fully_resolved"):
+            storage.update_agent_task(
+                task.id, status="completed", completed_at=datetime.utcnow(),
+                output={**result, "auto_verified": True},
+            )
             storage.update_agent_run(run_id, status="completed", completed_at=datetime.utcnow())
             logger.info(f"[AutoVerify] Run {run_id} fully resolved — marked COMPLETED")
         else:
+            # Reset task back to pending so the verify node doesn't show a
+            # green tick while findings are still open.
+            storage.update_agent_task(
+                task.id, status="pending",
+                output={**result, "auto_verified": True, "last_checked": datetime.utcnow().isoformat()},
+            )
             logger.info(
                 f"[AutoVerify] Run {run_id}: {result['resolved']}/{result['total_findings']} resolved, "
                 f"{result['remaining']} remaining — rescheduling"
             )
-            # Re-schedule for next cycle
             schedule(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
 
     except Exception as e:

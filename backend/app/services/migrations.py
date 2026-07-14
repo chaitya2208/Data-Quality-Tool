@@ -80,6 +80,52 @@ _MIGRATIONS = [
         """,
     ),
     (
+        "add_workflow_origin_scope",
+        "ALTER TABLE WORKFLOW_TEMPLATES ADD COLUMN IF NOT EXISTS ORIGIN_SCOPE VARCHAR(20)",
+    ),
+    (
+        "add_workflow_origin_database",
+        "ALTER TABLE WORKFLOW_TEMPLATES ADD COLUMN IF NOT EXISTS ORIGIN_DATABASE VARCHAR(255)",
+    ),
+    (
+        "add_workflow_origin_schema",
+        "ALTER TABLE WORKFLOW_TEMPLATES ADD COLUMN IF NOT EXISTS ORIGIN_SCHEMA VARCHAR(255)",
+    ),
+    (
+        "add_workflow_origin_table",
+        "ALTER TABLE WORKFLOW_TEMPLATES ADD COLUMN IF NOT EXISTS ORIGIN_TABLE VARCHAR(255)",
+    ),
+    (
+        "create_schedules",
+        """
+        CREATE TABLE IF NOT EXISTS SCHEDULES (
+            ID                   VARCHAR(36)   NOT NULL PRIMARY KEY,
+            NAME                 VARCHAR(200)  NOT NULL,
+            ENABLED              BOOLEAN       DEFAULT TRUE,
+            CONNECTION_ID        VARCHAR(36),
+            SCOPE                VARCHAR(20)   NOT NULL,
+            DATABASE_NAME        VARCHAR(255),
+            SCHEMA_NAME          VARCHAR(255),
+            TABLE_NAME           VARCHAR(255),
+            WORKFLOW_TEMPLATE_ID VARCHAR(36),
+            CADENCE              VARCHAR(20)   NOT NULL,
+            TIME_OF_DAY          VARCHAR(5),
+            DAY_OF_WEEK          INTEGER,
+            DAY_OF_MONTH         INTEGER,
+            MONTH_OF_YEAR        INTEGER,
+            INTERVAL_VALUE       INTEGER,
+            INTERVAL_UNIT        VARCHAR(10),
+            NEXT_RUN_AT          TIMESTAMP_NTZ,
+            LAST_RUN_AT          TIMESTAMP_NTZ,
+            LAST_BATCH_ID        VARCHAR(36),
+            LAST_STATUS          VARCHAR(20),
+            LAST_ERROR           VARCHAR(1024),
+            CREATED_AT           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            CREATED_BY           VARCHAR(200)
+        )
+        """,
+    ),
+    (
         "create_rule_intelligence_search",
         # Cortex Search — requires CORTEX_USER privilege.
         # Wrapped in a try inside run_migrations; if Cortex Search is

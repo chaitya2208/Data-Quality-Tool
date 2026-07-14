@@ -3,9 +3,7 @@ WorkflowCoordinator — pipeline:
 
   Coordinator
       ↓
-  [Metadata Agent ∥ Rules Fetch Agent ∥ Relationship Discovery Agent]   ← parallel threads
-      ↓
-  Profiler Agent                         ← deterministic stats (needs column_assets)
+  [Metadata Agent ∥ Rules Fetch Agent ∥ Relationship Discovery Agent ∥ Profiling Agent]   ← parallel threads
       ↓
   Rule Intelligence Agent                ← deterministic candidates + Claude proposals
       ↓
@@ -30,7 +28,6 @@ AGENT_ORDER = [
     "rules_fetch_agent",
     "relationship_discovery_agent",
     "profiling_agent",
-    "profiler_agent",
     "rule_intelligence_agent",
     "findings_agent",
     "fix_issues",          # UI-only node
@@ -43,7 +40,6 @@ DB_AGENT_ORDER = [
     "rules_fetch_agent",
     "relationship_discovery_agent",
     "profiling_agent",
-    "profiler_agent",
     "rule_intelligence_agent",
     "findings_agent",
     "verification_agent",
@@ -74,7 +70,7 @@ class WorkflowCoordinator:
         storage.update_agent_run(self.run_id, status="running", started_at=datetime.utcnow())
 
         all_downstream = [
-            "metadata_agent", "rules_fetch_agent", "relationship_discovery_agent", "profiler_agent",
+            "metadata_agent", "rules_fetch_agent", "relationship_discovery_agent",
             "rule_intelligence_agent", "findings_agent", "verification_agent",
         ]
 
@@ -117,7 +113,11 @@ class WorkflowCoordinator:
         meta_result    = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
         rules_result   = {"rule_codes": None, "error": None}
         reldisc_result = {"catalog": None, "error": None}
-        profile_result = {"profile": None, "error": None}
+        # profiling now yields BOTH the UI profile and the deterministic facts
+        # (column_stats/pk_shaped_candidates/freshness_signals/closed_set_columns)
+        # consumed by RuleIntelligenceAgent — computed in parallel, no longer a
+        # separate sequential Profiler step.
+        profile_result = {"profile": None, "facts": {}, "error": None}
 
         def _run_metadata():
             try:
@@ -170,23 +170,35 @@ class WorkflowCoordinator:
                 self._fail_task(reldisc_task, str(e))
 
         def _run_profiling():
-            # UI-facing profiling (anomaly surfacing / Data Explorer) — best-
-            # effort, and NOT consumed by RuleIntelligenceAgent (that agent
-            # gets its own deterministic column stats from ProfilerAgent,
-            # run sequentially below since it needs column_assets).
+            # One profiling pass produces BOTH the UI profile (anomaly surfacing
+            # / Data Explorer) AND the deterministic facts consumed by
+            # RuleIntelligenceAgent (column_stats / pk_shaped_candidates /
+            # freshness_signals / closed_set_columns). Runs in parallel — the
+            # facts are derived from (db, schema, table, connection_id), so this
+            # no longer waits for column metadata to be persisted.
             if not profile_task:
                 return
             try:
                 from app.services.agents.profiling_agent import ProfilingAgent
                 prof = ProfilingAgent(None).run(run.database, run.schema_name, run.table, run.connection_id)
                 profile_result["profile"] = prof
+                # Deterministic facts for RuleIntelligenceAgent (the 4 keys it reads).
+                profile_result["facts"] = {
+                    "column_stats":         prof.get("column_stats", {}),
+                    "pk_shaped_candidates": prof.get("pk_shaped_candidates", []),
+                    "freshness_signals":    prof.get("freshness_signals", []),
+                    "closed_set_columns":   prof.get("closed_set_columns", {}),
+                }
                 anomalies = prof.get("anomalies", [])
                 self._complete_task(profile_task, output={
-                    "columns_profiled": len(prof.get("columns", [])),
-                    "anomalies_found":  len(anomalies),
-                    "anomalies":        anomalies[:20],
-                    "row_count":        prof.get("table", {}).get("row_count"),
-                    "sampled":          prof.get("table", {}).get("is_sampled", False),
+                    "columns_profiled":     len(prof.get("columns", [])),
+                    "anomalies_found":      len(anomalies),
+                    "anomalies":            anomalies[:20],
+                    "pk_shaped_candidates": len(profile_result["facts"]["pk_shaped_candidates"]),
+                    "freshness_signals":    len(profile_result["facts"]["freshness_signals"]),
+                    "closed_set_columns":   len(profile_result["facts"]["closed_set_columns"]),
+                    "row_count":            prof.get("table", {}).get("row_count"),
+                    "sampled":              prof.get("table", {}).get("is_sampled", False),
                 })
             except Exception as e:
                 profile_result["error"] = str(e)
@@ -202,7 +214,7 @@ class WorkflowCoordinator:
         run = storage.get_agent_run(self.run_id)
 
         if meta_result["error"]:
-            self._skip_tasks(["profiler_agent", "rule_intelligence_agent", "findings_agent", "verification_agent"])
+            self._skip_tasks(["rule_intelligence_agent", "findings_agent", "verification_agent"])
             self._mark_run_failed(meta_result["error"])
             return
 
@@ -223,22 +235,12 @@ class WorkflowCoordinator:
             logger.warning(f"[Coordinator] Relationship discovery failed: {reldisc_result['error']}, continuing with no catalog")
         relationship_catalog = reldisc_result["catalog"] or []
 
-        # ── Profiler Agent — needs column_assets, so runs after the join ──────
-        profiler_task = self._get_task("profiler_agent")
-        self._start_task(profiler_task)
-        try:
-            from app.services.agents.profiler_agent import DeterministicProfilerAgent
-            profiler_result = DeterministicProfilerAgent().run(table_asset, column_assets)
-            self._complete_task(profiler_task, output={
-                "columns_profiled": len(profiler_result.get("column_stats", {})),
-                "pk_shaped_candidates": len(profiler_result.get("pk_shaped_candidates", [])),
-                "freshness_signals": len(profiler_result.get("freshness_signals", [])),
-                "closed_set_columns": len(profiler_result.get("closed_set_columns", {})),
-            })
-        except Exception as e:
-            logger.error(f"[Coordinator] ProfilerAgent failed: {e}")
-            self._fail_task(profiler_task, str(e))
-            profiler_result = {}
+        # Deterministic facts came from the parallel profiling agent (above) —
+        # no separate sequential profiler step. Empty dict if profiling failed
+        # (best-effort: RuleIntelligenceAgent handles a missing profiler_result).
+        if profile_result["error"]:
+            logger.warning(f"[Coordinator] Profiling failed: {profile_result['error']}, continuing with no deterministic facts")
+        profiler_result = profile_result["facts"] or {}
 
         # ── Rule Intelligence Agent ───────────────────────────────────────────
         intel_task = self._get_task("rule_intelligence_agent")
@@ -268,6 +270,11 @@ class WorkflowCoordinator:
                 "suppressed_duplicates": [
                     {"reason": s["reason"], "fingerprint": s["fingerprint"][:12]}
                     for s in suppressed
+                ],
+                "sample_tool_calls": len(intel_result.get("tool_calls", [])),
+                "sample_reasons": [
+                    (tc.get("input") or {}).get("reason", "")
+                    for tc in intel_result.get("tool_calls", [])
                 ],
             })
         except Exception as e:
@@ -596,36 +603,42 @@ class WorkflowCoordinator:
                 "rules_used":         rules_used,
                 "rules_unused":       rules_unused,
             })
-
-            # ── Findings Explanation Agent ────────────────────────────────
-            # Best-effort AI root-cause + fix-action annotations on each
-            # firing instance. Runs after the findings task is marked
-            # complete so a failure here never affects the run status.
-            if findings:
-                try:
-                    from app.services.agents.findings_explanation_agent import FindingsExplanationAgent
-                    FindingsExplanationAgent().run(
-                        findings=findings,
-                        table_asset=table_asset,
-                        run_id=run.id,
-                    )
-                except Exception as _exp_err:
-                    logger.warning(f"[Coordinator] FindingsExplanationAgent failed (non-fatal): {_exp_err}")
         except Exception as e:
             self._fail_task(findings_task, str(e))
             self._skip_tasks(["verification_agent"])
             self._mark_run_failed(str(e), advance=False)  # already advanced at review
             return
 
+        # Transition to awaiting_fixes immediately — before explanation agent so
+        # the UI banner appears without waiting for Claude explanation calls.
         run = storage.update_agent_run(self.run_id, status="awaiting_fixes")
         logger.info(
             f"[Coordinator] Run {self.run_id} — pipeline complete. "
             f"{run.findings_count} findings, {run.ai_rules_count} AI rules persisted."
         )
 
+        # ── Findings Explanation Agent (background) ───────────────────────────
+        # Runs in a daemon thread so it never delays the awaiting_fixes status.
+        # Best-effort — a failure here never affects the run.
+        if findings:
+            _findings_snap = list(findings)
+            _table_snap = table_asset
+            _run_id_snap = run.id
+            def _run_explanation():
+                try:
+                    from app.services.agents.findings_explanation_agent import FindingsExplanationAgent
+                    FindingsExplanationAgent().run(
+                        findings=_findings_snap,
+                        table_asset=_table_snap,
+                        run_id=_run_id_snap,
+                    )
+                except Exception as _exp_err:
+                    logger.warning(f"[Coordinator] FindingsExplanationAgent failed (non-fatal): {_exp_err}")
+            threading.Thread(target=_run_explanation, daemon=True).start()
+
         # Start background auto-verification (every 5 min while awaiting fixes)
         from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
-        schedule_verify(run.id)
+        schedule_verify(self.run_id)
         # Note: batch already advanced when this run reached rule review — do not
         # advance again here, or a table could be skipped.
 
@@ -643,7 +656,7 @@ class WorkflowCoordinator:
 
         all_tasks = [
             "metadata_agent", "rules_fetch_agent", "relationship_discovery_agent",
-            "profiler_agent", "rule_intelligence_agent", "findings_agent", "verification_agent",
+            "profiling_agent", "rule_intelligence_agent", "findings_agent", "verification_agent",
         ]
 
         template = storage.get_workflow(run.workflow_template_id)
@@ -683,19 +696,19 @@ class WorkflowCoordinator:
         except Exception as e:
             self._fail_task(meta_task, str(e))
             self._skip_tasks(["rules_fetch_agent", "relationship_discovery_agent",
-                               "profiler_agent", "rule_intelligence_agent",
+                               "profiling_agent", "rule_intelligence_agent",
                                "findings_agent", "verification_agent"])
             self._mark_run_failed(str(e))
             return
 
         # Skip unused pipeline stages gracefully
         for skipped in ["rules_fetch_agent", "relationship_discovery_agent",
-                        "profiler_agent", "rule_intelligence_agent"]:
+                        "profiling_agent", "rule_intelligence_agent"]:
             t = self._get_task(skipped)
             if t:
                 self._skip_task(t)
 
-        existing_column_names = {c.column_name.upper() for c in column_assets}
+        existing_column_names = {c.column_name.upper() for c in column_assets if c.column_name}
 
         # Re-instantiate each pattern for this target table
         from app.services.rule_sql_templates import render_template
@@ -875,15 +888,19 @@ class WorkflowCoordinator:
         return storage.get_agent_task(self.run_id, name)
 
     def _start_task(self, task: Any) -> None:
+        if not task: return
         storage.update_agent_task(task.id, status="running", started_at=datetime.utcnow())
 
     def _complete_task(self, task: Any, output: dict = None) -> None:
+        if not task: return
         storage.update_agent_task(task.id, status="completed", completed_at=datetime.utcnow(), output=output or {})
 
     def _fail_task(self, task: Any, error: str) -> None:
+        if not task: return
         storage.update_agent_task(task.id, status="failed", completed_at=datetime.utcnow(), error_message=error[:1024])
 
     def _skip_task(self, task: Any) -> None:
+        if not task: return
         storage.update_agent_task(task.id, status="skipped")
 
     def _skip_tasks(self, names: List[str]) -> None:

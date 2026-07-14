@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
@@ -10,6 +10,7 @@ import DataExplorer from './pages/DataExplorer'
 import Connections from './pages/Connections'
 import SettingsPage from './pages/Settings'
 import SavedWorkflows from './pages/SavedWorkflows'
+import Schedules from './pages/Schedules'
 import RunHistory from './pages/RunHistory'
 import { useConnection } from './ConnectionContext'
 
@@ -26,6 +27,7 @@ function App() {
     { name: 'Workflow',        href: '/workflow',        icon: GitBranch    },
     { name: 'Run History',     href: '/run-history',     icon: History      },
     { name: 'Saved Workflows', href: '/saved-workflows', icon: BookOpen     },
+    { name: 'Schedules',       href: '/schedules',       icon: Clock        },
     { name: 'Settings',        href: '/settings',        icon: SettingsIcon },
   ]
 
@@ -149,6 +151,7 @@ function App() {
             <Route path="/ai-fix"          element={<AIFix />}         />
             <Route path="/rule-library"    element={<RuleLibrary />}   />
             <Route path="/saved-workflows" element={<SavedWorkflows />}/>
+            <Route path="/schedules"       element={<Schedules />}     />
             <Route path="/settings"        element={<SettingsPage />}  />
           </Routes>
         </main>

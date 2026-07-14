@@ -5,7 +5,7 @@ from app.services.snowflake_session import session as sf_session
 from app.services import recommendation_cache_service as rec_cache
 from app.services.cortex_client import ask_for_recommendation, _sanitize_sql
 from pydantic import BaseModel
-from typing import List, Any
+from typing import List, Any, Optional
 from datetime import datetime
 import logging
 
@@ -119,6 +119,9 @@ class AIRecommendation(BaseModel):
     impact: str
     from_cache: bool = False
     source: str = "unknown"  # cortex | claude | cache | error
+    source_type: str = "snowflake"  # snowflake | postgres
+    connection_name: str | None = None
+    connection_user: str | None = None
 
 
 class WarehouseInfo(BaseModel):
@@ -144,16 +147,16 @@ class SnowflakeContext(BaseModel):
 class ExecuteSQLRequest(BaseModel):
     finding_id: str
     sql_query: str
-    warehouse: str
-    role: str
+    warehouse: str | None = None
+    role: str | None = None
 
 
 class ExecuteSQLResponse(BaseModel):
     success: bool
     message: str
     finding_id: str
-    warehouse_used: str
-    role_used: str
+    warehouse_used: Optional[str] = None
+    role_used: Optional[str] = None
     executed_at: datetime
 
 
@@ -197,6 +200,41 @@ def get_roles():
     return [RoleInfo(**r) for r in ctx["roles"]]
 
 
+@router.post("/source-type")
+def get_source_type(finding_ids: List[str]):
+    """
+    Fast endpoint — resolves the data source type for a list of findings without
+    calling Claude. Used by the AI-Fix page to know immediately (before the slow
+    recommendations call completes) whether to show Snowflake role/warehouse or
+    the Postgres connection pill.
+    """
+    for fid in finding_ids:
+        finding = storage.get_finding(fid)
+        if not finding:
+            continue
+        src_type, conn_name, conn_user = _get_connection_for_finding_impl(finding)
+        return {"source_type": src_type, "connection_name": conn_name, "connection_user": conn_user}
+    return {"source_type": "snowflake", "connection_name": None, "connection_user": None}
+
+
+def _get_connection_for_finding_impl(finding) -> tuple[str, str | None, str | None]:
+    """Internal helper shared by /source-type and /recommendations."""
+    try:
+        scan = storage.get_scan(finding.scan_id) if finding.scan_id else None
+        connection_id = scan.connection_id if scan else None
+        if connection_id:
+            conn = storage.get_connection_record(connection_id)
+            if conn:
+                return conn.type, conn.name, conn.username
+    except Exception:
+        pass
+    return "snowflake", None, None
+
+
+def _get_connection_for_finding(finding) -> tuple[str, str | None, str | None]:
+    return _get_connection_for_finding_impl(finding)
+
+
 @router.post("/recommendations", response_model=List[AIRecommendation])
 def get_ai_recommendations(finding_ids: List[str]):
     """
@@ -217,6 +255,11 @@ def get_ai_recommendations(finding_ids: List[str]):
         except Exception as e:
             logger.warning(f"Claude call failed for {finding_id}, using template: {e}")
             rec = _generate_recommendation(finding, rule_code, context)
+
+        src_type, conn_name, conn_user = _get_connection_for_finding(finding)
+        rec.source_type = src_type
+        rec.connection_name = conn_name
+        rec.connection_user = conn_user
 
         recommendations.append(rec)
     return recommendations
