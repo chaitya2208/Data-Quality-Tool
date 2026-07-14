@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { agentRunsApi } from '../api/client'
+import { useConnection } from '../ConnectionContext'
 import {
   History, Loader2, CheckCircle2, AlertTriangle, BrainCircuit,
   Wrench, Database, Search, Filter, ExternalLink,
@@ -39,6 +40,11 @@ export default function RunHistory() {
   const navigate = useNavigate()
   const [search, setSearch]           = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  // Run History is scoped to the selected data source. Runs already carry
+  // connection_id, so we filter client-side; legacy NULL-connection runs are
+  // attributed to Snowflake to match the findings/dashboard scoping rule.
+  const { selectedId: connId, selected } = useConnection()
+  const isSnowflake = (selected?.type ?? '').toLowerCase() === 'snowflake'
 
   const { data, isLoading } = useQuery({
     queryKey: ['agent-runs-history'],
@@ -46,7 +52,12 @@ export default function RunHistory() {
     refetchInterval: 10_000,
   })
 
-  const runs = data?.runs ?? []
+  const allRuns = data?.runs ?? []
+  const runs = allRuns.filter(run =>
+    !connId
+      ? true
+      : run.connection_id === connId || (isSnowflake && !run.connection_id)
+  )
 
   const filtered = runs.filter(run => {
     const matchesStatus = statusFilter === 'all' || run.status === statusFilter
@@ -134,12 +145,12 @@ export default function RunHistory() {
         ) : (
           <div className="divide-y divide-gray-100 dark:divide-gray-700">
             {/* Table header */}
-            <div className="hidden sm:grid grid-cols-[1fr_auto_auto_auto_auto] gap-4 px-6 py-3 bg-gray-50 dark:bg-gray-900 text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide">
+            <div className="hidden sm:grid grid-cols-[1fr_150px_110px_90px_80px] gap-4 px-6 py-3 bg-gray-50 dark:bg-gray-900 text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide">
               <span>Target</span>
               <span>Status</span>
               <span>Findings</span>
               <span>AI Rules</span>
-              <span></span>
+              <span className="text-right">Actions</span>
             </div>
 
             {filtered.map(run => {
@@ -148,7 +159,7 @@ export default function RunHistory() {
                   key={run.id}
                   className="px-6 py-4 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors"
                 >
-                  <div className="flex flex-col sm:grid sm:grid-cols-[1fr_auto_auto_auto_auto] sm:gap-4 sm:items-center gap-2">
+                  <div className="flex flex-col sm:grid sm:grid-cols-[1fr_150px_110px_90px_80px] sm:gap-4 sm:items-center gap-2">
 
                     {/* Target */}
                     <div className="min-w-0">

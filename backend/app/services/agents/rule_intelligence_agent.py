@@ -1122,9 +1122,12 @@ class RuleIntelligenceAgent:
                 kept.append(proposal)
             else:
                 reason = score_entry.get("drop_reason") or f"mean score {mean:.1f} < {min_score}"
+                # new_definition is often explicitly null (see prompt schema), so
+                # `.get('new_definition', {})` returns None, not {} — guard with `or {}`.
+                label = (proposal.get("new_definition") or {}).get("name") or proposal.get("definition_id", "?")
                 logger.info(
                     f"[RuleIntelligence] Self-critique dropped proposal[{i}] "
-                    f"'{proposal.get('new_definition', {}).get('name') or proposal.get('definition_id', '?')}' "
+                    f"'{label}' "
                     f"— {reason} (evidence={score_entry.get('evidence')}, "
                     f"impact={score_entry.get('impact')}, approval={score_entry.get('approval')})"
                 )

@@ -112,13 +112,20 @@ function isPolling(status: RunStatus) {
 }
 
 function fixIssuesStatus(runStatus: RunStatus): string {
-  return runStatus === 'awaiting_fixes' || runStatus === 'completed' ? 'active' : 'pending'
+  // A run only reaches 'completed' once verification confirms all findings are
+  // resolved, so green here means "all issues fixed". While issues remain
+  // (awaiting_fixes) the node is an actionable 'active' link; otherwise pending.
+  if (runStatus === 'completed') return 'completed'
+  if (runStatus === 'awaiting_fixes') return 'active'
+  return 'pending'
 }
 
 function nodeBorderColor(status: string) {
   switch (status) {
     case 'running':   return 'border-blue-400 dark:border-blue-500 bg-blue-50 dark:bg-blue-900/60'
     case 'completed': return 'border-green-400 dark:border-green-500 bg-green-50 dark:bg-green-900/60'
+    // 'partial' = verification ran but issues remain — amber, never green.
+    case 'partial':   return 'border-amber-400 dark:border-amber-500 bg-amber-50 dark:bg-amber-900/50'
     case 'failed':    return 'border-red-400 dark:border-red-500 bg-red-50 dark:bg-red-900/60'
     case 'skipped':   return 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 opacity-50'
     case 'active':    return 'border-primary-400 dark:border-primary-400 bg-primary-50 dark:bg-primary-900/60'
@@ -130,18 +137,21 @@ function nodeIconColor(status: string) {
   switch (status) {
     case 'running':   return 'text-blue-500'
     case 'completed': return 'text-green-600'
+    case 'partial':   return 'text-amber-600 dark:text-amber-400'
     case 'failed':    return 'text-red-500'
     case 'active':    return 'text-primary-600'
     default:          return 'text-gray-400 dark:text-gray-500'
   }
 }
 
-function statusBadge(status: string) {
+function statusBadge(status: string, partialRemaining?: number) {
   switch (status) {
     case 'running':
       return <span className="flex items-center gap-1 text-blue-700 dark:text-blue-300 text-xs font-medium"><Loader2 className="w-3 h-3 animate-spin" />Running</span>
     case 'completed':
       return <span className="flex items-center gap-1 text-green-700 dark:text-green-300 text-xs font-medium"><CheckCircle2 className="w-3 h-3" />Done</span>
+    case 'partial':
+      return <span className="flex items-center gap-1 text-amber-700 dark:text-amber-300 text-xs font-medium"><AlertTriangle className="w-3 h-3" />{partialRemaining != null ? `Partial — ${partialRemaining} left` : 'Partial'}</span>
     case 'failed':
       return <span className="flex items-center gap-1 text-red-700 dark:text-red-300 text-xs font-medium"><AlertTriangle className="w-3 h-3" />Failed</span>
     case 'skipped':
@@ -181,6 +191,14 @@ function AgentNode({
     status = task?.status ?? 'pending'
   }
 
+  // Verification ran but issues remain → show amber "Partial", never green. The
+  // backend leaves the task 'completed' (so the result banner still renders), so
+  // we derive 'partial' here from its output.remaining.
+  const verifyRemaining = agentDef.name === 'verification_agent' ? (task?.output?.remaining as number | undefined) : undefined
+  if (status === 'completed' && verifyRemaining != null && verifyRemaining > 0) {
+    status = 'partial'
+  }
+
   const duration    = task ? formatDuration(task.duration_seconds ?? null) : null
   const liveProgress= task?.output?.progress as string | undefined
   const hasLogs     = !isFixNode && task?.output && Object.keys(task.output).length > 0
@@ -191,10 +209,13 @@ function AgentNode({
         <div
           className={`w-full border-2 rounded-xl p-3 transition-all ${nodeBorderColor(status)} ${
             hasLogs ? 'cursor-pointer' : ''
-          } ${isFixNode && status === 'active' ? 'cursor-pointer hover:shadow-md' : ''}`}
+          } ${isFixNode && (status === 'active' || status === 'completed') ? 'cursor-pointer hover:shadow-md' : ''}`}
           onClick={() => {
-            if (isFixNode && status === 'active' && scanId) {
-              navigate(`/findings?scan_id=${scanId}&status=detected`)
+            if (isFixNode && scanId && (status === 'active' || status === 'completed')) {
+              // Active → jump to the open issues; completed → show the (resolved) set.
+              navigate(status === 'completed'
+                ? `/findings?scan_id=${scanId}`
+                : `/findings?scan_id=${scanId}&status=detected`)
             } else if (hasLogs) {
               setExpanded(e => !e)
             }
@@ -210,13 +231,13 @@ function AgentNode({
                 ? <ChevronDown className="w-3 h-3 text-gray-400 dark:text-gray-400 flex-shrink-0" />
                 : <ChevronRight className="w-3 h-3 text-gray-400 dark:text-gray-400 flex-shrink-0" />
             )}
-            {isFixNode && status === 'active' && (
-              <ExternalLink className="w-3 h-3 text-primary-500 flex-shrink-0" />
+            {isFixNode && (status === 'active' || status === 'completed') && (
+              <ExternalLink className={`w-3 h-3 flex-shrink-0 ${status === 'completed' ? 'text-green-500' : 'text-primary-500'}`} />
             )}
           </div>
 
           <div className="flex items-center justify-between gap-1 flex-wrap">
-            {statusBadge(status)}
+            {statusBadge(status, verifyRemaining)}
             {duration && (
               <span className="flex items-center gap-0.5 text-xs text-gray-400 dark:text-gray-400">
                 <Clock className="w-2.5 h-2.5" />{duration}

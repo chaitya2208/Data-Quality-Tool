@@ -404,11 +404,42 @@ def get_finding(finding_id: str) -> Optional[SimpleNamespace]:
     return _finding_from_row(rows[0]) if rows else None
 
 
+def _is_snowflake_connection(connection_id: Optional[str]) -> bool:
+    """True when the connection is Snowflake-typed. Legacy findings/scans/runs
+    predating connection tracking have a NULL connection and are attributed to
+    the Snowflake source, so a Snowflake connection scope must also include
+    those NULL rows (see _findings_connection_clause / list_agent_runs)."""
+    if not connection_id:
+        return False
+    conn = get_connection_record(connection_id)
+    if not conn:
+        return False
+    ctype = conn.type.value if hasattr(conn.type, "value") else str(conn.type)
+    return (ctype or "").lower() == "snowflake"
+
+
+def _findings_connection_clause(connection_id: str, params: dict, alias: str = "") -> str:
+    """SQL predicate restricting FINDINGS to one connection, via the SCANS join
+    (FINDINGS has no CONNECTION_ID column). Snowflake also absorbs legacy rows
+    whose scan is missing or has a NULL connection. `alias` (e.g. "f") qualifies
+    the SCAN_ID column when the query aliases FINDINGS."""
+    params["conn_id"] = connection_id
+    col = f"{alias}.SCAN_ID" if alias else "SCAN_ID"
+    scan_match = f"{col} IN (SELECT ID FROM SCANS WHERE CONNECTION_ID = %(conn_id)s)"
+    if _is_snowflake_connection(connection_id):
+        return (
+            f"({scan_match} OR {col} IS NULL "
+            f"OR {col} IN (SELECT ID FROM SCANS WHERE CONNECTION_ID IS NULL))"
+        )
+    return scan_match
+
+
 def list_findings(
     asset_id: Optional[str] = None,
     scan_id: Optional[str] = None,
     status: Optional[str] = None,
     severity: Optional[str] = None,
+    connection_id: Optional[str] = None,
     skip: int = 0,
     limit: int = 5000,
 ) -> tuple[int, list[SimpleNamespace]]:
@@ -419,6 +450,8 @@ def list_findings(
     if scan_id:
         where.append("SCAN_ID = %(scan_id)s")
         params["scan_id"] = scan_id
+    if connection_id:
+        where.append(_findings_connection_clause(connection_id, params))
     if status:
         where.append("STATUS = %(status)s")
         params["status"] = status
@@ -516,16 +549,25 @@ def supersede_open_findings(
     return affected or 0
 
 
-def findings_with_asset_not_closed() -> list[tuple[SimpleNamespace, SimpleNamespace]]:
-    """(finding, asset) pairs for every finding not RESOLVED/CLOSED — dashboard chart."""
+def findings_with_asset_not_closed(
+    connection_id: Optional[str] = None,
+) -> list[tuple[SimpleNamespace, SimpleNamespace]]:
+    """(finding, asset) pairs for every finding not RESOLVED/CLOSED — dashboard chart.
+    Optionally scoped to one connection via the FINDINGS → SCANS.CONNECTION_ID join."""
+    params: dict = {}
+    conn_sql = ""
+    if connection_id:
+        conn_sql = f"AND {_findings_connection_clause(connection_id, params, alias='f')}"
     rows = sf_session.query(
-        """
+        f"""
         SELECT f.*, a.DATABASE_NAME AS A_DATABASE_NAME, a.SCHEMA_NAME AS A_SCHEMA_NAME,
                a.TABLE_NAME AS A_TABLE_NAME, a.FQN AS A_FQN
         FROM FINDINGS f
         JOIN ASSETS a ON a.ID = f.ASSET_ID
         WHERE f.STATUS NOT IN ('resolved', 'closed', 'superseded')
-        """
+        {conn_sql}
+        """,
+        params,
     )
     result = []
     for row in rows:
@@ -540,17 +582,24 @@ def findings_with_asset_not_closed() -> list[tuple[SimpleNamespace, SimpleNamesp
     return result
 
 
-def findings_summary() -> dict:
+def findings_summary(connection_id: Optional[str] = None) -> dict:
     """total / by_status / by_severity counts — dashboard stats. Excludes
     'superseded' (stale rows replaced by a newer scan) so counts reflect real
-    current findings, not re-scan duplicates."""
-    total_rows = sf_session.query("SELECT COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded'")
+    current findings, not re-scan duplicates. Optionally scoped to one
+    connection via the FINDINGS → SCANS.CONNECTION_ID join."""
+    params: dict = {}
+    conn_sql = ""
+    if connection_id:
+        conn_sql = f"AND {_findings_connection_clause(connection_id, params)}"
+    base = f"FROM FINDINGS WHERE STATUS <> 'superseded' {conn_sql}"
+
+    total_rows = sf_session.query(f"SELECT COUNT(*) AS CNT {base}", params)
     total = total_rows[0]["CNT"] if total_rows else 0
 
-    status_rows = sf_session.query("SELECT STATUS, COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded' GROUP BY STATUS")
+    status_rows = sf_session.query(f"SELECT STATUS, COUNT(*) AS CNT {base} GROUP BY STATUS", params)
     by_status = {r["STATUS"]: r["CNT"] for r in status_rows}
 
-    severity_rows = sf_session.query("SELECT SEVERITY, COUNT(*) AS CNT FROM FINDINGS WHERE STATUS <> 'superseded' GROUP BY SEVERITY")
+    severity_rows = sf_session.query(f"SELECT SEVERITY, COUNT(*) AS CNT {base} GROUP BY SEVERITY", params)
     by_severity = {r["SEVERITY"]: r["CNT"] for r in severity_rows}
 
     return {"total": total, "by_status": by_status, "by_severity": by_severity}
@@ -1427,6 +1476,31 @@ def list_agent_runs_by_batch(batch_id: str) -> list[SimpleNamespace]:
         {"batch_id": batch_id},
     )
     return [_agent_run_from_row(r, tasks=list_agent_tasks(r["ID"])) for r in rows]
+
+
+def get_agent_run_by_scan(scan_id: str) -> Optional[SimpleNamespace]:
+    """The most recent agent run for a given scan, or None. Used to re-check a
+    run's completion when its findings are resolved (see findings PATCH)."""
+    if not scan_id:
+        return None
+    rows = sf_session.query(
+        "SELECT * FROM AGENT_RUNS WHERE SCAN_ID = %(scan_id)s ORDER BY CREATED_AT DESC LIMIT 1",
+        {"scan_id": scan_id},
+    )
+    return _agent_run_from_row(rows[0], tasks=list_agent_tasks(rows[0]["ID"])) if rows else None
+
+
+def count_open_findings_for_scan(scan_id: str) -> int:
+    """Number of still-open (detected/validated/in_progress) findings for a scan.
+    Used to decide whether resolving a finding has cleared a run's whole queue."""
+    if not scan_id:
+        return 0
+    in_open = ", ".join(f"'{s}'" for s in _OPEN_FINDING_STATUSES)
+    rows = sf_session.query(
+        f"SELECT COUNT(*) AS CNT FROM FINDINGS WHERE SCAN_ID = %(scan_id)s AND STATUS IN ({in_open})",
+        {"scan_id": scan_id},
+    )
+    return rows[0]["CNT"] if rows else 0
 
 
 def get_next_pending_batch_run(batch_id: str) -> Optional[SimpleNamespace]:

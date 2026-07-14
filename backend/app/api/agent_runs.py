@@ -377,8 +377,14 @@ def save_run_as_workflow(run_id: str, request: dict):
     if not label:
         raise HTTPException(status_code=400, detail="label is required")
 
-    # Active instances on this run's table = the rule set this run applied.
-    _, instances = storage.list_instances(
+    # The rule set a run applies = its table-scoped active instances PLUS every
+    # global (DATABASE_NAME='*') governance instance, which applies to all
+    # tables. This mirrors what the pipeline itself executes (see
+    # rule_intelligence_agent._existing_active_or_pending_instances). Without the
+    # global union, a run that fires only governance rules — or whose
+    # table-specific proposals were all rejected — has zero table-scoped active
+    # instances and save-as-workflow wrongly reports "No active rules found".
+    _, table_instances = storage.list_instances(
         database_name=run.database,
         schema_name=run.schema_name,
         table_name=run.table,
@@ -386,6 +392,18 @@ def save_run_as_workflow(run_id: str, request: dict):
         is_active=True,
         limit=1000,
     )
+    _, global_instances = storage.list_instances(
+        database_name="*",
+        status="active",
+        is_active=True,
+        limit=1000,
+    )
+    seen_ids: set = set()
+    instances = []
+    for inst in [*table_instances, *global_instances]:
+        if inst.id not in seen_ids:
+            seen_ids.add(inst.id)
+            instances.append(inst)
 
     patterns = []
     for inst in instances:
