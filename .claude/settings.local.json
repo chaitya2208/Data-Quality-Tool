@@ -151,7 +151,24 @@
       "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/services/agents/findings_agent.py', encoding='utf-8'\\).read\\(\\)\\)\")",
       "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/schemas/finding.py', encoding='utf-8'\\).read\\(\\)\\)\")",
       "Bash(.venv/Scripts/pip install *)",
-      "Bash(.venv/Scripts/pip uninstall *)"
+      "Bash(.venv/Scripts/pip uninstall *)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_agentic_features.py -v)",
+      "Bash(.venv/Scripts/python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload)",
+      "Bash(.venv/Scripts/python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8001)",
+      "Bash(taskkill /F /PID 21596)",
+      "Bash(taskkill /F /IM python.exe /FI \"WINDOWTITLE eq uvicorn*\")",
+      "Bash(findstr :8001)",
+      "Bash(taskkill //F //PID 1764)",
+      "Bash(taskkill //F //PID 25392)",
+      "Bash(taskkill //F //PID 25392 //T)",
+      "Bash(taskkill //F //PID 1764 //T)",
+      "Bash(findstr \":8001 \")",
+      "Bash(powershell -Command \"Stop-Process -Id 25392 -Force -ErrorAction SilentlyContinue; Stop-Process -Id 1764 -Force -ErrorAction SilentlyContinue; Start-Sleep 2; netstat -ano | Select-String ':8001'\")",
+      "Bash(.venv/Scripts/python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8002)",
+      "Bash(taskkill *)",
+      "Bash(.\\\\venv\\\\Scripts\\\\pip install *)",
+      "Bash(./venv/Scripts/pip install *)",
+      "Bash(/C/D/Agentic-App-v2/Data-Quality-Tool/backend/.venv/Scripts/pip install *)"
     ]
   }
 }

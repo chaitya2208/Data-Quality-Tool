@@ -21,8 +21,8 @@ function App() {
   const navigation = [
     { name: 'Dashboard',       href: '/',                icon: Home         },
     { name: 'Data Explorer',   href: '/explorer',        icon: Compass      },
-    { name: 'Findings',        href: '/findings',        icon: AlertCircle  },
     { name: 'Rule Library',    href: '/rule-library',    icon: Library      },
+    { name: 'Findings',        href: '/findings',        icon: AlertCircle  },
     { name: 'Workflow',        href: '/workflow',        icon: GitBranch    },
     { name: 'Run History',     href: '/run-history',     icon: History      },
     { name: 'Saved Workflows', href: '/saved-workflows', icon: BookOpen     },

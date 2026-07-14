@@ -59,34 +59,137 @@ def ask_claude(prompt: str, system: str = None, max_tokens: int = 32000) -> str:
     )
 
 
+def ask_claude_agentic(
+    prompt: str,
+    system: str = None,
+    tools: list = None,
+    tool_executor=None,
+    max_tokens: int = 24000,
+    effort: str = "high",
+    max_tool_rounds: int = 5,
+) -> dict:
+    """
+    Agentic tool-use loop with extended thinking (adaptive).
+
+    Sends the initial prompt with tools defined; if Claude responds with
+    stop_reason="tool_use" it executes each tool via tool_executor(name, inputs)
+    and feeds results back as a new user turn.  Loops until end_turn or
+    max_tool_rounds is exhausted.
+
+    tool_executor: callable(name: str, inputs: dict) -> str
+
+    Returns {"text": str, "thinking": str, "tool_calls": list[dict]}
+    where tool_calls is [{name, input, result}, ...] in call order.
+
+    Thinking blocks are carried forward in history (API requirement) and their
+    text is accumulated in "thinking".
+    """
+    client = get_claude_client()
+    messages = [{"role": "user", "content": prompt}]
+    kwargs = {
+        "model": DEFAULT_MODEL,
+        "max_tokens": max_tokens,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort},
+        "messages": messages,
+    }
+    if system:
+        kwargs["system"] = system
+    if tools:
+        kwargs["tools"] = tools
+
+    all_thinking: list = []
+    all_tool_calls: list = []
+    message = None
+
+    for _round in range(max_tool_rounds + 1):
+        with client.messages.stream(**kwargs) as stream:
+            message = stream.get_final_message()
+
+        for block in message.content:
+            if getattr(block, "type", None) == "thinking":
+                all_thinking.append(getattr(block, "thinking", "") or "")
+
+        if message.stop_reason != "tool_use" or _round >= max_tool_rounds:
+            break
+
+        # Build assistant content list — must preserve thinking/text/tool_use blocks
+        assistant_content = []
+        tool_results = []
+        for block in message.content:
+            btype = getattr(block, "type", None)
+            if btype == "thinking":
+                bd = {"type": "thinking", "thinking": block.thinking}
+                sig = getattr(block, "signature", None)
+                if sig:
+                    bd["signature"] = sig
+                assistant_content.append(bd)
+            elif btype == "text":
+                assistant_content.append({"type": "text", "text": block.text})
+            elif btype == "tool_use":
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
+                try:
+                    result_str = tool_executor(block.name, block.input or {}) if tool_executor else "No executor provided."
+                except Exception as exc:
+                    result_str = f"Tool execution error: {exc}"
+                    logger.warning(f"[agentic] tool {block.name} raised: {exc}")
+
+                all_tool_calls.append({"name": block.name, "input": block.input, "result": result_str})
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_str,
+                })
+
+        kwargs["messages"] = kwargs["messages"] + [
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": tool_results},
+        ]
+
+    final_text = "".join(
+        block.text for block in (message.content if message else [])
+        if getattr(block, "type", None) == "text"
+    )
+    return {
+        "text": final_text,
+        "thinking": "\n\n---\n\n".join(all_thinking),
+        "tool_calls": all_tool_calls,
+    }
+
+
 def ask_claude_with_thinking(
     prompt: str,
     system: str = None,
-    max_tokens: int = 16000,
-    thinking_budget: int = 8000,
+    max_tokens: int = 24000,
+    thinking_budget: int = 8000,  # kept for signature compat; ignored for claude-4.8+
+    effort: str = "high",
 ) -> dict:
     """
     Call Claude via Bedrock with extended thinking enabled.
-    Returns {"thinking": str, "text": str} — thinking is Claude's raw
-    deliberation before it committed to its answer; text is the final output.
+    Returns {"thinking": str, "text": str}.
 
-    max_tokens must be > thinking_budget (Anthropic requirement).
-    thinking_budget controls how many tokens Claude can spend deliberating —
-    higher = more thorough reasoning but slower and more expensive.
-    Extended thinking disables streaming (SDK limitation), so this uses a
-    blocking messages.create() call.
+    Claude 4.8+ uses thinking.type="adaptive" + output_config.effort instead
+    of the old thinking.type="enabled" + budget_tokens API.
+    Streams to keep the corporate proxy connection alive during long thinking.
     """
     client = get_claude_client()
     kwargs = {
         "model": DEFAULT_MODEL,
         "max_tokens": max_tokens,
-        "thinking": {"type": "enabled", "budget_tokens": thinking_budget},
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort},
         "messages": [{"role": "user", "content": prompt}],
     }
     if system:
         kwargs["system"] = system
 
-    message = client.messages.create(**kwargs)
+    with client.messages.stream(**kwargs) as stream:
+        message = stream.get_final_message()
 
     thinking_text = "".join(
         block.thinking for block in message.content

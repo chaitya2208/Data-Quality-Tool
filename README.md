@@ -4,6 +4,7 @@ An AI-powered data quality platform for Snowflake with finding-centric architect
 
 ## 🎯 What Is This?
 
+
 A comprehensive platform to monitor, assess, and improve data quality in Snowflake warehouses. It combines:
 - **Automated scanning** of metadata, schema, and data quality
 - **Rule-based detection** of quality issues

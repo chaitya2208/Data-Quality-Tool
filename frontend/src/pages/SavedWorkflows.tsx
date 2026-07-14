@@ -253,6 +253,220 @@ function RunModal({
   )
 }
 
+// ── Create modal ──────────────────────────────────────────────────────────────
+
+function CreateModal({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient()
+  const [label, setLabel] = useState('')
+  const [description, setDescription] = useState('')
+  const [patterns, setPatterns] = useState<RulePattern[]>([])
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(null)
+  const [addOpen, setAddOpen] = useState(false)
+  const [addSearch, setAddSearch] = useState('')
+
+  const { data: defsData, isFetching: defsLoading } = useQuery({
+    queryKey: ['rule-definitions-active'],
+    queryFn: () => ruleLibraryApi.listDefinitions({ status: 'active' }).then(r => r.data),
+    staleTime: 60_000,
+    enabled: addOpen,
+  })
+  const allDefs = defsData?.definitions ?? []
+  const filteredDefs = allDefs.filter(d =>
+    d.name.toLowerCase().includes(addSearch.toLowerCase()) ||
+    d.category.toLowerCase().includes(addSearch.toLowerCase())
+  )
+  const alreadyAdded = new Set(patterns.map(p => p.definition_id))
+
+  const addPattern = (def: typeof allDefs[number]) => {
+    if (alreadyAdded.has(def.id)) return
+    setPatterns(p => [...p, {
+      definition_id: def.id,
+      definition_name: def.name,
+      scope: def.allowed_scopes?.[0] ?? 'table',
+      target_config: {},
+      threshold_config: {},
+      severity: def.default_severity,
+      template_shape: def.template_shape,
+      rationale: def.description,
+    }])
+  }
+
+  const removePattern = (idx: number) => {
+    setPatterns(p => p.filter((_, i) => i !== idx))
+    if (expandedIdx === idx) setExpandedIdx(null)
+  }
+
+  const createMutation = useMutation({
+    mutationFn: () => workflowsApi.create({ label, description, rule_patterns: patterns }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['workflows'] })
+      onClose()
+    },
+  })
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl w-full max-w-2xl p-6 max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">Create Workflow</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="space-y-3 mb-5">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Label</label>
+            <input
+              value={label}
+              onChange={e => setLabel(e.target.value)}
+              placeholder="e.g. PII Audit Workflow"
+              className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Description</label>
+            <textarea
+              value={description}
+              onChange={e => setDescription(e.target.value)}
+              rows={2}
+              placeholder="Optional description…"
+              className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+            />
+          </div>
+        </div>
+
+        <div className="mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">
+              Rule Patterns ({patterns.length})
+            </h4>
+            <button
+              onClick={() => setAddOpen(o => !o)}
+              className="flex items-center gap-1 text-xs px-2.5 py-1 bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 border border-primary-200 dark:border-primary-700 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/50"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Add Rule
+            </button>
+          </div>
+
+          {addOpen && (
+            <div className="mb-3 border border-primary-200 dark:border-primary-700 rounded-lg overflow-hidden">
+              <div className="px-3 py-2 bg-primary-50 dark:bg-primary-900/20 border-b border-primary-200 dark:border-primary-700 flex items-center gap-2">
+                <Search className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
+                <input
+                  autoFocus
+                  value={addSearch}
+                  onChange={e => setAddSearch(e.target.value)}
+                  placeholder="Search rule definitions…"
+                  className="flex-1 text-sm bg-transparent outline-none text-gray-800 dark:text-gray-200 placeholder-gray-400"
+                />
+                {defsLoading && <Loader2 className="w-3.5 h-3.5 animate-spin text-gray-400" />}
+              </div>
+              <div className="max-h-52 overflow-y-auto">
+                {filteredDefs.length === 0 && !defsLoading && (
+                  <p className="text-xs text-gray-400 text-center py-4">No matching rules</p>
+                )}
+                {filteredDefs.map(def => {
+                  const added = alreadyAdded.has(def.id)
+                  return (
+                    <div
+                      key={def.id}
+                      onClick={() => !added && addPattern(def)}
+                      className={`flex items-center gap-3 px-3 py-2.5 border-b border-gray-100 dark:border-gray-700 last:border-0 ${
+                        added ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50'
+                      }`}
+                    >
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-gray-800 dark:text-gray-200 truncate">{def.name}</p>
+                        <p className="text-xs text-gray-400 truncate">{def.category} · {def.description.slice(0, 80)}{def.description.length > 80 ? '…' : ''}</p>
+                      </div>
+                      <span className={`text-xs px-2 py-0.5 rounded-full font-medium flex-shrink-0 ${severityClass(def.default_severity)}`}>
+                        {def.default_severity}
+                      </span>
+                      {added
+                        ? <span className="text-xs text-gray-400 flex-shrink-0">added</span>
+                        : <Plus className="w-3.5 h-3.5 text-primary-500 flex-shrink-0" />
+                      }
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {patterns.length === 0 && !addOpen && (
+            <p className="text-xs text-gray-400 py-4 text-center">
+              No patterns yet — click "Add Rule" to build your workflow.
+            </p>
+          )}
+
+          <div className="space-y-2">
+            {patterns.map((p, idx) => (
+              <div key={idx} className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+                <div
+                  className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50"
+                  onClick={() => setExpandedIdx(expandedIdx === idx ? null : idx)}
+                >
+                  {expandedIdx === idx
+                    ? <ChevronDown className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+                    : <ChevronRight className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+                  }
+                  <span className="text-sm font-medium text-gray-800 dark:text-gray-200 flex-1 truncate">
+                    {p.definition_name}
+                  </span>
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${severityClass(p.severity)}`}>
+                    {p.severity}
+                  </span>
+                  <span className="text-xs text-gray-400">{p.scope}</span>
+                  <button
+                    onClick={e => { e.stopPropagation(); removePattern(idx) }}
+                    className="ml-1 text-gray-400 hover:text-red-500 flex-shrink-0"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                {expandedIdx === idx && (
+                  <div className="px-4 py-3 bg-gray-50 dark:bg-gray-900/40 border-t border-gray-100 dark:border-gray-700 text-xs text-gray-600 dark:text-gray-400 space-y-1">
+                    {p.template_shape && <div><span className="font-medium">Shape:</span> {p.template_shape}</div>}
+                    {p.target_config && Object.keys(p.target_config).length > 0 && (
+                      <div><span className="font-medium">Target:</span> {JSON.stringify(p.target_config)}</div>
+                    )}
+                    {p.threshold_config && Object.keys(p.threshold_config).length > 0 && (
+                      <div><span className="font-medium">Threshold:</span> {JSON.stringify(p.threshold_config)}</div>
+                    )}
+                    {p.rationale && <div><span className="font-medium">Rationale:</span> {p.rationale}</div>}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {createMutation.isError && (
+          <p className="mb-3 text-xs text-red-600">
+            {(createMutation.error as any)?.response?.data?.detail || 'Create failed'}
+          </p>
+        )}
+
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">Cancel</button>
+          <button
+            onClick={() => createMutation.mutate()}
+            disabled={createMutation.isPending || !label.trim()}
+            className="flex items-center gap-2 px-4 py-2 text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50"
+          >
+            {createMutation.isPending
+              ? <><Loader2 className="w-4 h-4 animate-spin" />Creating...</>
+              : <><Save className="w-4 h-4" />Create Workflow</>
+            }
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Edit modal ────────────────────────────────────────────────────────────────
 
 function EditModal({
@@ -496,6 +710,7 @@ export default function SavedWorkflows() {
   const [runTarget, setRunTarget] = useState<WorkflowTemplate | null>(null)
   const [editTarget, setEditTarget] = useState<WorkflowTemplate | null>(null)
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
 
   const { data: workflows = [], isLoading } = useQuery({
     queryKey: ['workflows'],
@@ -519,6 +734,13 @@ export default function SavedWorkflows() {
             Reusable sets of approved rules you can run on any table or schema
           </p>
         </div>
+        <button
+          onClick={() => setCreateOpen(true)}
+          className="flex items-center gap-2 px-4 py-2 text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors"
+        >
+          <Plus className="w-4 h-4" />
+          Create Workflow
+        </button>
       </div>
 
       {isLoading && (
@@ -641,6 +863,7 @@ export default function SavedWorkflows() {
 
       {runTarget && <RunModal workflow={runTarget} onClose={() => setRunTarget(null)} />}
       {editTarget && <EditModal workflow={editTarget} onClose={() => setEditTarget(null)} />}
+      {createOpen && <CreateModal onClose={() => setCreateOpen(false)} />}
     </div>
   )
 }

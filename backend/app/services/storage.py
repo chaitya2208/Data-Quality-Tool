@@ -1832,6 +1832,83 @@ def get_intelligence_log_for_run(run_id: str) -> Optional[SimpleNamespace]:
     return _intelligence_log_from_row(rows[0]) if rows else None
 
 
+def append_intelligence_log_lessons(
+    run_id: str, table_fqn: str, lessons: list
+) -> None:
+    """Persist structured review lessons (approve/reject decisions with reasons)
+    into a dedicated RULE_REVIEW_LESSONS table so future runs on similar tables
+    can read them as grounded guidance rather than raw thinking blobs.
+
+    Table DDL (run once in Snowflake):
+        CREATE TABLE IF NOT EXISTS DQ_APP.RULE_REVIEW_LESSONS (
+            ID          VARCHAR PRIMARY KEY,
+            RUN_ID      VARCHAR,
+            TABLE_FQN   VARCHAR,
+            VERDICT     VARCHAR,        -- 'approved' | 'rejected'
+            CHECK_CONCEPT VARCHAR,
+            COLUMN_NAME VARCHAR,
+            SEVERITY    VARCHAR,
+            REASON      VARCHAR,
+            CREATED_AT  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """
+    try:
+        for lesson in lessons:
+            sf_session.execute(
+                """
+                INSERT INTO DQ_APP.RULE_REVIEW_LESSONS
+                    (ID, RUN_ID, TABLE_FQN, VERDICT, CHECK_CONCEPT, COLUMN_NAME, SEVERITY, REASON)
+                SELECT %(id)s, %(run_id)s, %(table_fqn)s, %(verdict)s,
+                       %(check_concept)s, %(column_name)s, %(severity)s, %(reason)s
+                """,
+                {
+                    "id": _new_id(),
+                    "run_id": run_id,
+                    "table_fqn": table_fqn,
+                    "verdict": lesson.get("verdict", ""),
+                    "check_concept": (lesson.get("check_concept") or "")[:200],
+                    "column_name": (lesson.get("column") or "")[:200],
+                    "severity": (lesson.get("severity") or "")[:50],
+                    "reason": (lesson.get("reason") or "")[:1000],
+                },
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[storage] append_intelligence_log_lessons failed: {e}")
+
+
+def get_review_lessons_for_table(table_fqn: str, limit: int = 20) -> list:
+    """Fetch recent review lessons for tables sharing the same bare table name.
+    Used by RuleIntelligenceAgent._format_past_context to inject structured
+    human feedback into the prompt rather than raw thinking blobs."""
+    try:
+        parts = table_fqn.upper().split(".")
+        table_name = parts[-1] if parts else table_fqn.upper()
+        rows = sf_session.query(
+            """
+            SELECT VERDICT, CHECK_CONCEPT, COLUMN_NAME, SEVERITY, REASON, CREATED_AT
+            FROM DQ_APP.RULE_REVIEW_LESSONS
+            WHERE UPPER(SPLIT_PART(TABLE_FQN, '.', 3)) = %(table_name)s
+               OR TABLE_FQN = %(fqn)s
+            ORDER BY CREATED_AT DESC
+            LIMIT %(limit)s
+            """,
+            {"table_name": table_name, "fqn": table_fqn, "limit": limit},
+        )
+        return [
+            {
+                "verdict": r.get("VERDICT"),
+                "check_concept": r.get("CHECK_CONCEPT"),
+                "column": r.get("COLUMN_NAME"),
+                "severity": r.get("SEVERITY"),
+                "reason": r.get("REASON"),
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
 def update_intelligence_log_outcomes(
     log_id: str, approved_count: int, rejected_count: int
 ) -> None:
@@ -1926,5 +2003,117 @@ def search_similar_intelligence(table_fqn: str, limit: int = 5) -> list[SimpleNa
             },
         )
         return [_intelligence_log_from_row(r) for r in rows]
+    except Exception:
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEEDBACK MEMOS  (synthesised cross-run patterns)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_feedback_memo(bare_table_name: str, table_type: str) -> Optional[dict]:
+    """Return the synthesised feedback memo for this (bare_table_name, table_type)
+    pair, or None if no memo exists yet."""
+    try:
+        rows = sf_session.query(
+            """
+            SELECT MEMO, LESSON_COUNT, UPDATED_AT
+            FROM DQ_APP.RULE_FEEDBACK_MEMOS
+            WHERE BARE_TABLE_NAME = %(name)s
+              AND TABLE_TYPE      = %(type)s
+            LIMIT 1
+            """,
+            {"name": bare_table_name.upper(), "type": table_type.lower()},
+        )
+        if not rows:
+            return None
+        memo = _parse_json(rows[0].get("MEMO"))
+        if not isinstance(memo, dict):
+            return None
+        memo["_lesson_count"] = rows[0].get("LESSON_COUNT", 0)
+        memo["_updated_at"] = str(rows[0].get("UPDATED_AT", ""))
+        return memo
+    except Exception:
+        return None
+
+
+def upsert_feedback_memo(
+    bare_table_name: str,
+    table_type: str,
+    memo: dict,
+    lesson_count: int,
+) -> None:
+    """Insert or replace the feedback memo for this (bare_table_name, table_type)."""
+    existing = sf_session.query(
+        """
+        SELECT ID FROM DQ_APP.RULE_FEEDBACK_MEMOS
+        WHERE BARE_TABLE_NAME = %(name)s AND TABLE_TYPE = %(type)s
+        LIMIT 1
+        """,
+        {"name": bare_table_name.upper(), "type": table_type.lower()},
+    )
+    if existing:
+        sf_session.execute(
+            """
+            UPDATE DQ_APP.RULE_FEEDBACK_MEMOS
+            SET MEMO         = PARSE_JSON(%(memo)s),
+                LESSON_COUNT = %(count)s,
+                UPDATED_AT   = CURRENT_TIMESTAMP()
+            WHERE BARE_TABLE_NAME = %(name)s
+              AND TABLE_TYPE      = %(type)s
+            """,
+            {
+                "memo": json.dumps(memo, default=_json_default),
+                "count": lesson_count,
+                "name": bare_table_name.upper(),
+                "type": table_type.lower(),
+            },
+        )
+    else:
+        sf_session.execute(
+            """
+            INSERT INTO DQ_APP.RULE_FEEDBACK_MEMOS
+                (ID, BARE_TABLE_NAME, TABLE_TYPE, MEMO, LESSON_COUNT)
+            SELECT %(id)s, %(name)s, %(type)s, PARSE_JSON(%(memo)s), %(count)s
+            """,
+            {
+                "id": _new_id(),
+                "name": bare_table_name.upper(),
+                "type": table_type.lower(),
+                "memo": json.dumps(memo, default=_json_default),
+                "count": lesson_count,
+            },
+        )
+
+
+def get_lessons_for_synthesis(
+    table_fqn: str, table_type: str, limit: int = 40
+) -> list:
+    """Fetch lessons for synthesis: all lessons for this bare table name PLUS
+    lessons for any table of the same type that have 5+ data points.
+    Used by FeedbackSynthesisAgent to build a representative training set."""
+    try:
+        parts = table_fqn.upper().split(".")
+        bare = parts[-1] if parts else table_fqn.upper()
+        rows = sf_session.query(
+            """
+            SELECT VERDICT, CHECK_CONCEPT, COLUMN_NAME, SEVERITY, REASON
+            FROM DQ_APP.RULE_REVIEW_LESSONS
+            WHERE UPPER(SPLIT_PART(TABLE_FQN, '.', 3)) = %(bare)s
+            ORDER BY CREATED_AT DESC
+            LIMIT %(limit)s
+            """,
+            {"bare": bare, "limit": limit},
+        )
+        return [
+            {
+                "verdict": r.get("VERDICT"),
+                "check_concept": r.get("CHECK_CONCEPT") or "",
+                "column": r.get("COLUMN_NAME"),
+                "severity": r.get("SEVERITY"),
+                "reason": r.get("REASON") or "",
+            }
+            for r in rows
+        ]
     except Exception:
         return []
