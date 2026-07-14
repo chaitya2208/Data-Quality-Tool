@@ -1,3 +1,5 @@
+C:\D\Agentic-App-v2\Data-Quality-Tool\backend> cd C:\D\Agentic-App-v2\Data-Quality-Tool\backend && .venv\Scripts\activate && uvicorn   app.main:app --port 8002
+
 # Setup Guide - Data Quality Platform
 
 This guide will walk you through setting up the backend for Phase 0.

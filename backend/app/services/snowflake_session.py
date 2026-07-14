@@ -26,6 +26,9 @@ import os
 os.environ.setdefault("PYTHONHTTPSVERIFY", "0")
 ssl._create_default_https_context = ssl._create_unverified_context  # stdlib path
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # Patch Snowflake's vendored pyopenssl — the S3 result-batch downloader uses
 # this path and it bypasses the stdlib ssl._create_default_https_context hook.
 try:
@@ -99,7 +102,7 @@ class SnowflakeSession:
         else:
             params["password"] = settings.SNOWFLAKE_PASSWORD
 
-        self._connection = snowflake.connector.connect(**params, insecure_mode=True)
+        self._connection = snowflake.connector.connect(**params, insecure_mode=True, login_timeout=120)
         logger.info("Snowflake connection established.")
 
     def get_connection(self):

@@ -100,6 +100,37 @@ _MIGRATIONS = [
         """,
     ),
     (
+        "create_rule_review_lessons",
+        """
+        CREATE TABLE IF NOT EXISTS DQ_APP.RULE_REVIEW_LESSONS (
+            ID            VARCHAR(36)    NOT NULL PRIMARY KEY,
+            RUN_ID        VARCHAR(36)    NOT NULL,
+            TABLE_FQN     VARCHAR(500)   NOT NULL,
+            VERDICT       VARCHAR(20)    NOT NULL,
+            CHECK_CONCEPT VARCHAR(200),
+            COLUMN_NAME   VARCHAR(200),
+            SEVERITY      VARCHAR(50),
+            REASON        VARCHAR(1000),
+            CREATED_AT    TIMESTAMP_NTZ  DEFAULT CURRENT_TIMESTAMP()
+        )
+        """,
+    ),
+    (
+        "create_rule_feedback_memos",
+        """
+        CREATE TABLE IF NOT EXISTS DQ_APP.RULE_FEEDBACK_MEMOS (
+            ID                 VARCHAR(36)    NOT NULL PRIMARY KEY,
+            BARE_TABLE_NAME    VARCHAR(200)   NOT NULL,
+            TABLE_TYPE         VARCHAR(50)    NOT NULL,
+            MEMO               VARIANT        NOT NULL,
+            LESSON_COUNT       INTEGER        DEFAULT 0,
+            CREATED_AT         TIMESTAMP_NTZ  DEFAULT CURRENT_TIMESTAMP(),
+            UPDATED_AT         TIMESTAMP_NTZ  DEFAULT CURRENT_TIMESTAMP(),
+            UNIQUE (BARE_TABLE_NAME, TABLE_TYPE)
+        )
+        """,
+    ),
+    (
         "create_rule_intelligence_search",
         # Cortex Search — requires CORTEX_USER privilege.
         # Wrapped in a try inside run_migrations; if Cortex Search is

@@ -16,6 +16,7 @@ WorkflowCoordinator — pipeline:
 import logging
 import threading
 from datetime import datetime
+from types import SimpleNamespace
 from typing import List, Any
 
 from app.services import storage
@@ -478,6 +479,8 @@ class WorkflowCoordinator:
 
         # Back-fill outcome counts on the intelligence log so the vector store
         # reflects whether Claude's proposals were accepted or rejected.
+        # Also persist structured review lessons so future runs on similar
+        # tables learn what kinds of proposals humans accept or reject here.
         try:
             new_instances_rejected = sum(
                 1 for e in skipped_entries if e.get("is_new_instance")
@@ -489,6 +492,33 @@ class WorkflowCoordinator:
                     approved_count=new_instances_approved,
                     rejected_count=new_instances_rejected,
                 )
+
+            # Build structured lessons from this review round
+            run_obj = storage.get_agent_run(self.run_id)
+            review_state = (run_obj.instance_review_state or {}) if run_obj else {}
+            lessons = self._build_review_lessons(
+                active_entries=review_state.get("active", []),
+                skipped_entries=review_state.get("skipped", []),
+            )
+            if lessons:
+                storage.append_intelligence_log_lessons(
+                    run_id=self.run_id,
+                    table_fqn=f"{run.database}.{run.schema_name}.{run.table}",
+                    lessons=lessons,
+                )
+
+            # Synthesise accumulated lessons into a reusable memo — best-effort,
+            # background thread so it never blocks the findings pipeline.
+            table_type = (
+                (storage.get_intelligence_log_for_run(self.run_id) or SimpleNamespace(table_type="unknown"))
+                .table_type or "unknown"
+            )
+            _fqn = f"{run.database}.{run.schema_name}.{run.table}"
+            threading.Thread(
+                target=self._run_feedback_synthesis,
+                args=(_fqn, table_type),
+                daemon=True,
+            ).start()
         except Exception as e:
             logger.warning(f"[Coordinator] Could not update intelligence log outcomes: {e}")
 
@@ -570,6 +600,21 @@ class WorkflowCoordinator:
                 "rules_used":         rules_used,
                 "rules_unused":       rules_unused,
             })
+
+            # ── Findings Explanation Agent ────────────────────────────────
+            # Best-effort AI root-cause + fix-action annotations on each
+            # firing instance. Runs after the findings task is marked
+            # complete so a failure here never affects the run status.
+            if findings:
+                try:
+                    from app.services.agents.findings_explanation_agent import FindingsExplanationAgent
+                    FindingsExplanationAgent().run(
+                        findings=findings,
+                        table_asset=table_asset,
+                        run_id=run.id,
+                    )
+                except Exception as _exp_err:
+                    logger.warning(f"[Coordinator] FindingsExplanationAgent failed (non-fatal): {_exp_err}")
         except Exception as e:
             self._fail_task(findings_task, str(e))
             self._skip_tasks(["verification_agent"])
@@ -780,6 +825,53 @@ class WorkflowCoordinator:
 
         from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
         schedule_verify(run.id)
+
+    # ── Feedback synthesis (background) ──────────────────────────────────────
+
+    @staticmethod
+    def _run_feedback_synthesis(table_fqn: str, table_type: str) -> None:
+        """Called in a daemon thread — synthesise accumulated lessons into a
+        reusable memo. Any exception here is swallowed; this is best-effort."""
+        try:
+            from app.services.agents.feedback_synthesis_agent import FeedbackSynthesisAgent
+            FeedbackSynthesisAgent().run(table_fqn=table_fqn, table_type=table_type)
+        except Exception as e:
+            logger.warning(f"[Coordinator] FeedbackSynthesisAgent failed (non-fatal): {e}")
+
+    # ── Review lesson builder ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_review_lessons(active_entries: list, skipped_entries: list) -> list:
+        """Convert the human's approve/reject decisions into structured lesson
+        dicts that future runs on similar tables can read as "lessons learned".
+
+        Each lesson captures: verdict, check concept, column pattern, and the
+        human's reason — enough for the prompt to say "last time a human
+        rejected an accepted_values check on a STATUS column because the
+        column is intentionally nullable for draft records."
+        """
+        lessons = []
+        for entry in active_entries:
+            if not entry.get("is_new_instance"):
+                continue
+            lessons.append({
+                "verdict": "approved",
+                "check_concept": entry.get("definition_id") or entry.get("name", ""),
+                "column": entry.get("column_name") or (entry.get("target_config") or {}).get("column"),
+                "severity": entry.get("severity"),
+                "reason": entry.get("reason") or "Approved at review",
+            })
+        for entry in skipped_entries:
+            if not entry.get("is_new_instance"):
+                continue
+            lessons.append({
+                "verdict": "rejected",
+                "check_concept": entry.get("definition_id") or entry.get("name", ""),
+                "column": entry.get("column_name") or (entry.get("target_config") or {}).get("column"),
+                "severity": entry.get("severity"),
+                "reason": entry.get("reason") or "Skipped at review",
+            })
+        return lessons
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
