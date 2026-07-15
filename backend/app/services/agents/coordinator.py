@@ -297,7 +297,11 @@ class WorkflowCoordinator:
                 ],
             })
         except Exception as e:
-            logger.error(f"[Coordinator] RuleIntelligenceAgent failed: {e}")
+            import traceback
+            logger.error(
+                f"[Coordinator] RuleIntelligenceAgent failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
             self._fail_task(intel_task, str(e))
             intel_result = {
                 "classification": {"table_type": "unknown", "definitions_evaluated": {}},
@@ -424,12 +428,39 @@ class WorkflowCoordinator:
         # screen that hides the gap.
         signals_missed = intel_result.get("signals_missed", [])
         ai_rules_proposed = len([p for p in proposed_instances if p["kind"] == "new"])
+
+        # ── Unused library bucket ─────────────────────────────────────────────
+        # Definitions the agent knew about but that ended up with NO instance
+        # on this table (neither existing nor newly proposed). Surfaced so the
+        # reviewer can manually activate one — without this bucket the ~20+
+        # library definitions Claude ignored are invisible in the UI, and the
+        # reviewer has no way to discover "we have an SLA breach detector, I
+        # could turn that on for this table" short of clicking through the
+        # rule library page. See instance_review_state schema.
+        used_def_ids = {
+            e["definition_id"] for e in active_entries + skipped_entries if e.get("definition_id")
+        }
+        unused_library = []
+        for d in existing_definitions:
+            if d.id in used_def_ids:
+                continue
+            unused_library.append({
+                "definition_id":  d.id,
+                "name":           d.name,
+                "description":    d.description or "",
+                "category":       getattr(d, "category", "data_quality"),
+                "template_shape": getattr(d, "template_shape", None),
+                "check_kind":     getattr(d, "check_kind", None),
+                "default_severity": getattr(d, "default_severity", "medium"),
+            })
+
         storage.update_agent_run(
             self.run_id,
             ai_rules_count=ai_rules_proposed,
             instance_review_state={
                 "active": active_entries,
                 "skipped": skipped_entries,
+                "unused_library": unused_library,
                 "signals_missed": signals_missed,
                 "ai_rules_proposed": ai_rules_proposed,
                 # True when the model's response couldn't be parsed even after a
@@ -653,6 +684,7 @@ class WorkflowCoordinator:
             _findings_snap = list(findings)
             _table_snap = table_asset
             _run_id_snap = run.id
+            _connection_id_snap = run.connection_id
             def _run_explanation():
                 try:
                     from app.services.agents.findings_explanation_agent import FindingsExplanationAgent
@@ -660,6 +692,7 @@ class WorkflowCoordinator:
                         findings=_findings_snap,
                         table_asset=_table_snap,
                         run_id=_run_id_snap,
+                        connection_id=_connection_id_snap,
                     )
                 except Exception as _exp_err:
                     logger.warning(f"[Coordinator] FindingsExplanationAgent failed (non-fatal): {_exp_err}")

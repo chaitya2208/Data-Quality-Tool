@@ -112,6 +112,7 @@ class RuleEngine:
         scan_id: str,
         allowed_rule_codes: Optional[Set[str]] = None,
         allowed_instance_ids: Optional[Set[str]] = None,
+        instance_id_by_handler_key: Optional[Dict[str, str]] = None,
         source: Any = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -130,11 +131,15 @@ class RuleEngine:
         for col_asset in column_assets:
             findings.extend(self.execute_rules(col_asset, scan_id, allowed_rule_codes))
 
-        # Dynamic pattern-based checks
+        # Dynamic pattern-based checks — only fire for approved per-table
+        # instances. instance_id_by_handler_key wires each emitted finding
+        # back to its RULE_INSTANCES row (globals are gone; findings without
+        # an approved instance get dropped inside run_dynamic_checks).
         try:
             dynamic = run_dynamic_checks(
                 table_asset, column_assets, scan_id,
                 allowed_rule_codes=allowed_rule_codes,
+                instance_id_by_handler_key=instance_id_by_handler_key,
             )
             findings.extend(dynamic)
             logger.info(
@@ -223,12 +228,25 @@ class RuleEngine:
             col_fqn = f"{table_asset.fqn}.{column_name}"
             asset = storage.get_asset_by_fqn(col_fqn) or table_asset
 
+        # Prefer the per-instance rationale (Claude's specific reasoning for
+        # THIS target — e.g. "'XX9' corrupts any revenue aggregation") over
+        # the definition's generic library description ("Flags rows whose
+        # column value falls outside an explicit accepted-values list..."),
+        # which reads as boilerplate on every finding. The definition
+        # description is a decent fallback when rationale is empty, e.g. for
+        # instances created outside the AI proposal path.
+        instance_rationale = (getattr(instance, "rationale", "") or "").strip()
+        detail = instance_rationale or (definition.description or "").strip()
+        description = f"{failed} of {total} rows fail this check."
+        if detail:
+            description = f"{description} {detail}"
+
         return {
             "asset_id": asset.id,
             "scan_id": scan_id,
             "instance_id": instance.id,
             "title": f"{definition.name} violated on {asset.fqn.split('.')[-1]}",
-            "description": f"{failed} of {total} rows fail this check. {definition.description}",
+            "description": description,
             "severity": instance.severity,
             "status": "detected",
             "context": {
@@ -346,72 +364,43 @@ class RuleEngine:
 
 def initialize_default_rules() -> None:
     """
-    Ensure the system rule library exists. The actual seed data lives in
-    snowflake/03_seed_default_rules.sql (run once via setup_db.py); this
-    just self-heals if any of those rows are missing (e.g. a fresh-start
+    Ensure the system rule library holds the DEFINITIONS RuleIntelligence
+    can propose on a per-table basis. No global instances (DATABASE_NAME='*')
+    are created here anymore — a metadata audit runs on a table only if
+    Claude proposes it (and a human reviews it) for that specific table, just
+    like every other check. The library is now a list of concepts, not a set
+    of always-on universal rules.
+
+    Trimmed from the original 16-entry seed on 2026-07-15: dropped 8 noisy
+    metadata handlers (missing_table_comment, missing_column_comment,
+    missing_table_owner, too_many_columns, inconsistent_column_naming,
+    generic_column_name, missing_created_at, missing_updated_at,
+    fk_column_no_constraint) and the redundant column-type-mismatch variants
+    that duplicate boolean/date-as-VARCHAR. Kept the 5 highest-signal
+    metadata handlers.
+
+    Self-heals if any of these rows are missing (e.g. after a fresh-start
     TRUNCATE) without needing a full setup_db.py re-run.
     """
     default_rules = [
-        ("MISSING_TABLE_COMMENT", "Missing Table Comment",
-         "Tables should have descriptive comments explaining their purpose",
-         "documentation", "medium", ["table"]),
-        ("MISSING_TABLE_OWNER", "Missing Table Owner",
-         "Tables should have an assigned owner for accountability",
-         "ownership", "high", ["table"]),
-        ("MISSING_COLUMN_COMMENT", "Missing Column Comment",
-         "Columns should have descriptive comments explaining their data",
-         "documentation", "low", ["column"]),
+        # ── Metadata/schema audits (python_handler, dispatched by handler_key
+        # at findings time). Small deliberate set: each catches a real defect
+        # that shows up in most tables and can't be expressed as a SELECT.
         ("NO_PRIMARY_KEY_HINT", "Table May Be Missing a Primary Key",
          "No column matching common primary-key naming patterns (ID, *_ID, PK_*, *_PK, "
          "*_KEY, *_SEQ) was found. Tables without a primary key risk duplicate rows and "
          "make joins, deduplication, and CDC harder.",
          "schema", "medium", ["table"]),
-        ("MISSING_CREATED_AT", "Missing Row Creation Timestamp",
-         "Production tables should track when rows were inserted via a column such as "
-         "CREATED_AT, CREATE_DATE, or INSERT_TS. This enables auditing, incremental "
-         "loads, and change tracking.",
-         "schema", "medium", ["table"]),
-        ("MISSING_UPDATED_AT", "Missing Row Updated Timestamp",
-         "Mutable tables should track the last modification time via UPDATED_AT, "
-         "MODIFIED_DATE, or equivalent. Required for CDC, incremental ETL, and auditing.",
-         "schema", "low", ["table"]),
-        ("TOO_MANY_COLUMNS", "Table Has Too Many Columns",
-         "Tables with more than 50 columns often indicate poor normalisation, merged "
-         "business entities, or accumulated technical debt. Consider decomposing into "
-         "focused, related tables.",
-         "schema", "low", ["table"]),
-        ("INCONSISTENT_COLUMN_NAMING", "Inconsistent Column Naming Style",
-         "Column names should follow a single naming convention throughout a table "
-         "(e.g. all UPPER_SNAKE_CASE). Mixing styles makes queries harder to write and "
-         "datasets harder to join.",
-         "naming", "low", ["table"]),
-        ("PII_COLUMN_NO_MASKING", "Potential PII Column Without Masking Policy",
-         "Columns whose names suggest personally identifiable information (e.g. EMAIL, "
-         "SSN, PHONE, PASSWORD, DOB, SALARY) should have a Snowflake Dynamic Data "
-         "Masking policy applied and a PII tag attached.",
-         "security", "high", ["column"]),
-        ("GENERIC_COLUMN_NAME", "Generic / Uninformative Column Name",
-         "Column names like COL1, DATA, VALUE, FIELD, or MISC provide no semantic "
-         "context. Rename them to describe what they actually store.",
-         "naming", "low", ["column"]),
-        ("COLUMN_ID_WRONG_TYPE", "Column Type Mismatch — ID/key column should be numeric",
-         "Columns ending in _ID, _KEY, _FK, or _PK should use a numeric type (NUMBER, "
-         "INTEGER, BIGINT). Storing them as VARCHAR causes implicit conversions and "
-         "silent join failures.",
-         "schema", "medium", ["column"]),
-        ("COLUMN_DATE_WRONG_TYPE", "Column Type Mismatch — Date column should be DATE or TIMESTAMP",
-         "Columns ending in _DATE, _DT, or _DAY should use DATE or TIMESTAMP. Storing "
-         "them as other types prevents date arithmetic and proper sorting.",
-         "schema", "medium", ["column"]),
-        ("FK_COLUMN_NO_CONSTRAINT", "Foreign Key Column Without FK Constraint",
-         "Columns ending in '_ID' typically reference another table. Add an unenforced "
-         "REFERENCES clause for documentation and data lineage tools.",
-         "schema", "low", ["column"]),
         ("NULLABLE_ID_COLUMN", "Nullable ID / Primary Key Column",
          "Primary key and identifier columns should never be NULL. A nullable PK column "
          "breaks referential integrity and causes unexpected results in GROUP BY, JOIN, "
          "and deduplication.",
          "schema", "high", ["column"]),
+        ("PII_COLUMN_NO_MASKING", "Potential PII Column Without Masking Policy",
+         "Columns whose names suggest personally identifiable information (e.g. EMAIL, "
+         "SSN, PHONE, PASSWORD, DOB, SALARY) should have a Snowflake Dynamic Data "
+         "Masking policy applied and a PII tag attached.",
+         "security", "high", ["column"]),
         ("BOOLEAN_STORED_AS_VARCHAR", "Boolean/Flag Column Stored as VARCHAR",
          "Columns whose names suggest a boolean or flag value (_FL, _FLAG, _IND, IS_, "
          "_YN) are stored as VARCHAR. This allows invalid values and prevents efficient "
@@ -427,4 +416,4 @@ def initialize_default_rules() -> None:
     for code, name, description, category, severity, applies_to in default_rules:
         storage.ensure_definition(code.lower(), name, description, category, severity, applies_to)
 
-    logger.info("Default rules initialized")
+    logger.info(f"Default rules initialized — {len(default_rules)} metadata-audit definitions")

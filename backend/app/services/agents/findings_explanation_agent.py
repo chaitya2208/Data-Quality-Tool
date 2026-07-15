@@ -22,6 +22,7 @@ from typing import Any, List, Optional
 from app.services import storage
 from app.services.snowflake_session import session as sf_session
 from app.services.claude_client import ask_claude, ask_claude_json
+from app.services.datasources import get_source
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class FindingsExplanationAgent:
         findings: List[Any],
         table_asset: Any,
         run_id: Optional[str] = None,
+        connection_id: Optional[str] = None,
     ) -> None:
         """
         Mutates finding records in-place by updating their resolution_notes
@@ -57,6 +59,9 @@ class FindingsExplanationAgent:
         need to wait on this; it's a value-add, not a gate.
 
         findings: list of Finding objects returned by FindingsAgent.run()
+        connection_id: connection whose DataSource should be used to fetch
+        sample violating rows. Falls back to sf_session ONLY when unresolved,
+        so a Postgres-backed run does not silently query Snowflake.
         """
         # Group findings by instance so we make one call per rule, not per row
         by_instance: dict = {}
@@ -69,27 +74,51 @@ class FindingsExplanationAgent:
         if not by_instance:
             return
 
+        # Resolve the source once; safe to fail — the explain path degrades
+        # to sf_session, which is correct for Snowflake connections and
+        # gracefully-empty for anything else.
+        source = None
+        if connection_id:
+            try:
+                source = get_source(connection_id)
+            except Exception as e:
+                logger.warning(
+                    f"[FindingsExplanation] Could not resolve source for "
+                    f"connection {connection_id}: {e} — falling back to sf_session"
+                )
+
         # Cap total calls to avoid runaway cost on tables with many rules firing
         instance_ids = list(by_instance.keys())[:_MAX_FINDINGS_TO_EXPLAIN]
         logger.info(
             f"[FindingsExplanation] Explaining {len(instance_ids)} firing instance(s) "
-            f"on {table_asset.fqn}"
+            f"on {table_asset.fqn} (source={'multi' if source else 'sf_session_fallback'})"
         )
 
         for instance_id in instance_ids:
             instance_findings = by_instance[instance_id]
             try:
-                self._explain_instance(instance_id, instance_findings, table_asset)
+                self._explain_instance(instance_id, instance_findings, table_asset, source)
             except Exception as e:
                 logger.warning(
                     f"[FindingsExplanation] Failed to explain instance {instance_id}: {e}"
                 )
+
+        # Findings-list API caches results for 30s. Background evidence writes
+        # would otherwise stay invisible to the UI until the TTL rolled — flush
+        # the cache once explanations finish so the next page load sees the
+        # AI analysis and sample rows immediately.
+        try:
+            from app.api.findings import _invalidate_findings_cache
+            _invalidate_findings_cache()
+        except Exception as e:
+            logger.debug(f"[FindingsExplanation] Cache invalidation skipped: {e}")
 
     def _explain_instance(
         self,
         instance_id: str,
         instance_findings: List[Any],
         table_asset: Any,
+        source: Optional[Any] = None,
     ) -> None:
         instance = storage.get_instance(instance_id)
         if not instance:
@@ -103,11 +132,13 @@ class FindingsExplanationAgent:
         finding_count = len(instance_findings)
         first_finding = instance_findings[0]
 
-        # Fetch violating rows from Snowflake for concrete evidence
+        # Fetch violating rows for concrete evidence — through the run's own
+        # DataSource so Postgres findings get real sample rows too, not empty.
         sample_text = self._fetch_violating_rows(
             rule_sql=rule_sql,
             table_asset=table_asset,
             target_col=target_col,
+            source=source,
         )
 
         # Build any context from the existing finding evidence field
@@ -195,9 +226,16 @@ class FindingsExplanationAgent:
         rule_sql: str,
         table_asset: Any,
         target_col: str,
+        source: Optional[Any] = None,
     ) -> str:
         """Run the rule's SQL to find rows that actually fail, then fetch
-        those specific rows for concrete evidence.  Falls back gracefully."""
+        those specific rows for concrete evidence.
+
+        Runs against the run's own DataSource when one is passed in (Postgres
+        or Snowflake); falls back to sf_session only for legacy call sites.
+        Without this, Postgres runs would silently query Snowflake here and
+        return "(no violating rows found)" or an error — findings would
+        surface with ai_explanation but no sample_rows on the UI."""
         if not rule_sql:
             return "(no rule SQL available — python_handler check)"
 
@@ -219,7 +257,8 @@ class FindingsExplanationAgent:
             else:
                 sample_sql = f"SELECT * FROM {fqn} LIMIT {_MAX_SAMPLE_ROWS}"
 
-            rows = sf_session.query(sample_sql)
+            querier = source if source is not None else sf_session
+            rows = querier.query(sample_sql)
             if not rows:
                 return "(no violating rows found)"
 

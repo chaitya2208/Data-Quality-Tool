@@ -90,28 +90,29 @@ def accepted_values_sql(
     )
 
 
-def positive_value_sql(database_name: str, schema_name: str, table_name: str, column_name: str) -> str:
+def range_sql(
+    database_name: str, schema_name: str, table_name: str, column_name: str,
+    min_value: Optional[float] = None, max_value: Optional[float] = None,
+) -> str:
+    """Numeric bounds check. Rows where column is outside [min_value, max_value]
+    fail — either bound may be omitted for one-sided constraints. Callers must
+    supply at least one bound; a range with neither is not a check."""
+    if min_value is None and max_value is None:
+        raise ValueError("range_sql needs at least one of min_value/max_value")
     table = _fqn(database_name, schema_name, table_name)
     col = _safe_identifier(column_name)
+    predicates = []
+    if min_value is not None:
+        predicates.append(f"{col} < {float(min_value)}")
+    if max_value is not None:
+        predicates.append(f"{col} > {float(max_value)}")
+    failed_predicate = " OR ".join(predicates)
     return (
         "SELECT\n"
         "    COUNT(*) AS FAILED_COUNT,\n"
         f"    (SELECT COUNT(*) FROM {table} WHERE {col} IS NOT NULL) AS TOTAL_COUNT\n"
         f"FROM {table}\n"
-        f"WHERE {col} IS NOT NULL AND {col} <= 0"
-    )
-
-
-def email_format_sql(database_name: str, schema_name: str, table_name: str, column_name: str) -> str:
-    table = _fqn(database_name, schema_name, table_name)
-    col = _safe_identifier(column_name)
-    pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
-    return (
-        "SELECT\n"
-        "    COUNT(*) AS FAILED_COUNT,\n"
-        f"    (SELECT COUNT(*) FROM {table} WHERE {col} IS NOT NULL) AS TOTAL_COUNT\n"
-        f"FROM {table}\n"
-        f"WHERE {col} IS NOT NULL AND NOT REGEXP_LIKE({col}, '{pattern}')"
+        f"WHERE {col} IS NOT NULL AND ({failed_predicate})"
     )
 
 
@@ -195,20 +196,58 @@ def referential_integrity_sql(
     )
 
 
-# Shapes Claude can pick by name instead of writing SQL. Each maps to a
-# function above; `params` names the threshold_config keys it needs.
+# Core template shapes Claude can pick by name instead of writing SQL. The
+# long tail (positive_value, email_format, ad-hoc constraints, etc.) lives in
+# draft_sql — validate_sql + _repair_draft_sql handle it. Keeping this set
+# small also keeps the prompt small and prevents Claude from getting anchored
+# on a specific check just because a matching shape name exists.
+#
+# `params` names the threshold_config keys the fn needs; `optional_params`
+# names keys the fn also accepts but has defaults for (used by `range` where
+# either bound alone is a valid check).
 TEMPLATE_SHAPES = {
     "not_null":               {"fn": not_null_sql,               "scope": "column", "params": []},
     "uniqueness":              {"fn": uniqueness_sql,             "scope": "column", "params": []},
     "accepted_values":         {"fn": accepted_values_sql,        "scope": "column", "params": ["accepted_values"]},
-    "positive_value":          {"fn": positive_value_sql,         "scope": "column", "params": []},
-    "email_format":            {"fn": email_format_sql,           "scope": "column", "params": []},
+    "range":                   {"fn": range_sql,                  "scope": "column", "params": [],
+                                 "optional_params": ["min_value", "max_value"]},
     "regex_match":             {"fn": regex_match_sql,            "scope": "column", "params": ["pattern"]},
     "freshness":               {"fn": freshness_sql,              "scope": "column", "params": ["max_age_hours"]},
     "duplicate_key":           {"fn": duplicate_key_sql,           "scope": "multi_column", "params": []},
     "referential_integrity":   {"fn": referential_integrity_sql,   "scope": "cross_table",
                                  "params": ["ref_database", "ref_schema", "ref_table", "ref_column"]},
 }
+
+
+# Common short aliases Claude tends to use for threshold_config keys. Normalising
+# here (in one place) means every render path benefits, and callers don't have
+# to teach the model exact param names. Only aliases where the intent is
+# unambiguous — no synonyms that could refer to two different keys.
+_THRESHOLD_KEY_ALIASES = {
+    "min": "min_value",
+    "max": "max_value",
+    "minimum": "min_value",
+    "maximum": "max_value",
+    "pattern_regex": "pattern",
+    "regex": "pattern",
+    "values": "accepted_values",
+    "allowed_values": "accepted_values",
+}
+
+
+def _normalize_threshold_config(threshold_config: dict[str, Any]) -> dict[str, Any]:
+    """Map short aliases to their canonical keys. On an alias-vs-canonical
+    collision, the canonical wins (the model asked for both, honor the
+    specific one)."""
+    if not threshold_config:
+        return {}
+    out = dict(threshold_config)
+    for alias, canonical in _THRESHOLD_KEY_ALIASES.items():
+        if alias in out and canonical not in out:
+            out[canonical] = out.pop(alias)
+        elif alias in out:
+            out.pop(alias)  # canonical already present, drop the alias
+    return out
 
 
 def render_template(
@@ -226,11 +265,14 @@ def render_template(
     spec = TEMPLATE_SHAPES.get(shape)
     if not spec:
         raise ValueError(f"Unknown template shape: {shape!r}")
-    threshold_config = threshold_config or {}
+    threshold_config = _normalize_threshold_config(threshold_config or {})
 
     if spec["scope"] == "column":
         column = target_config["column"]
         kwargs = {k: threshold_config[k] for k in spec["params"]}
+        for k in spec.get("optional_params", []):
+            if threshold_config.get(k) is not None:
+                kwargs[k] = threshold_config[k]
         return spec["fn"](database_name, schema_name, table_name, column, **kwargs)
 
     if spec["scope"] == "multi_column":

@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime
-from typing import Set, Tuple, Any
+from typing import Set, Tuple, Any, Dict
 
 from app.services import storage
 from app.services.scan_service import ScanService
@@ -97,10 +97,27 @@ class VerificationAgent:
                 checked_instance_ids.add(inst.id)
 
         try:
+            # Build handler_key → instance_id map so dynamic checks emit
+            # findings stamped with the correct per-table instance_id (globals
+            # are gone — a dynamic finding without a matching approved instance
+            # would otherwise be dropped inside run_dynamic_checks).
+            # allowed_codes is derived from the same set — passed as empty
+            # (not None) so no-approved-handler tables run zero dynamic
+            # checks (see FindingsAgent for the reasoning).
+            instance_id_by_handler_key: Dict[str, str] = {}
+            allowed_codes: Set[str] = set()
+            for inst in active_instances:
+                defn = storage.get_definition(inst.definition_id)
+                if defn and defn.check_kind == "python_handler" and defn.handler_key:
+                    instance_id_by_handler_key[defn.handler_key.lower()] = inst.id
+                    allowed_codes.add(defn.handler_key.upper())
+
             # Use a sentinel scan_id so we don't create new Finding rows
             findings_data = rule_engine.execute_all_rules(
                 table_asset, column_assets, scan_id="__verification__",
+                allowed_rule_codes=allowed_codes,
                 allowed_instance_ids=active_instance_ids,
+                instance_id_by_handler_key=instance_id_by_handler_key,
                 source=source,
             )
             for fd in findings_data:

@@ -527,6 +527,21 @@ export interface AgentRun {
   instance_review_state: {
     active: RuleReviewEntry[];
     skipped: RuleReviewEntry[];
+    // Library definitions Claude knew about but that ended up with NO instance
+    // on this table — neither existing nor newly proposed. Surfaced so the
+    // reviewer can discover applicable checks that the agent didn't apply.
+    // Activation currently stubbed (see AgentWorkflow.tsx "Available in Library"
+    // section) — the target/threshold prompt + create-instance wiring is next
+    // round.
+    unused_library?: Array<{
+      definition_id: string;
+      name: string;
+      description: string;
+      category?: string;
+      template_shape?: string | null;
+      check_kind?: string | null;
+      default_severity?: string;
+    }>;
     // Deterministic profiler signals the model never addressed. Freshness has
     // no deterministic backstop, so an omitted freshness signal here means no
     // check was proposed for it — surfaced so the reviewer sees the gap.

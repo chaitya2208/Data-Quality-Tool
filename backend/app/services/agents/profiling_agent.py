@@ -47,6 +47,12 @@ _TEMPORAL_TYPES = _DATE_TYPES | _TIMESTAMP_TYPES
 _CLOSED_SET_MAX_DISTINCT = 50
 _CLOSED_SET_SAMPLE_LIMIT = 200
 
+# Cardinality ceiling for tail-value fetch. Above this we skip — the tail on a
+# high-cardinality column is a bag of one-offs that reveals nothing about the
+# domain, and pulling it costs a full scan.
+_TAIL_VALUES_MAX_DISTINCT = 200
+_TAIL_VALUES_LIMIT = 5
+
 
 class ProfilingAgent:
     def __init__(self, db=None):
@@ -115,12 +121,27 @@ class ProfilingAgent:
                 null_pct = round((null_count / total * 100), 1) if total else 0.0
             top_values = c.get("top_values") or []
 
+            # Tail values (least-frequent) are where typos, legacy codes, and
+            # data-entry one-offs hide — the exact material rules should
+            # catch. Fetch only for low-cardinality columns so we don't do a
+            # full scan on wide-domain text columns.
+            tail_values: List[dict] = []
+            if distinct and distinct <= _TAIL_VALUES_MAX_DISTINCT:
+                try:
+                    tail_values = source.bottom_values(
+                        database, schema, table, name, limit=_TAIL_VALUES_LIMIT,
+                    )
+                except Exception as e:
+                    logger.debug(f"[ProfilingAgent] bottom_values failed for {name}: {e}")
+                    tail_values = []
+
             column_stats[name] = {
                 "total": total,
                 "nulls": null_count,
                 "null_pct": null_pct,
                 "distinct": distinct,
                 "top_values": top_values,
+                "tail_values": tail_values,
             }
 
             # PK-shaped uniqueness signal — only when the column NAME looks like a

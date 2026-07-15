@@ -43,9 +43,30 @@ logger = logging.getLogger(__name__)
 # static validation but is accidentally expensive — see _execute_check_sql.
 _CHECK_SQL_TIMEOUT_SECONDS = 120
 
+def _template_shape_doc_line(name: str, spec: dict) -> str:
+    """Human-readable line for one template shape.
+
+    Includes optional_params separately so Claude sees them as "at least one
+    of ...". Without this, `range` shows `needs: none` (params is [] because
+    min_value / max_value are optional), which is what caused the silent
+    two-proposal discard the first time we ran the rebalanced prompt — Claude
+    picked `range` for PRICE and STOCK_QTY, sent empty threshold_config, and
+    render_template raised ValueError.
+    """
+    parts = [f"scope={spec['scope']}"]
+    required = spec.get("params") or []
+    optional = spec.get("optional_params") or []
+    if required:
+        parts.append(f"required threshold_config keys: {required}")
+    if optional:
+        parts.append(f"optional (at least one required): {optional}")
+    if not required and not optional:
+        parts.append("no threshold_config keys needed")
+    return f"  - {name} ({', '.join(parts)})"
+
+
 _TEMPLATE_SHAPES_DOC = "\n".join(
-    f"  - {name} (scope={spec['scope']}, needs threshold_config keys: {spec['params'] or 'none'})"
-    for name, spec in TEMPLATE_SHAPES.items()
+    _template_shape_doc_line(name, spec) for name, spec in TEMPLATE_SHAPES.items()
 )
 
 # Tool available to Claude during the rule-intelligence agentic loop.
@@ -56,12 +77,19 @@ _SAMPLE_TOOL_SCHEMA = [
     {
         "name": "get_sample_rows",
         "description": (
-            "Fetch sample rows from the table being analysed. Use this when "
-            "the column statistics and top_values you already have are not "
-            "enough to decide whether a check is worth proposing — for "
-            "example: a sparse column where top_values covers only nulls, a "
-            "suspected format pattern you want to verify, or a multi-column "
-            "relationship you need concrete row evidence for. "
+            "Fetch evidence from the table being analysed. Three modes:\n"
+            "  mode=\"sample\" (default): return raw rows, optionally filtered "
+            "by a WHERE predicate. Use for verifying a suspected multi-column "
+            "relationship or seeing what a sparse column's non-null rows "
+            "actually look like.\n"
+            "  mode=\"distinct\": return a distinct-value listing for ONE "
+            "column with occurrence counts — both the most-frequent (top) and "
+            "the least-frequent (tail). The tail is where typos, deprecated "
+            "codes, and one-off values hide; useful before proposing an "
+            "accepted_values or regex check.\n"
+            "  mode=\"nulls\": return null% and a sample of NON-null rows for "
+            "ONE column. Useful when top_values covers only NULL and you need "
+            "to see the actual populated data before proposing a check.\n"
             "Only query the table you were given — requests for other tables "
             "will be rejected. Column names must match the schema exactly. "
             "Results are capped at 20 rows."
@@ -69,33 +97,43 @@ _SAMPLE_TOOL_SCHEMA = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["sample", "distinct", "nulls"],
+                    "description": (
+                        "sample = raw rows (default); distinct = value+count "
+                        "listing for one column (top and tail); nulls = null% "
+                        "plus non-null rows for one column."
+                    ),
+                },
                 "columns": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Subset of columns to return. Use a focused list — "
-                        "omit columns you already understand. Leave empty to "
-                        "return all columns (capped at 10)."
+                        "For mode=sample: subset of columns to return (leave "
+                        "empty for all, capped at 10). For mode=distinct or "
+                        "mode=nulls: EXACTLY ONE column — the one being "
+                        "investigated."
                     ),
                 },
                 "where_clause": {
                     "type": "string",
                     "description": (
                         "Optional WHERE predicate (no WHERE keyword). "
-                        "Example: \"STATUS IS NULL\" or \"AMOUNT < 0\". "
-                        "Must be a pure filter — no subqueries, no JOINs, "
-                        "no aggregates."
+                        "Only honored for mode=sample. Example: "
+                        "\"STATUS IS NULL\" or \"AMOUNT < 0\". Must be a "
+                        "pure filter — no subqueries, no JOINs, no aggregates."
                     ),
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Number of rows to return (1-20, default 10).",
+                    "description": "Number of rows/values to return (1-20, default 10).",
                     "minimum": 1,
                     "maximum": 20,
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Why you need these rows — logged for observability.",
+                    "description": "Why you need this — logged for observability.",
                 },
             },
             "required": [],
@@ -117,9 +155,11 @@ what is already running or pending on this exact table), you will:
 2. For each existing definition that is already active or pending on THIS
    table, decide whether it should keep running (rarely — only if clearly
    irrelevant to this table's business purpose)
-3. Propose NEW instances: either a new application of an EXISTING definition
-   to a column/table on THIS table that doesn't have one yet, or — only if no
-   existing definition covers the concept — a genuinely NEW check.
+3. Propose NEW instances. When an existing definition genuinely fits (same
+   concept + threshold shape), reuse it. But when this table has a
+   domain-specific check no existing definition covers, propose a
+   new_definition rather than force-fit an unrelated one — the library is
+   supposed to grow.
 4. Every new check MUST be backed by a real, executable SQL check — never a
    one-time opinion. Prefer one of these known template shapes when it fits
    (Claude just names the shape + the target/params, no SQL to write):
@@ -134,13 +174,17 @@ what is already running or pending on this exact table), you will:
 5. Use the column statistics (null%, distinct count, min/max, top values)
    to decide whether a check is worth proposing and whether it's currently
    violated — you have real numbers, not just a 3-row guess.
-6. You have access to a tool: get_sample_rows. Call it when the column
+6. You have access to a tool: get_sample_rows. It supports three modes:
+   `mode="sample"` (default) returns raw rows with an optional WHERE filter;
+   `mode="distinct"` returns distinct values + counts (top AND tail — the
+   tail is where typos, legacy values, and one-offs hide); `mode="nulls"`
+   returns null% and a sample of non-null rows. Call it when the column
    statistics alone are not enough to be confident — for example: a column
-   whose top_values are all NULL and you want to know if non-null values
-   follow a pattern; a suspected multi-column constraint you want to verify
-   with a filtered sample; or a column you want to see before proposing an
-   accepted_values or regex check. Do NOT call it for columns you already
-   have enough evidence for. You may call it up to 5 times total.
+   whose top_values are all NULL and you want to see the non-null pattern;
+   a suspected multi-column constraint; a column you're about to propose an
+   accepted_values or regex check on. If you're less than 70% sure a
+   proposal is right, call get_sample_rows first — prefer skipping a
+   proposal over guessing. You may call it up to 5 times total.
 
 Respond with valid JSON only — no markdown, no prose outside the JSON.
 Be thorough, but NEVER propose an instance that duplicates something already
@@ -183,13 +227,17 @@ assumed/world knowledge."""
 # waste reasoning on a nonexistent affordance and doesn't complain the tool is
 # missing when the fallback path (no-tools ask_claude) is used.
 SYSTEM_PROMPT_NO_TOOLS = SYSTEM_PROMPT.replace(
-    "6. You have access to a tool: get_sample_rows. Call it when the column\n"
+    "6. You have access to a tool: get_sample_rows. It supports three modes:\n"
+    "   `mode=\"sample\"` (default) returns raw rows with an optional WHERE filter;\n"
+    "   `mode=\"distinct\"` returns distinct values + counts (top AND tail — the\n"
+    "   tail is where typos, legacy values, and one-offs hide); `mode=\"nulls\"`\n"
+    "   returns null% and a sample of non-null rows. Call it when the column\n"
     "   statistics alone are not enough to be confident — for example: a column\n"
-    "   whose top_values are all NULL and you want to know if non-null values\n"
-    "   follow a pattern; a suspected multi-column constraint you want to verify\n"
-    "   with a filtered sample; or a column you want to see before proposing an\n"
-    "   accepted_values or regex check. Do NOT call it for columns you already\n"
-    "   have enough evidence for. You may call it up to 5 times total.\n\n",
+    "   whose top_values are all NULL and you want to see the non-null pattern;\n"
+    "   a suspected multi-column constraint; a column you're about to propose an\n"
+    "   accepted_values or regex check on. If you're less than 70% sure a\n"
+    "   proposal is right, call get_sample_rows first — prefer skipping a\n"
+    "   proposal over guessing. You may call it up to 5 times total.\n\n",
     "6. No sample-row tool is available in this call — decide from the column\n"
     "   statistics and signals alone. If the evidence isn't enough for a\n"
     "   confident proposal, prefer to skip it rather than guess.\n\n",
@@ -284,10 +332,17 @@ IMPORTANT REQUIREMENTS:
 - Every new_instances entry MUST set exactly one of template_shape or
   draft_sql — never both null, never both set. A check with neither is
   useless: it can never actually run.
+- When you pick a template_shape, populate threshold_config with the exact
+  keys listed above for that shape. For range specifically, supply at least
+  one of {{"min_value": ..., "max_value": ...}} — an empty threshold_config
+  for range is silently discarded. If neither bound applies, use a different
+  shape (accepted_values, regex_match) or draft_sql instead.
 - Base violation_detected and violation_evidence on the COLUMN STATISTICS
   and SAMPLE DATA given above, not assumption.
-- Generate 1-5 new_instances. Skip if this table is already well covered by
-  what's active/pending — do not force new suggestions.
+- Propose every check the data actually supports. There is no cap — the
+  reviewer's job is to filter. Every entry MUST cite a specific column,
+  stat, or signal in its rationale/violation_evidence; skip anything you
+  can't ground that way. Skipping is better than guessing.
 - Your ENTIRE response must be a single valid JSON object starting with {{ and ending with }}."""
 
 VALID_CATEGORIES = {"naming", "documentation", "ownership", "schema", "data_quality", "security", "performance"}
@@ -957,6 +1012,26 @@ class RuleIntelligenceAgent:
                     "promoting candidate via template_shape/similarity/synthesis"
                 )
                 definition_id = None
+            elif template_shape and definition.template_shape != template_shape:
+                # Shape mismatch guard: Claude picked template_shape=X but
+                # attached a definition_id whose canonical shape is Y (or is
+                # None — a python_handler def which by design has no template
+                # shape). This happens because UUIDs are opaque tokens; the
+                # model copied the wrong one from the library list. Concrete
+                # example: candidate template_shape="freshness" on LAST_UPDATED
+                # wired to definition "OHLC Range Consistency" (python_handler,
+                # template_shape=None). Drop the wrong id and fall through to
+                # the template-shape canonical / similarity / synthesis path so
+                # the intent survives, attached to a definition that actually
+                # matches the shape.
+                logger.warning(
+                    f"[RuleIntelligence] Shape mismatch: candidate template_shape={template_shape!r} "
+                    f"but definition_id={definition_id} points to '{definition.name}' "
+                    f"(shape={definition.template_shape!r}) — discarding definition_id, "
+                    "will re-resolve via template_shape canonical."
+                )
+                definition = None
+                definition_id = None
 
         if not definition and not definition_id:
             if template_shape and storage.get_definition_by_template_shape(template_shape):
@@ -1054,9 +1129,15 @@ class RuleIntelligenceAgent:
             rule_sql, threshold_config = self._build_rule_sql(render_candidate, table_asset, target_config)
             label = new_definition_data.get("name", "?") if new_definition_data else (definition.name if definition else "?")
             if not rule_sql:
+                # Include the shape + what Claude sent so a silent drop is
+                # actually debuggable — the two range-template discards on the
+                # first real scan showed up as generic "no valid SQL" lines
+                # in the log with no way to see it was an empty threshold_config.
                 logger.info(
                     f"[RuleIntelligence] Discarding candidate '{label}' — "
-                    "no valid template_shape or draft_sql resolved to executable SQL"
+                    f"no executable SQL resolved. shape={effective_template_shape!r} "
+                    f"threshold_config={candidate.get('threshold_config')!r} "
+                    f"draft_sql={'yes' if candidate.get('draft_sql') else 'no'}"
                 )
                 return None
             # Actually run it now — real query result beats Claude's
@@ -1218,13 +1299,37 @@ class RuleIntelligenceAgent:
         before it enters _process_candidate and hits fingerprinting/SQL execution.
         Deterministic candidates never enter this path (they're already processed).
 
+        Novel proposals (definition_id is None AND new_definition is set) are
+        deliberately routed AROUND this critique — their evidence is naturally
+        weaker than an existing-reuse proposal's, so they used to be cut
+        hardest here, which starved the library of new concepts. The reviewer
+        is the filter for novel concepts; critique is reserved for existing-
+        reuse proposals where the "does this belong here?" question is real.
+
         Uses a fast non-thinking call — this is a scoring/filtering task, not
         an exploration task.
         """
         if not proposals:
             return proposals
 
-        proposals_json = json.dumps(proposals, indent=2)
+        novel_indices: Set[int] = set()
+        critique_targets: List[dict] = []
+        critique_index_map: List[int] = []
+        for i, p in enumerate(proposals):
+            if p.get("definition_id") is None and p.get("new_definition"):
+                novel_indices.add(i)
+                continue
+            critique_index_map.append(i)
+            critique_targets.append(p)
+
+        if not critique_targets:
+            logger.info(
+                f"[RuleIntelligence] Self-critique bypassed — all {len(proposals)} "
+                "proposals are novel (new_definition set), keeping as-is"
+            )
+            return proposals
+
+        proposals_json = json.dumps(critique_targets, indent=2)
         critique_prompt = (
             f"Table: {table_asset.fqn}\n"
             f"Row count: {table_asset.row_count or 'unknown'}\n\n"
@@ -1250,10 +1355,22 @@ class RuleIntelligenceAgent:
         if critique is None:
             logger.warning("[RuleIntelligence] Self-critique returned no parseable JSON — keeping all proposals")
             return proposals
-        scores_by_index = {s["index"]: s for s in critique.get("scores", [])}
+        # Scores are indexed against critique_targets (the subset actually
+        # submitted). Remap back to the full proposals list before the drop
+        # loop so per-proposal indices line up.
+        scores_by_index: Dict[int, dict] = {}
+        for s in critique.get("scores", []):
+            local_i = s.get("index")
+            if local_i is None or local_i < 0 or local_i >= len(critique_index_map):
+                continue
+            scores_by_index[critique_index_map[local_i]] = s
 
         kept = []
         for i, proposal in enumerate(proposals):
+            if i in novel_indices:
+                # Novel proposals bypass critique — keep them all.
+                kept.append(proposal)
+                continue
             score_entry = scores_by_index.get(i)
             if not score_entry:
                 kept.append(proposal)
@@ -1425,67 +1542,168 @@ class RuleIntelligenceAgent:
     def _execute_sample_tool(self, table_asset: Any, inputs: dict) -> str:
         """Safe executor for the get_sample_rows tool call from Claude.
 
+        Dispatches on `mode`:
+          sample   — raw rows (default), optional WHERE
+          distinct — value+count listing for one column (top and tail)
+          nulls    — null% and non-null sample for one column
+
         Enforces:
-        - Only the target table can be queried (rejects any other fqn)
-        - WHERE clause is stripped of dangerous keywords
+        - Only the target table can be queried
+        - Identifiers pass _safe_identifier (letters/digits/underscore only)
+        - WHERE clause is stripped of dangerous keywords, semicolons rejected
         - Row cap of _SAMPLE_MAX_ROWS
         - SELECT-only (no DML)
         """
-        fqn = table_asset.fqn
-        columns = inputs.get("columns") or []
-        where_clause = (inputs.get("where_clause") or "").strip()
-        limit = min(int(inputs.get("limit") or 10), _SAMPLE_MAX_ROWS)
+        mode = (inputs.get("mode") or "sample").lower()
         reason = inputs.get("reason", "")
+        limit = min(int(inputs.get("limit") or 10), _SAMPLE_MAX_ROWS)
+        columns = inputs.get("columns") or []
 
-        logger.info(f"[RuleIntelligence] sample tool: cols={columns} where={where_clause!r} limit={limit} reason={reason!r}")
+        logger.info(
+            f"[RuleIntelligence] sample tool: mode={mode} cols={columns} "
+            f"limit={limit} reason={reason!r}"
+        )
+
+        try:
+            if mode == "distinct":
+                return self._sample_tool_distinct(table_asset, columns, limit)
+            if mode == "nulls":
+                return self._sample_tool_nulls(table_asset, columns, limit)
+            return self._sample_tool_rows(table_asset, columns, inputs.get("where_clause") or "", limit)
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] sample tool ({mode}) failed: {e}")
+            return f"Query failed: {e}"
+
+    @staticmethod
+    def _require_ident(name: str) -> str:
+        """Reject anything that isn't a plain identifier. Uses the same rule
+        rule_sql_templates._safe_identifier applies — letters, digits, and
+        underscore only — so Claude can't smuggle SQL through a column name."""
+        _IDENT_SAFE = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")
+        if not name or not all(c in _IDENT_SAFE for c in name):
+            raise ValueError(f"Unsafe column name: {name!r}")
+        return name
+
+    def _sample_tool_rows(self, table_asset: Any, columns: list, where_clause: str, limit: int) -> str:
+        fqn = table_asset.fqn
+        where_clause = where_clause.strip()
 
         # Safety: reject anything that could turn the filter into a second
         # statement or exfiltration query.
         _FORBIDDEN_WORDS = {"insert", "update", "delete", "drop", "truncate", "create",
                             "alter", "merge", "execute", "exec", "call", "grant", "revoke", "select"}
         where_lower = where_clause.lower()
-        # Semicolons are statement terminators — check with plain 'in', not \b
         if ";" in where_lower:
             return "Rejected: WHERE clause contains forbidden keyword ';'."
         for kw in _FORBIDDEN_WORDS:
             if re.search(r'\b' + kw + r'\b', where_lower):
                 return f"Rejected: WHERE clause contains forbidden keyword '{kw}'."
 
-        col_expr = ", ".join(columns[:_SAMPLE_DEFAULT_COLS]) if columns else "*"
+        safe_cols = [self._require_ident(c) for c in columns[:_SAMPLE_DEFAULT_COLS]]
+        col_expr = ", ".join(safe_cols) if safe_cols else "*"
         sql = f"SELECT {col_expr} FROM {fqn}"
         if where_clause:
             sql += f" WHERE {where_clause}"
         sql += f" LIMIT {limit}"
 
-        try:
-            # Run against the analysed table's OWN source (Snowflake or
-            # Postgres/RDS) — falls back to the shared Snowflake session only
-            # for legacy call sites where no source was plumbed through.
-            rows = self._source.query(sql) if self._source is not None else sf_session.query(sql)
-            if not rows:
-                return "(no rows matched)"
-            headers = list(rows[0].keys())[:_SAMPLE_DEFAULT_COLS]
-            lines = [" | ".join(headers), "-" * 60]
-            for row in rows:
-                vals = [str(row.get(h, ""))[:30] for h in headers]
-                lines.append(" | ".join(vals))
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] sample tool query failed: {e}")
-            return f"Query failed: {e}"
+        rows = self._source.query(sql) if self._source is not None else sf_session.query(sql)
+        if not rows:
+            return "(no rows matched)"
+        headers = list(rows[0].keys())[:_SAMPLE_DEFAULT_COLS]
+        lines = [" | ".join(headers), "-" * 60]
+        for row in rows:
+            vals = [str(row.get(h, ""))[:30] for h in headers]
+            lines.append(" | ".join(vals))
+        return "\n".join(lines)
+
+    def _sample_tool_distinct(self, table_asset: Any, columns: list, limit: int) -> str:
+        """Top-N + bottom-N distinct values with counts for one column. Uses
+        the DataSource primitives (top_values / bottom_values) so it goes
+        through the adapter's native ORDER BY and works on Snowflake + Postgres
+        with identical semantics."""
+        if len(columns) != 1:
+            return "Rejected: mode=distinct requires exactly one column."
+        col = self._require_ident(columns[0])
+        if self._source is None:
+            return "Rejected: mode=distinct requires a resolved data source."
+
+        top = self._source.top_values(
+            table_asset.database_name, table_asset.schema_name, table_asset.table_name,
+            col, limit=limit,
+        )
+        bottom = self._source.bottom_values(
+            table_asset.database_name, table_asset.schema_name, table_asset.table_name,
+            col, limit=limit,
+        )
+        lines = [f"Column {col} — top {len(top)} distinct values by frequency:"]
+        for tv in top:
+            lines.append(f"  {tv.get('value')!r:<40} count={tv.get('count')}")
+        lines.append(f"Column {col} — tail {len(bottom)} distinct values by frequency:")
+        for tv in bottom:
+            lines.append(f"  {tv.get('value')!r:<40} count={tv.get('count')}")
+        return "\n".join(lines)
+
+    def _sample_tool_nulls(self, table_asset: Any, columns: list, limit: int) -> str:
+        """Null% for one column + a sample of its NON-null rows. Useful when
+        top_values on a sparse column shows only NULL and Claude needs to see
+        actual populated values before proposing a check."""
+        if len(columns) != 1:
+            return "Rejected: mode=nulls requires exactly one column."
+        col = self._require_ident(columns[0])
+        fqn = table_asset.fqn
+
+        source = self._source if self._source is not None else sf_session
+        stat_rows = source.query(
+            f"SELECT COUNT(*) AS TOTAL, COUNT({col}) AS NON_NULLS FROM {fqn}"
+        )
+        stat = stat_rows[0] if stat_rows else {}
+        total = stat.get("TOTAL", stat.get("total")) or 0
+        non_nulls = stat.get("NON_NULLS", stat.get("non_nulls")) or 0
+        null_pct = round((total - non_nulls) / total * 100, 1) if total else 0.0
+
+        sample_rows = source.query(
+            f"SELECT {col} FROM {fqn} WHERE {col} IS NOT NULL LIMIT {limit}"
+        )
+        lines = [
+            f"Column {col} — total={total}, non_nulls={non_nulls}, null%={null_pct}",
+            f"Sample non-null values (up to {limit}):",
+        ]
+        if not sample_rows:
+            lines.append("  (no non-null rows found)")
+        else:
+            key = col if col in sample_rows[0] else col.lower()
+            for row in sample_rows:
+                lines.append(f"  {row.get(key)!r}")
+        return "\n".join(lines)
 
     def _format_column_stats(self, column_stats: Dict[str, dict]) -> str:
         """Formats DeterministicProfilerAgent's column_stats for the prompt —
         the querying itself now happens once, upstream in profiler_agent.py,
-        reused for both this text and deterministic candidate generation."""
+        reused for both this text and deterministic candidate generation.
+
+        tail_values (least-frequent, when present) are shown alongside
+        top_values because they surface the outliers real rules should catch
+        — typos, legacy codes, deprecated statuses that top_values alone
+        would never reveal on a skewed distribution.
+        """
         if not column_stats:
             return "  (stats unavailable)"
         lines = []
         for name, stat in column_stats.items():
             top_values = ", ".join(f"{tv['value']!r}({tv['count']})" for tv in stat.get("top_values", []))
+            tail = stat.get("tail_values") or []
+            tail_str = ""
+            if tail:
+                # Only show tail when it differs from top — a tiny closed set
+                # already fits in top_values, and repeating it just wastes tokens.
+                top_val_set = {repr(tv["value"]) for tv in stat.get("top_values", [])}
+                tail_extra = [tv for tv in tail if repr(tv["value"]) not in top_val_set]
+                if tail_extra:
+                    tail_formatted = ", ".join(f"{tv['value']!r}({tv['count']})" for tv in tail_extra)
+                    tail_str = f" tail_values=[{tail_formatted}]"
             lines.append(
                 f"  {name:<25} null%={stat['null_pct']:<6} distinct={stat['distinct']:<8} "
-                f"top_values=[{top_values}]"
+                f"top_values=[{top_values}]{tail_str}"
             )
         return "\n".join(lines)
 

@@ -47,6 +47,7 @@ class FindingsAgent:
         severity_overrides = severity_overrides or {}
 
         allowed_codes = self._resolve_handler_codes(allowed_instance_ids)
+        instance_id_by_handler_key = self._resolve_instance_id_map(allowed_instance_ids)
 
         logger.info(
             f"[FindingsAgent] Running {len(allowed_instance_ids)} approved instances on {table_asset.fqn}"
@@ -62,10 +63,18 @@ class FindingsAgent:
         except Exception as e:
             logger.warning(f"[FindingsAgent] Could not resolve source for scan {scan.id}: {e}")
 
+        # Pass allowed_codes as an EMPTY set (not None) when there are no
+        # approved python_handler instances — the downstream _allowed() check
+        # treats None as "allow everything," which used to be intentional for
+        # the globals era but is now a bug: it lets every dynamic check
+        # function fire against a table that Claude never proposed the check
+        # for. An empty set means "allow nothing," which is correct now that
+        # every handler instance is per-table proposed.
         findings_data = self.rule_engine.execute_all_rules(
             table_asset, column_assets, scan.id,
-            allowed_rule_codes=allowed_codes if allowed_codes else None,
+            allowed_rule_codes=allowed_codes,
             allowed_instance_ids=allowed_instance_ids,
+            instance_id_by_handler_key=instance_id_by_handler_key,
             source=source,
         )
 
@@ -119,6 +128,24 @@ class FindingsAgent:
             if definition.check_kind == "python_handler" and definition.handler_key:
                 codes.add(definition.handler_key.upper())
         return codes
+
+    def _resolve_instance_id_map(self, instance_ids: Set[str]) -> Dict[str, str]:
+        """{handler_key_lower: instance_id} for approved python_handler
+        instances. Threaded into run_dynamic_checks so each finding it emits
+        gets stamped with its approved per-table instance_id (globals are
+        gone; a dynamic-check finding with no matching approved instance is
+        dropped inside run_dynamic_checks)."""
+        mapping: Dict[str, str] = {}
+        for instance_id in instance_ids:
+            instance = storage.get_instance(instance_id)
+            if not instance:
+                continue
+            definition = storage.get_definition(instance.definition_id)
+            if not definition or definition.status == "disabled":
+                continue
+            if definition.check_kind == "python_handler" and definition.handler_key:
+                mapping[definition.handler_key.lower()] = instance_id
+        return mapping
 
     def _apply_severity_overrides(
         self, findings_data: List[dict], overrides: Dict[str, str],

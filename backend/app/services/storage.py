@@ -849,7 +849,15 @@ def ensure_definition(
     allowed_scopes: list[str],
 ) -> SimpleNamespace:
     """Return the python_handler definition for `handler_key`, auto-creating it
-    (as system/active) if missing. Also ensures one global instance exists."""
+    (as system/active) if missing.
+
+    NOTE 2026-07-15: this used to also call ensure_global_instance() to create
+    a DATABASE_NAME='*' instance so the check auto-fired on every scan of
+    every table. That model is gone — a python_handler definition now runs on
+    a table only when RuleIntelligence proposed it (with human review) as a
+    per-table instance. The definition still exists in the library; Claude
+    picks it per table like any other check. See rule_engine.initialize_default_rules
+    and dynamic_rules._ensure_rule for the callers."""
     existing = get_definition_by_handler_key(handler_key)
     if not existing:
         existing = create_definition(
@@ -865,7 +873,6 @@ def ensure_definition(
             owner="data-governance-team",
             created_by="system",
         )
-    ensure_global_instance(existing)
     return existing
 
 
