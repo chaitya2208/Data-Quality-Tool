@@ -1069,8 +1069,28 @@ class RuleIntelligenceAgent:
                 # Check if this "new" concept actually matches an existing one by
                 # name/description similarity — Claude sometimes re-describes a
                 # concept that already has a definition under a different id.
-                matched = self._find_similar_definition(new_definition_data, existing_definitions)
+                #
+                # Search against ALL definitions (proposed + active + disabled),
+                # not just `existing_definitions` (which only has ACTIVE ones):
+                # a previously-synthesized concept still in PROPOSED status
+                # would otherwise be invisible and get duplicated every scan.
+                # Concrete incident (2026-07-15): Claude proposed
+                # "Check-out After Check-in" on EMPLOYEE_ATTENDANCE and
+                # "Cross-Column Date Ordering Violation" on SUBSCRIPTIONS in
+                # separate scans — both are the same concept, but the second
+                # scan didn't see the first because the first was still
+                # `proposed` and RulesFetchAgent only loads ACTIVE.
+                try:
+                    all_defs = storage.list_all_definitions()
+                except Exception as e:
+                    logger.warning(f"[RuleIntelligence] list_all_definitions failed, falling back to active: {e}")
+                    all_defs = existing_definitions
+                matched = self._find_similar_definition(new_definition_data, all_defs)
                 if matched:
+                    logger.info(
+                        f"[RuleIntelligence] Novel proposal '{new_definition_data.get('name')}' "
+                        f"matched existing definition '{matched.name}' (status={matched.status}) — reusing"
+                    )
                     definition = matched
                 else:
                     definition = None  # not persisted yet — staged below
