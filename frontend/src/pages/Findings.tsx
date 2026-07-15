@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { findingsApi, assetsApi, rulesApi } from '../api/client'
 import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck, ChevronDown, ChevronRight, BrainCircuit, TableIcon } from 'lucide-react'
+import { useConnection } from '../ConnectionContext'
 
 // ── Finding card ──────────────────────────────────────────────────────────────
 
@@ -174,6 +175,9 @@ export default function Findings() {
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate    = useNavigate()
   const queryClient = useQueryClient()
+  // Findings are scoped to the selected data source. connId in the query key
+  // makes a source switch refetch the correct rows.
+  const { selectedId: connId } = useConnection()
 
   // ── Filters (initialised from URL params) ──────────────────────────────────
   const [severityFilter, setSeverityFilter] = useState(searchParams.get('severity') || '')
@@ -236,12 +240,13 @@ export default function Findings() {
 
   // ── Data fetching ──────────────────────────────────────────────────────────
   const { data: allFindings, isLoading } = useQuery({
-    queryKey: ['findings', severityFilter, statusFilter, scanIdFilter],
+    queryKey: ['findings', severityFilter, statusFilter, scanIdFilter, connId],
     queryFn: () => findingsApi.list({
-      severity: severityFilter || undefined,
-      status:   statusFilter   || undefined,
-      scan_id:  scanIdFilter   || undefined,
-      limit:    5000,
+      severity:      severityFilter || undefined,
+      status:        statusFilter   || undefined,
+      scan_id:       scanIdFilter   || undefined,
+      connection_id: connId         || undefined,
+      limit:         5000,
     }).then(r => r.data),
     staleTime: 60_000,
   })

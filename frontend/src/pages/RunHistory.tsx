@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { agentRunsApi } from '../api/client'
+import { useConnection } from '../ConnectionContext'
 import {
   History, Loader2, CheckCircle2, AlertTriangle, BrainCircuit,
   Wrench, Database, Search, Filter, ExternalLink,
@@ -39,6 +40,11 @@ export default function RunHistory() {
   const navigate = useNavigate()
   const [search, setSearch]           = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  // Run History is scoped to the selected data source. Runs already carry
+  // connection_id, so we filter client-side; legacy NULL-connection runs are
+  // attributed to Snowflake to match the findings/dashboard scoping rule.
+  const { selectedId: connId, selected } = useConnection()
+  const isSnowflake = (selected?.type ?? '').toLowerCase() === 'snowflake'
 
   const { data, isLoading } = useQuery({
     queryKey: ['agent-runs-history'],
@@ -46,7 +52,12 @@ export default function RunHistory() {
     refetchInterval: 10_000,
   })
 
-  const runs = data?.runs ?? []
+  const allRuns = data?.runs ?? []
+  const runs = allRuns.filter(run =>
+    !connId
+      ? true
+      : run.connection_id === connId || (isSnowflake && !run.connection_id)
+  )
 
   const filtered = runs.filter(run => {
     const matchesStatus = statusFilter === 'all' || run.status === statusFilter
@@ -139,7 +150,7 @@ export default function RunHistory() {
               <span>Status</span>
               <span>Findings</span>
               <span>AI Rules</span>
-              <span></span>
+              <span className="text-right">Actions</span>
             </div>
 
             {filtered.map(run => {

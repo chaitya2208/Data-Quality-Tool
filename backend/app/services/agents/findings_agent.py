@@ -52,10 +52,21 @@ class FindingsAgent:
             f"[FindingsAgent] Running {len(allowed_instance_ids)} approved instances on {table_asset.fqn}"
         )
 
+        # Resolve the finding's own data source so sql_template checks run
+        # against the right database (Snowflake OR Postgres/RDS), not always
+        # the shared Snowflake session.
+        source = None
+        try:
+            from app.services.datasources import get_source
+            source = get_source(getattr(scan, "connection_id", None))
+        except Exception as e:
+            logger.warning(f"[FindingsAgent] Could not resolve source for scan {scan.id}: {e}")
+
         findings_data = self.rule_engine.execute_all_rules(
             table_asset, column_assets, scan.id,
             allowed_rule_codes=allowed_codes if allowed_codes else None,
             allowed_instance_ids=allowed_instance_ids,
+            source=source,
         )
 
         # Severity overrides are applied to the produced findings in memory —
@@ -70,6 +81,16 @@ class FindingsAgent:
 
         # Log RULE_EXECUTIONS for every instance that actually ran
         self._log_executions(findings_data, allowed_instance_ids, scan.id, run_id)
+
+        # Supersede any still-open findings from PRIOR scans for the same
+        # (asset, instance) targets we're about to re-create — re-running a
+        # workflow on a table otherwise leaves stale 'detected' twins from the
+        # old scan, so one real issue showed up in both Detected and Resolved.
+        storage.supersede_open_findings(
+            table_asset_id=table_asset.id,
+            instance_ids=allowed_instance_ids,
+            except_scan_id=scan.id,
+        )
 
         # Persist all findings
         storage.create_findings_bulk(findings_data)

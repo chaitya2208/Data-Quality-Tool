@@ -112,6 +112,7 @@ class RuleEngine:
         scan_id: str,
         allowed_rule_codes: Optional[Set[str]] = None,
         allowed_instance_ids: Optional[Set[str]] = None,
+        source: Any = None,
     ) -> List[Dict[str, Any]]:
         """
         Run static (python_handler) + dynamic + sql_template instances.
@@ -147,13 +148,14 @@ class RuleEngine:
         # since the SQL itself already encodes the target.
         if allowed_instance_ids:
             findings.extend(
-                self.execute_sql_instances(table_asset, scan_id, allowed_instance_ids)
+                self.execute_sql_instances(table_asset, scan_id, allowed_instance_ids, source=source)
             )
 
         return findings
 
     def execute_sql_instances(
         self, table_asset: Any, scan_id: str, allowed_instance_ids: Set[str],
+        source: Any = None,
     ) -> List[Dict[str, Any]]:
         """Run every active sql_template instance in allowed_instance_ids that
         belongs to this table. sql_template instances are ALWAYS bound to a
@@ -185,7 +187,7 @@ class RuleEngine:
             if instance.database_name != table_asset.database_name:
                 continue
             try:
-                result = self._execute_sql_instance(instance, definition, table_asset, scan_id)
+                result = self._execute_sql_instance(instance, definition, table_asset, scan_id, source=source)
                 if result:
                     findings.append(result)
             except Exception as e:
@@ -194,16 +196,21 @@ class RuleEngine:
 
     def _execute_sql_instance(
         self, instance: Any, definition: Any, table_asset: Any, scan_id: str,
+        source: Any = None,
     ) -> Optional[Dict[str, Any]]:
         if not instance.rule_sql:
             logger.warning(f"sql_template instance {instance.id} has no rule_sql")
             return None
-        rows = sf_session.query(instance.rule_sql)
+        # Run against the finding's OWN source (Postgres/RDS or Snowflake) when
+        # one is provided; fall back to the shared Snowflake session otherwise
+        # (legacy/global calls). Snowflake keys come back UPPERCASE, Postgres
+        # lowercase — read both.
+        rows = source.query(instance.rule_sql) if source is not None else sf_session.query(instance.rule_sql)
         if not rows:
             return None
         row = rows[0]
-        failed = row.get("FAILED_COUNT")
-        total = row.get("TOTAL_COUNT")
+        failed = row.get("FAILED_COUNT", row.get("failed_count"))
+        total = row.get("TOTAL_COUNT", row.get("total_count"))
         if failed is None or total is None:
             logger.warning(f"sql_template instance {instance.id} SQL did not return FAILED_COUNT/TOTAL_COUNT")
             return None

@@ -316,3 +316,7 @@ class PostgresSource(DataSource):
                 for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
                     cur.execute(stmt)
             cx.commit()
+
+    def query(self, sql: str) -> List[Dict[str, Any]]:
+        """Read-only query (lowercase keys) — used to run sql_template checks."""
+        return self._query(sql)

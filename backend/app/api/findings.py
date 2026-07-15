@@ -16,8 +16,8 @@ _findings_cache: dict = {}   # key → (expires_at, payload)
 _CACHE_TTL = 30              # seconds
 
 
-def _cache_key(asset_id, scan_id, status, severity, skip, limit):
-    return f"{asset_id}|{scan_id}|{status}|{severity}|{skip}|{limit}"
+def _cache_key(asset_id, scan_id, status, severity, connection_id, skip, limit):
+    return f"{asset_id}|{scan_id}|{status}|{severity}|{connection_id}|{skip}|{limit}"
 
 
 def _invalidate_findings_cache():
@@ -30,18 +30,19 @@ def list_findings(
     scan_id: Optional[str] = None,
     status: Optional[str] = None,
     severity: Optional[str] = None,
+    connection_id: Optional[str] = None,
     skip: int = 0,
     limit: int = 5000,
 ):
     """List all findings with optional filters"""
-    key = _cache_key(asset_id, scan_id, status, severity, skip, limit)
+    key = _cache_key(asset_id, scan_id, status, severity, connection_id, skip, limit)
     cached = _findings_cache.get(key)
     if cached and cached[0] > time.time():
         return cached[1]
 
     total, raw_findings = storage.list_findings(
         asset_id=asset_id, scan_id=scan_id, status=status, severity=severity,
-        skip=skip, limit=limit,
+        connection_id=connection_id, skip=skip, limit=limit,
     )
     findings = []
     for f in raw_findings:
@@ -72,10 +73,14 @@ def update_finding(finding_id: str, update_data: FindingUpdate):
 
     fields = {}
     if update_data.status is not None:
-        fields["status"] = update_data.status
-        if update_data.status == "resolved" and not finding.resolved_at:
+        # FindingStatus is a (str, Enum); the Snowflake connector rejects binding
+        # the enum member itself ("Binding data in type (findingstatus) is not
+        # supported"), so coerce to its plain string value.
+        status_value = update_data.status.value if hasattr(update_data.status, "value") else str(update_data.status)
+        fields["status"] = status_value
+        if status_value == "resolved" and not finding.resolved_at:
             fields["resolved_at"] = datetime.utcnow()
-        elif update_data.status == "closed" and not finding.closed_at:
+        elif status_value == "closed" and not finding.closed_at:
             fields["closed_at"] = datetime.utcnow()
 
     if update_data.assigned_to is not None:
@@ -86,17 +91,44 @@ def update_finding(finding_id: str, update_data: FindingUpdate):
 
     result = storage.update_finding(finding_id, **fields)
     _invalidate_findings_cache()
+
+    # If this update resolved/closed the finding and it was the LAST open finding
+    # for its run, kick an immediate verification so the workflow can complete
+    # right away instead of waiting for the 5-min auto-verify cycle. Best-effort:
+    # any failure here must never break the PATCH response.
+    _CLOSED_STATUSES = {"resolved", "false_positive", "wont_fix", "closed"}
+    if update_data.status is not None and fields.get("status") in _CLOSED_STATUSES:
+        try:
+            _maybe_trigger_verification(finding.scan_id)
+        except Exception as e:
+            logger.warning(f"[findings] post-resolve verify trigger failed: {e}")
+
     return result
 
 
+def _maybe_trigger_verification(scan_id: Optional[str]) -> None:
+    """When a run's findings are all resolved, verify now (delay=0) rather than
+    waiting for the periodic auto-verify. Only acts on runs in awaiting_fixes."""
+    if not scan_id:
+        return
+    run = storage.get_agent_run_by_scan(scan_id)
+    if not run or run.status != "awaiting_fixes":
+        return
+    if storage.count_open_findings_for_scan(scan_id) > 0:
+        return  # still open findings — nothing to complete yet
+    from app.services.agents import auto_verify_scheduler
+    auto_verify_scheduler.schedule(run.id, delay=0)
+    logger.info(f"[findings] All findings resolved for run {run.id} — verifying now")
+
+
 @router.get("/stats/by-database")
-def get_findings_by_database():
+def get_findings_by_database(connection_id: Optional[str] = None):
     """
     Aggregate findings by database → schema → table.
     Joins findings with assets to get proper database/schema/table names.
-    Used for the dashboard chart.
+    Used for the dashboard chart. Optionally scoped to one connection.
     """
-    pairs = storage.findings_with_asset_not_closed()
+    pairs = storage.findings_with_asset_not_closed(connection_id=connection_id)
 
     db_map: dict = defaultdict(lambda: defaultdict(lambda: {"total": 0, "by_severity": defaultdict(int)}))
 
@@ -128,6 +160,6 @@ def get_findings_by_database():
 
 
 @router.get("/stats/summary")
-def get_findings_summary():
-    """Get summary statistics of findings"""
-    return storage.findings_summary()
+def get_findings_summary(connection_id: Optional[str] = None):
+    """Get summary statistics of findings, optionally scoped to one connection."""
+    return storage.findings_summary(connection_id=connection_id)

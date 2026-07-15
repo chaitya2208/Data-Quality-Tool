@@ -22,7 +22,8 @@ export default function AIFix() {
   const [executedFixes, setExecutedFixes] = useState<string[]>([])
   const [copiedSQL, setCopiedSQL] = useState<string | null>(null)
   // Per-finding edited SQL. Keyed by finding id; when a key exists it overrides
-  // the AI's recommended sql_query so the user can tweak before executing.
+  // the AI's recommended sql_query, so the user can tweak the query in place and
+  // Execute runs their edited version. Session-local (not persisted).
   const [editedSql, setEditedSql] = useState<Record<string, string>>({})
 
   // Single call — served from backend startup cache, instant
@@ -213,7 +214,7 @@ export default function AIFix() {
           </div>
           )}
 
-          {/* Postgres/RDS: show which connection fixes run on */}
+          {/* Postgres/RDS: no role/warehouse — show which connection it runs as */}
           {isPostgres && (
             <div className="flex flex-col gap-1 items-end">
               <label className="text-xs font-medium text-gray-500 dark:text-gray-300 flex items-center gap-1">
@@ -245,7 +246,7 @@ export default function AIFix() {
         </div>
       )}
 
-      {/* Postgres/RDS context pill */}
+      {/* Postgres/RDS context pill — connection + user */}
       {isPostgres && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <span className="flex items-center gap-1.5 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-500/40 text-blue-800 dark:text-blue-300 px-3 py-1.5 rounded-full font-medium">
@@ -263,7 +264,7 @@ export default function AIFix() {
       )}
 
       {/* Info banner */}
-      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 flex items-start gap-3">
+      <div className="bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-500/40 rounded-lg p-4 flex items-start gap-3">
         <Sparkles className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
         <p className="text-sm text-blue-800 dark:text-blue-300">
           <span className="font-semibold">Review each fix carefully before approving.</span>{' '}
@@ -277,11 +278,11 @@ export default function AIFix() {
 
       {/* ── Recommendations loading / error banner ── */}
       {loadingRecommendations && (
-        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 flex items-center gap-3">
+        <div className="bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-500/40 rounded-xl p-4 flex items-center gap-3">
           <Loader2 className="w-5 h-5 animate-spin text-blue-600 flex-shrink-0" />
           <div>
-            <p className="text-sm font-semibold text-blue-900">Claude is generating recommendations...</p>
-            <p className="text-xs text-blue-700 mt-0.5">
+            <p className="text-sm font-semibold text-blue-900 dark:text-blue-200">Claude is generating recommendations...</p>
+            <p className="text-xs text-blue-700 dark:text-blue-300 mt-0.5">
               This can take 10–30 seconds. Finding cards will appear below once ready.
             </p>
           </div>
@@ -289,11 +290,11 @@ export default function AIFix() {
       )}
 
       {recsError && (
-        <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-center gap-3">
+        <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-500/40 rounded-xl p-4 flex items-center gap-3">
           <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0" />
           <div>
-            <p className="text-sm font-semibold text-red-900">Failed to generate recommendations</p>
-            <p className="text-xs text-red-700 mt-0.5">
+            <p className="text-sm font-semibold text-red-900 dark:text-red-200">Failed to generate recommendations</p>
+            <p className="text-xs text-red-700 dark:text-red-300 mt-0.5">
               {(recsErrorObj as any)?.response?.data?.detail || 'Check backend logs for details.'}
             </p>
           </div>
@@ -308,6 +309,7 @@ export default function AIFix() {
           const isExecuting = executeMutation.isPending && executeMutation.variables?.findingId === finding.id
           const isExecuted = executedFixes.includes(finding.id)
           const originalSql = rec?.sql_query ?? ''
+          // Effective SQL: the user's edit if present, else the AI's original.
           const sql = editedSql[finding.id] ?? originalSql
           const isEdited = editedSql[finding.id] !== undefined && editedSql[finding.id] !== originalSql
 
@@ -439,9 +441,9 @@ export default function AIFix() {
 
                     {/* Impact */}
                     {rec.impact && (
-                      <div className="flex items-start gap-2 bg-yellow-50 border border-yellow-200 rounded-lg px-4 py-2.5">
+                      <div className="flex items-start gap-2 bg-yellow-50 dark:bg-yellow-950/40 border border-yellow-200 dark:border-yellow-500/40 rounded-lg px-4 py-2.5">
                         <AlertTriangle className="w-4 h-4 text-yellow-500 mt-0.5 flex-shrink-0" />
-                        <p className="text-sm text-yellow-800">
+                        <p className="text-sm text-yellow-800 dark:text-yellow-300">
                           <span className="font-medium">Impact: </span>{rec.impact}
                         </p>
                       </div>
@@ -500,7 +502,7 @@ export default function AIFix() {
 
                 {/* Execution error */}
                 {executeMutation.isError && executeMutation.variables?.findingId === finding.id && (
-                  <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">
+                  <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-500/40 rounded-lg text-sm text-red-800 dark:text-red-300">
                     ❌ {(executeMutation.error as any)?.response?.data?.detail || 'Execution failed. Check backend logs.'}
                   </div>
                 )}

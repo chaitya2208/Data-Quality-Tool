@@ -35,6 +35,7 @@ from app.services.claude_client import ask_claude, ask_claude_agentic
 from app.services.sql_validation import validate_sql
 from app.services.rule_sql_templates import TEMPLATE_SHAPES, render_template
 from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
+
 logger = logging.getLogger(__name__)
 
 # Server-side statement timeout (seconds) for running a candidate check's SQL
@@ -1157,9 +1158,12 @@ class RuleIntelligenceAgent:
                 kept.append(proposal)
             else:
                 reason = score_entry.get("drop_reason") or f"mean score {mean:.1f} < {min_score}"
+                # new_definition is often explicitly null (see prompt schema), so
+                # `.get('new_definition', {})` returns None, not {} — guard with `or {}`.
+                label = (proposal.get("new_definition") or {}).get("name") or proposal.get("definition_id", "?")
                 logger.info(
                     f"[RuleIntelligence] Self-critique dropped proposal[{i}] "
-                    f"'{(proposal.get('new_definition') or {}).get('name') or proposal.get('definition_id', '?')}' "
+                    f"'{label}' "
                     f"— {reason} (evidence={score_entry.get('evidence')}, "
                     f"impact={score_entry.get('impact')}, approval={score_entry.get('approval')})"
                 )

@@ -9,16 +9,17 @@ from app.services.rule_engine import RuleEngine
 logger = logging.getLogger(__name__)
 
 # Statuses that are already considered closed — skip re-checking these
-CLOSED_STATUSES = {"resolved", "false_positive", "wont_fix", "closed"}
+CLOSED_STATUSES = {"resolved", "false_positive", "wont_fix", "closed", "superseded"}
 
 
 class VerificationAgent:
     """
-    Re-scans the table against Snowflake to check which findings have been
-    resolved — whether fixed via the dashboard OR directly in Snowflake.
+    Re-scans the table against its own data source to check which findings
+    have been resolved — whether fixed via the dashboard OR directly in the
+    source (Snowflake or Postgres/RDS).
 
     Flow:
-      1. Re-fetch fresh metadata from Snowflake (updates Asset rows in DB)
+      1. Re-fetch fresh metadata from the data source (updates Asset rows in DB)
       2. Re-run all rules → get set of (rule_code, asset_fqn) that still fire
       3. For each DETECTED finding:
            - If its rule no longer fires → auto-mark resolved
@@ -33,20 +34,31 @@ class VerificationAgent:
         if not run.scan_id:
             raise ValueError("No scan_id on run — cannot verify")
 
-        storage.update_agent_task(task.id, output={"progress": "Refreshing table metadata from Snowflake..."})
+        storage.update_agent_task(task.id, output={"progress": "Refreshing table metadata from the data source..."})
+
+        # Resolve the run's OWN data source so verification re-checks against the
+        # right database (Snowflake OR Postgres/RDS) — the every-N-min auto-verify
+        # and the manual Verify both flow through here.
+        source = None
+        try:
+            from app.services.datasources import get_source
+            source = get_source(getattr(run, "connection_id", None))
+        except Exception as e:
+            logger.warning(f"[VerificationAgent] Could not resolve source for run {run.id}: {e}")
 
         # ── Step 1: Re-fetch fresh metadata ───────────────────────────────────
         try:
             service = ScanService()
             _, table_asset, column_assets = service.scan_metadata_only(
-                run.database, run.schema_name, run.table
+                run.database, run.schema_name, run.table,
+                connection_id=getattr(run, "connection_id", None),
             )
             logger.info(
                 f"[VerificationAgent] Refreshed metadata for {table_asset.fqn} "
                 f"({len(column_assets)} columns)"
             )
         except Exception as e:
-            raise ValueError(f"Failed to refresh metadata from Snowflake: {e}")
+            raise ValueError(f"Failed to refresh metadata from the data source: {e}")
 
         storage.update_agent_task(task.id, output={"progress": "Re-running quality rules against fresh schema..."})
 
@@ -81,6 +93,7 @@ class VerificationAgent:
             findings_data = rule_engine.execute_all_rules(
                 table_asset, column_assets, scan_id="__verification__",
                 allowed_instance_ids=active_instance_ids,
+                source=source,
             )
             for fd in findings_data:
                 ctx = fd.get("context") or {}

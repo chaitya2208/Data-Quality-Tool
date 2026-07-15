@@ -9,6 +9,7 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
 } from 'recharts'
 import { useTheme } from '../ThemeContext'
+import { useConnection } from '../ConnectionContext'
 
 const SEVERITY_COLORS: Record<string, string> = {
   critical: '#ef4444',
@@ -21,6 +22,9 @@ const SEVERITY_COLORS: Record<string, string> = {
 export default function Dashboard() {
   const navigate = useNavigate()
   const { resolved: theme } = useTheme()
+  // Everything on the dashboard is scoped to the selected data source. Including
+  // connId in each query key means switching sources auto-refetches.
+  const { selectedId: connId } = useConnection()
   // Recharts renders SVG text with an inline fill that Tailwind's dark: classes
   // can't reach — drive axis/grid colors from the theme explicitly.
   const axisColor = theme === 'dark' ? '#9ca3af' : '#6b7280'
@@ -28,30 +32,46 @@ export default function Dashboard() {
   // null = showing databases, string = drilled into that database
   const [selectedDb, setSelectedDb] = useState<string | null>(null)
 
-  const { data: stats } = useQuery({
-    queryKey: ['findings-stats'],
-    queryFn: () => findingsApi.stats().then(r => r.data),
+  const { data: stats, isLoading: loadingStats } = useQuery({
+    queryKey: ['findings-stats', connId],
+    queryFn: () => findingsApi.stats(connId).then(r => r.data),
   })
 
   const { data: dbData = [], isLoading: loadingDb } = useQuery({
-    queryKey: ['findings-by-database'],
-    queryFn: () => findingsApi.byDatabase().then(r => r.data),
+    queryKey: ['findings-by-database', connId],
+    queryFn: () => findingsApi.byDatabase(connId).then(r => r.data),
   })
 
-  const { data: runsData } = useQuery({
+  // Count workflow runs (same source as the Run History page) so the card
+  // matches that page's run count, not raw scan rows. Runs already carry
+  // connection_id, so the source filter is applied client-side below.
+  const { data: runsData, isLoading: loadingRuns } = useQuery({
     queryKey: ['agent-runs'],
     queryFn: () => agentRunsApi.list().then(r => r.data),
+    staleTime: 30_000,  // don't refetch-and-flash 0 on every dashboard revisit
   })
 
   const { data: recentFindings } = useQuery({
-    queryKey: ['findings-recent'],
-    queryFn: () => findingsApi.list({ limit: 5 }).then(r => r.data),
+    queryKey: ['findings-recent', connId],
+    queryFn: () => findingsApi.list({ limit: 5, connection_id: connId ?? undefined }).then(r => r.data),
   })
 
+  // Rules are global (not connection-scoped) — a rule definition applies across
+  // sources by design, so this card is intentionally not filtered by connId.
   const { data: ruleStats } = useQuery({
     queryKey: ['rules-stats'],
     queryFn: () => rulesApi.stats().then(r => r.data),
   })
+
+  // Workflow-run count scoped to the selected source. NULL-connection (legacy)
+  // runs are attributed to Snowflake, matching the findings scoping rule.
+  const { selected } = useConnection()
+  const isSnowflake = (selected?.type ?? '').toLowerCase() === 'snowflake'
+  const scopedRuns = (runsData?.runs ?? []).filter(r =>
+    !connId
+      ? true
+      : r.connection_id === connId || (isSnowflake && !r.connection_id)
+  )
 
   // ── Severity pie data ──
   const severityData = stats?.by_severity
@@ -126,7 +146,7 @@ export default function Dashboard() {
     }
   }
 
-  const StatCard = ({ title, value, icon: Icon, color, href }: any) => (
+  const StatCard = ({ title, value, icon: Icon, color, href, loading }: any) => (
     <div
       onClick={() => href && navigate(href)}
       className={`bg-white dark:bg-gray-800 rounded-lg shadow p-6 flex items-center justify-between ${
@@ -135,7 +155,13 @@ export default function Dashboard() {
     >
       <div>
         <p className="text-sm font-medium text-gray-500 dark:text-gray-300">{title}</p>
-        <p className="mt-1 text-3xl font-bold text-gray-900 dark:text-gray-100">{value}</p>
+        {/* Pulsing skeleton while loading — avoids flashing a misleading 0
+            before the query resolves. */}
+        {loading ? (
+          <div className="mt-2 h-8 w-16 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+        ) : (
+          <p className="mt-1 text-3xl font-bold text-gray-900 dark:text-gray-100">{value}</p>
+        )}
         {href && <p className="text-xs text-primary-600 mt-1">Click to view →</p>}
       </div>
       <div className={`p-3 rounded-full ${color}`}>
@@ -154,9 +180,9 @@ export default function Dashboard() {
 
       {/* Stat cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-6">
-        <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           />
-        <StatCard title="Pending Issues"   value={stats?.by_status?.detected ?? 0} icon={Clock}       color="bg-yellow-500" href="/findings?status=detected" />
-        <StatCard title="Workflow Runs"    value={runsData?.runs?.length ?? 0}     icon={CheckCircle} color="bg-green-500"  href="/run-history"        />
+        <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           loading={loadingStats} />
+        <StatCard title="Pending Issues"   value={stats?.by_status?.detected ?? 0} icon={Clock}       color="bg-yellow-500" href="/findings?status=detected" loading={loadingStats} />
+        <StatCard title="Workflow Runs"    value={scopedRuns.length}               icon={CheckCircle} color="bg-green-500"  href="/run-history"        loading={loadingRuns} />
       </div>
 
       {/* ── Database / Table issues chart ── */}
@@ -245,7 +271,7 @@ export default function Dashboard() {
               <button
                 key={d.database}
                 onClick={() => setSelectedDb(d.database)}
-                className="text-left p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-primary-400 hover:bg-primary-50 transition-all group"
+                className="text-left p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-primary-400 hover:bg-primary-50 dark:hover:bg-primary-900/20 transition-all group"
               >
                 <div className="flex items-center gap-1.5 mb-1">
                   <Database className="w-3.5 h-3.5 text-gray-400 dark:text-gray-400 group-hover:text-primary-500" />

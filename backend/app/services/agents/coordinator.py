@@ -404,13 +404,15 @@ class WorkflowCoordinator:
         # state so the reviewer sees "N signals unaddressed" instead of a clean
         # screen that hides the gap.
         signals_missed = intel_result.get("signals_missed", [])
+        ai_rules_proposed = len([p for p in proposed_instances if p["kind"] == "new"])
         storage.update_agent_run(
             self.run_id,
-            ai_rules_count=len([p for p in proposed_instances if p["kind"] == "new"]),
+            ai_rules_count=ai_rules_proposed,
             instance_review_state={
                 "active": active_entries,
                 "skipped": skipped_entries,
                 "signals_missed": signals_missed,
+                "ai_rules_proposed": ai_rules_proposed,
                 # True when the model's response couldn't be parsed even after a
                 # retry — the reviewer should treat "0 proposals" with suspicion
                 # rather than as confirmation the table is fully covered.
@@ -638,7 +640,7 @@ class WorkflowCoordinator:
 
         # Start background auto-verification (every 5 min while awaiting fixes)
         from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
-        schedule_verify(self.run_id)
+        schedule_verify(run.id)
         # Note: batch already advanced when this run reached rule review — do not
         # advance again here, or a table could be skipped.
 

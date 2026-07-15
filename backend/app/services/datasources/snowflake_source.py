@@ -229,6 +229,10 @@ class SnowflakeSource(DataSource):
             warehouse=warehouse or self._warehouse,
         )
 
+    def query(self, sql: str) -> List[Dict[str, Any]]:
+        """Read-only query on the shared SSO session (UPPERCASE keys)."""
+        return sf_session.query(sql)
+
     # ── native AI ─────────────────────────────────────────────────────────────
     def ask_ai(self, prompt: str) -> Optional[str]:
         try:

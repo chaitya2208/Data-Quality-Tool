@@ -1,5 +1,3 @@
-import threading
-import uuid
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from typing import List, Optional
@@ -12,7 +10,7 @@ from app.schemas.agent_run import (
     AgentBatchCreateRequest, AgentBatchResponse, BulkInstanceActionRequest,
 )
 from app.services.agents.coordinator import WorkflowCoordinator, DB_AGENT_ORDER
-from app.services.datasources import get_source
+from app.services.batch_runner import run_batch
 import logging
 
 router = APIRouter()
@@ -54,6 +52,8 @@ def _build_run_response(run) -> AgentRunResponse:
         completed_at=run.completed_at,
         findings_count=run.findings_count,
         ai_rules_count=getattr(run, "ai_rules_count", 0) or 0,
+        ai_rules_proposed=(getattr(run, "instance_review_state", None) or {}).get("ai_rules_proposed")
+            or getattr(run, "ai_rules_count", 0) or 0,
         instance_review_state=getattr(run, "instance_review_state", None),
         error_message=run.error_message,
         created_at=run.created_at,
@@ -82,31 +82,6 @@ def start_workflow(
     return _build_run_response(run)
 
 
-def _expand_scope(req: AgentBatchCreateRequest, source) -> List[tuple]:
-    """Resolve a scope request into an ordered list of (database, schema, table)."""
-    scope = (req.scope or "table").lower()
-
-    if scope == "table":
-        if not (req.schema_name and req.table):
-            raise HTTPException(status_code=400, detail="scope=table requires schema_name and table")
-        return [(req.database, req.schema_name, req.table)]
-
-    if scope == "schema":
-        if not req.schema_name:
-            raise HTTPException(status_code=400, detail="scope=schema requires schema_name")
-        tables = [t["name"] for t in source.list_tables(req.database, req.schema_name)]
-        return [(req.database, req.schema_name, t) for t in tables]
-
-    if scope == "database":
-        targets: List[tuple] = []
-        for sch in source.list_schemas(req.database):
-            for t in source.list_tables(req.database, sch):
-                targets.append((req.database, sch, t["name"]))
-        return targets
-
-    raise HTTPException(status_code=400, detail=f"Unknown scope '{req.scope}'")
-
-
 @router.post("/runs/batch", response_model=AgentBatchResponse, status_code=202)
 def start_batch(request: AgentBatchCreateRequest):
     """
@@ -116,40 +91,19 @@ def start_batch(request: AgentBatchCreateRequest):
     previous one reaches rule review / awaiting fixes.
     """
     try:
-        source = get_source(request.connection_id)
-        targets = _expand_scope(request, source)
-    except HTTPException:
-        raise
+        batch_id, runs = run_batch(
+            connection_id=request.connection_id,
+            scope=request.scope,
+            database=request.database,
+            schema_name=request.schema_name,
+            table=request.table,
+            workflow_template_id=request.workflow_template_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to enumerate scope: {e}")
 
-    if not targets:
-        raise HTTPException(status_code=404, detail="No tables found for the selected scope")
-
-    batch_id = str(uuid.uuid4())
-    runs = []
-    for idx, (database, schema_name, table) in enumerate(targets):
-        run = storage.create_agent_run(
-            connection_id=request.connection_id,
-            database=database,
-            schema_name=schema_name,
-            table=table,
-            status="pending",
-            batch_id=batch_id,
-            batch_index=idx,
-            workflow_template_id=request.workflow_template_id,
-        )
-        storage.create_agent_tasks(run.id, DB_AGENT_ORDER)
-        runs.append(storage.get_agent_run(run.id))
-
-    # Kick off only the first table — the coordinator advances the rest sequentially
-    first = runs[0]
-    threading.Thread(target=WorkflowCoordinator(run_id=first.id).run, daemon=True).start()
-
-    logger.info(
-        f"[API] Started batch {batch_id} scope={request.scope} — {len(runs)} tables, "
-        f"first={first.database}.{first.schema_name}.{first.table}"
-    )
     return AgentBatchResponse(
         batch_id=batch_id,
         scope=request.scope,
@@ -471,6 +425,84 @@ def get_workflow(workflow_id: str):
     return _workflow_response(w)
 
 
+@router.post("/runs/{run_id}/save-as-workflow", status_code=201)
+def save_run_as_workflow(run_id: str, request: dict):
+    """
+    Save a workflow from a run's currently-active rule set. Works for ANY run
+    type — AI pipeline, saved-workflow template, or scheduled — because it reads
+    the active RULE_INSTANCES on the run's target table rather than relying on
+    instance_review_state (which only exists for runs that paused for review).
+    """
+    run = storage.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+
+    label = (request.get("label") or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label is required")
+
+    # The rule set a run applies = its table-scoped active instances PLUS every
+    # global (DATABASE_NAME='*') governance instance, which applies to all
+    # tables. This mirrors what the pipeline itself executes (see
+    # rule_intelligence_agent._existing_active_or_pending_instances). Without the
+    # global union, a run that fires only governance rules — or whose
+    # table-specific proposals were all rejected — has zero table-scoped active
+    # instances and save-as-workflow wrongly reports "No active rules found".
+    _, table_instances = storage.list_instances(
+        database_name=run.database,
+        schema_name=run.schema_name,
+        table_name=run.table,
+        status="active",
+        is_active=True,
+        limit=1000,
+    )
+    _, global_instances = storage.list_instances(
+        database_name="*",
+        status="active",
+        is_active=True,
+        limit=1000,
+    )
+    seen_ids: set = set()
+    instances = []
+    for inst in [*table_instances, *global_instances]:
+        if inst.id not in seen_ids:
+            seen_ids.add(inst.id)
+            instances.append(inst)
+
+    patterns = []
+    for inst in instances:
+        definition = storage.get_definition(inst.definition_id)
+        patterns.append({
+            "definition_id":   inst.definition_id,
+            "definition_name": definition.name if definition else inst.definition_id,
+            "scope":           inst.scope,
+            "target_config":   inst.target_config or {},
+            "threshold_config": inst.threshold_config or {},
+            "severity":        inst.severity,
+            "template_shape":  (definition.template_shape if definition else None),
+            "rationale":       inst.rationale or "",
+        })
+
+    if not patterns:
+        raise HTTPException(
+            status_code=400,
+            detail="No active rules found for this run's table to save as a workflow.",
+        )
+
+    w = storage.create_workflow(
+        label=label,
+        description=(request.get("description") or ""),
+        rule_patterns=patterns,
+        created_by=(request.get("created_by") or ""),
+        origin_scope="table",
+        origin_database=run.database,
+        origin_schema=run.schema_name,
+        origin_table=run.table,
+    )
+    logger.info(f"[API] Saved workflow '{label}' from run {run_id} — {len(patterns)} patterns")
+    return _workflow_response(w)
+
+
 @router.post("/workflows", status_code=201)
 def create_workflow(request: dict):
     label = request.get("label", "").strip()
@@ -484,6 +516,10 @@ def create_workflow(request: dict):
         description=request.get("description", ""),
         rule_patterns=patterns,
         created_by=request.get("created_by", ""),
+        origin_scope=request.get("origin_scope"),
+        origin_database=request.get("origin_database"),
+        origin_schema=request.get("origin_schema"),
+        origin_table=request.get("origin_table"),
     )
     return _workflow_response(w)
 
@@ -520,4 +556,8 @@ def _workflow_response(w) -> dict:
         "created_at": w.created_at.isoformat() if w.created_at else None,
         "updated_at": w.updated_at.isoformat() if w.updated_at else None,
         "pattern_count": len(w.rule_patterns or []),
+        "origin_scope": getattr(w, "origin_scope", None),
+        "origin_database": getattr(w, "origin_database", None),
+        "origin_schema": getattr(w, "origin_schema", None),
+        "origin_table": getattr(w, "origin_table", None),
     }

@@ -39,6 +39,8 @@ async def lifespan(app: FastAPI):
             run_migrations()
         except Exception as mig_err:
             logger.warning(f"Migrations skipped: {mig_err}")
+        # Start the schedule runner AFTER migrations so the SCHEDULES table
+        # exists. Best-effort — a scheduler failure must not block startup.
         try:
             from app.services import schedule_runner
             schedule_runner.start()

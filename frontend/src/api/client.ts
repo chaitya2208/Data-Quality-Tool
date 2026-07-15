@@ -231,8 +231,10 @@ export const findingsApi = {
   list: (params?: any) => api.get<{ total: number; findings: Finding[] }>('/findings', { params }),
   get: (id: string) => api.get<Finding>(`/findings/${id}`),
   update: (id: string, data: any) => api.patch<Finding>(`/findings/${id}`, data),
-  stats: () => api.get<FindingStats>('/findings/stats/summary'),
-  byDatabase: () => api.get<DatabaseFindingSummary[]>('/findings/stats/by-database'),
+  stats: (connectionId?: string | null) =>
+    api.get<FindingStats>('/findings/stats/summary', { params: connectionId ? { connection_id: connectionId } : {} }),
+  byDatabase: (connectionId?: string | null) =>
+    api.get<DatabaseFindingSummary[]>('/findings/stats/by-database', { params: connectionId ? { connection_id: connectionId } : {} }),
 };
 
 export const scansApi = {
@@ -520,7 +522,8 @@ export interface AgentRun {
   started_at: string | null;
   completed_at: string | null;
   findings_count: number;
-  ai_rules_count: number;
+  ai_rules_count: number;       // approved after user review
+  ai_rules_proposed: number;    // proposed by AI before review
   instance_review_state: {
     active: RuleReviewEntry[];
     skipped: RuleReviewEntry[];
@@ -531,6 +534,7 @@ export interface AgentRun {
     // True when the model's JSON was unparseable even after a retry: "0
     // proposals" should be treated as suspect, not as full coverage.
     parse_failed?: boolean;
+    ai_rules_proposed?: number;
   } | null;
   error_message: string | null;
   created_at: string;

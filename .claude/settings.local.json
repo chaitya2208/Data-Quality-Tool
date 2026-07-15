@@ -175,7 +175,13 @@
       "Bash(cp /tmp/schedule_calc.py \"C:/D/Agentic-App-v2/Data-Quality-Tool/backend/app/services/schedule_calc.py\")",
       "Bash(cp /tmp/schedule_runner.py \"C:/D/Agentic-App-v2/Data-Quality-Tool/backend/app/services/schedule_runner.py\")",
       "Bash(grep -v \"//\\\\|animate-spin\\\\|icon: Clock\\\\|Clock }\\\\|Clock,\")",
-      "Bash(/C/D/Agentic-App-v2/Data-Quality-Tool/backend/.venv/Scripts/python.exe -)"
+      "Bash(/C/D/Agentic-App-v2/Data-Quality-Tool/backend/.venv/Scripts/python.exe -)",
+      "Bash(backend/venv/Scripts/python.exe -c ' *)",
+      "Bash(backend/venv/Scripts/python.exe -)",
+      "Bash(./venv/Scripts/python.exe -)",
+      "Bash(backend/venv/Scripts/python.exe -m py_compile backend/app/services/storage.py backend/app/api/findings.py)",
+      "Bash(grep -nE \"\\\\.get\\\\\\('new_definition', \\\\{\\\\}\\\\\\)\\\\.get|\\\\.get\\\\\\(\\\\\"new_definition\\\\\", \\\\{\\\\}\\\\\\)\\\\.get|\\\\.get\\\\\\('[a-z_]+', \\\\{\\\\}\\\\\\)\\\\.get\" backend/app/services/agents/rule_intelligence_agent.py)",
+      "Bash(powershell.exe -Command 'Get-CimInstance Win32_Process -Filter \"name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*uvicorn*'\\\\'' } | ForEach-Object { $_.CommandLine }')"
     ]
   }
 }

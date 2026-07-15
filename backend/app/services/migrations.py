@@ -48,6 +48,57 @@ _MIGRATIONS = [
         )
         """,
     ),
+    # Origin of a saved workflow (the table it was created from) so the Schedule
+    # modal can auto-fill scope/database/schema/table. Nullable — workflows saved
+    # before this migration have no origin and fall back to manual entry. One
+    # column per statement (Snowflake does not accept repeated ADD COLUMN clauses
+    # in a single ALTER), matching the proven single-column pattern above.
+    (
+        "add_workflow_origin_scope",
+        "ALTER TABLE WORKFLOW_TEMPLATES ADD COLUMN IF NOT EXISTS ORIGIN_SCOPE VARCHAR(20)",
+    ),
+    (
+        "add_workflow_origin_database",
+        "ALTER TABLE WORKFLOW_TEMPLATES ADD COLUMN IF NOT EXISTS ORIGIN_DATABASE VARCHAR(255)",
+    ),
+    (
+        "add_workflow_origin_schema",
+        "ALTER TABLE WORKFLOW_TEMPLATES ADD COLUMN IF NOT EXISTS ORIGIN_SCHEMA VARCHAR(255)",
+    ),
+    (
+        "add_workflow_origin_table",
+        "ALTER TABLE WORKFLOW_TEMPLATES ADD COLUMN IF NOT EXISTS ORIGIN_TABLE VARCHAR(255)",
+    ),
+    (
+        "create_schedules",
+        """
+        CREATE TABLE IF NOT EXISTS SCHEDULES (
+            ID                   VARCHAR(36)   NOT NULL PRIMARY KEY,
+            NAME                 VARCHAR(200)  NOT NULL,
+            ENABLED              BOOLEAN       DEFAULT TRUE,
+            CONNECTION_ID        VARCHAR(36),
+            SCOPE                VARCHAR(20)   NOT NULL,   -- database | schema | table
+            DATABASE_NAME        VARCHAR(255),
+            SCHEMA_NAME          VARCHAR(255),
+            TABLE_NAME           VARCHAR(255),
+            WORKFLOW_TEMPLATE_ID VARCHAR(36),              -- null = AI pipeline, set = saved workflow
+            CADENCE              VARCHAR(20)   NOT NULL,    -- daily|weekly|monthly|yearly|custom
+            TIME_OF_DAY          VARCHAR(5),               -- 'HH:MM' 24h, server-local
+            DAY_OF_WEEK          INTEGER,                  -- weekly: 0=Mon..6=Sun
+            DAY_OF_MONTH         INTEGER,                  -- monthly/yearly: 1..31
+            MONTH_OF_YEAR        INTEGER,                  -- yearly: 1..12
+            INTERVAL_VALUE       INTEGER,                  -- custom: N
+            INTERVAL_UNIT        VARCHAR(10),              -- custom: 'hours'|'days'
+            NEXT_RUN_AT          TIMESTAMP_NTZ,
+            LAST_RUN_AT          TIMESTAMP_NTZ,
+            LAST_BATCH_ID        VARCHAR(36),
+            LAST_STATUS          VARCHAR(20),              -- 'ok'|'error'
+            LAST_ERROR           VARCHAR(1024),
+            CREATED_AT           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            CREATED_BY           VARCHAR(200)
+        )
+        """,
+    ),
     (
         "create_rule_review_lessons",
         """
