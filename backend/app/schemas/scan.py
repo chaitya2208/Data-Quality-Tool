@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from app.core.enums import ScanStatus, ScanType

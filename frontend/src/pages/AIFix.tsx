@@ -69,8 +69,6 @@ export default function AIFix() {
     staleTime: 5 * 60 * 1000, // cache for 5 min — avoid re-calling Claude on re-render
   })
 
-  const isLoading = loadingFindings || loadingRecommendations
-
   // Which data source these findings belong to. All findings in one AI-Fix
   // session share a connection, so the first recommendation's source_type is
   // authoritative. Postgres/RDS fixes run as the connection's user — no

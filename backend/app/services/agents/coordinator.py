@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from typing import List, Any
 
 from app.services import storage
-from app.services.snowflake_session import session as sf_session
 
 logger = logging.getLogger(__name__)
 

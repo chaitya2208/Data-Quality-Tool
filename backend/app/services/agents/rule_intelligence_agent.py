@@ -31,7 +31,7 @@ from typing import List, Optional, Dict, Any, Set
 from app.services import storage
 from app.services.fingerprint import compute_fingerprint
 from app.services.snowflake_session import session as sf_session
-from app.services.claude_client import ask_claude, ask_claude_with_thinking, ask_claude_agentic
+from app.services.claude_client import ask_claude, ask_claude_agentic
 from app.services.sql_validation import validate_sql
 from app.services.rule_sql_templates import TEMPLATE_SHAPES, render_template
 from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD

@@ -664,11 +664,6 @@ def get_definition_by_handler_key(handler_key: str) -> Optional[SimpleNamespace]
     return _definition_from_row(rows[0]) if rows else None
 
 
-def get_definition_by_name(name: str) -> Optional[SimpleNamespace]:
-    rows = sf_session.query("SELECT * FROM RULE_DEFINITIONS WHERE NAME = %(name)s", {"name": name})
-    return _definition_from_row(rows[0]) if rows else None
-
-
 def get_definition_by_template_shape(template_shape: str) -> Optional[SimpleNamespace]:
     """Exact lookup for the canonical, system-wide definition backing a
     sql_template shape (not_null, uniqueness, ...) — the fix for definition-
@@ -817,37 +812,6 @@ def ensure_definition(
     return existing
 
 
-def ensure_template_definition(
-    template_shape: str,
-    name: str,
-    description: str,
-    category: str,
-    severity: str,
-    allowed_scopes: list[str],
-) -> SimpleNamespace:
-    """Return the canonical sql_template definition for `template_shape`,
-    auto-creating it (as system/active) if missing — the sql_template analog
-    of ensure_definition() above. Unlike ensure_definition, does NOT create a
-    global instance: sql_template checks are always table/column-scoped via
-    their own TARGET_CONFIG, there is no 'runs everywhere' degenerate case."""
-    existing = get_definition_by_template_shape(template_shape)
-    if existing:
-        return existing
-    return create_definition(
-        name=name,
-        category=category,
-        description=description,
-        check_kind="sql_template",
-        template_shape=template_shape,
-        default_severity=severity,
-        allowed_scopes=allowed_scopes,
-        source="system",
-        status="active",
-        owner="data-governance-team",
-        created_by="system",
-    )
-
-
 def update_definition(definition_id: str, **fields: Any) -> SimpleNamespace:
     """Partial update. JSON fields (parameters_schema, default_threshold_config,
     allowed_scopes) are auto-detected."""
@@ -992,11 +956,6 @@ def list_instances(
         {**params, "limit": limit, "skip": skip},
     )
     return total, [_instance_from_row(r) for r in rows]
-
-
-def list_all_instances() -> list[SimpleNamespace]:
-    rows = sf_session.query("SELECT * FROM RULE_INSTANCES")
-    return [_instance_from_row(r) for r in rows]
 
 
 def _instance_as_rule_view(instance: SimpleNamespace, definition: SimpleNamespace) -> SimpleNamespace:
@@ -1247,75 +1206,6 @@ def list_relationships(
         params,
     )
     return [_relationship_from_row(r) for r in rows]
-
-
-def upsert_relationship(
-    database_name: str,
-    schema_name: str,
-    from_table: str,
-    from_column: str,
-    to_table: str,
-    to_column: str,
-    status: str = "confirmed",
-    confidence: str = "name_match",
-    orphan_rate: Optional[float] = None,
-    sample_total: Optional[int] = None,
-    sample_orphans: Optional[int] = None,
-) -> SimpleNamespace:
-    """Insert or refresh one relationship candidate, keyed on
-    (database, schema, from_table, from_column, to_table, to_column). Callers
-    re-discovering a schema simply upsert every candidate again — no need to
-    diff against the previous run's rows first."""
-    existing_rows = sf_session.query(
-        """
-        SELECT ID FROM RELATIONSHIP_CATALOG
-        WHERE DATABASE_NAME = %(database_name)s AND SCHEMA_NAME = %(schema_name)s
-          AND FROM_TABLE = %(from_table)s AND FROM_COLUMN = %(from_column)s
-          AND TO_TABLE = %(to_table)s AND TO_COLUMN = %(to_column)s
-        """,
-        {
-            "database_name": database_name, "schema_name": schema_name,
-            "from_table": from_table, "from_column": from_column,
-            "to_table": to_table, "to_column": to_column,
-        },
-    )
-    params = {
-        "status": status, "confidence": confidence, "orphan_rate": orphan_rate,
-        "sample_total": sample_total, "sample_orphans": sample_orphans,
-    }
-    if existing_rows:
-        relationship_id = existing_rows[0]["ID"]
-        sf_session.execute(
-            """
-            UPDATE RELATIONSHIP_CATALOG
-            SET STATUS = %(status)s, CONFIDENCE = %(confidence)s, ORPHAN_RATE = %(orphan_rate)s,
-                SAMPLE_TOTAL = %(sample_total)s, SAMPLE_ORPHANS = %(sample_orphans)s,
-                LAST_VERIFIED_AT = CURRENT_TIMESTAMP()
-            WHERE ID = %(id)s
-            """,
-            {**params, "id": relationship_id},
-        )
-    else:
-        relationship_id = _new_id()
-        sf_session.execute(
-            """
-            INSERT INTO RELATIONSHIP_CATALOG
-                (ID, DATABASE_NAME, SCHEMA_NAME, FROM_TABLE, FROM_COLUMN, TO_TABLE, TO_COLUMN,
-                 STATUS, CONFIDENCE, ORPHAN_RATE, SAMPLE_TOTAL, SAMPLE_ORPHANS)
-            SELECT
-                %(id)s, %(database_name)s, %(schema_name)s, %(from_table)s, %(from_column)s,
-                %(to_table)s, %(to_column)s, %(status)s, %(confidence)s, %(orphan_rate)s,
-                %(sample_total)s, %(sample_orphans)s
-            """,
-            {
-                **params, "id": relationship_id,
-                "database_name": database_name, "schema_name": schema_name,
-                "from_table": from_table, "from_column": from_column,
-                "to_table": to_table, "to_column": to_column,
-            },
-        )
-    rows = sf_session.query("SELECT * FROM RELATIONSHIP_CATALOG WHERE ID = %(id)s", {"id": relationship_id})
-    return _relationship_from_row(rows[0])
 
 
 def replace_relationships(

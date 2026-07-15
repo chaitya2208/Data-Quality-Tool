@@ -1,4 +1,3 @@
-import json
 from fastapi import APIRouter, HTTPException
 from app.services import storage
 from app.services.snowflake_session import session as sf_session
