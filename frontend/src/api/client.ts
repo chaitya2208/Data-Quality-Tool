@@ -528,6 +528,7 @@ export interface AgentRun {
   } | null;
   error_message: string | null;
   created_at: string;
+  schedule_id: string | null;  // set when the run was fired by a schedule
   tasks: AgentTask[];
 }
 

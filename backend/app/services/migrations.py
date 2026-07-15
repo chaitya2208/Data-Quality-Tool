@@ -15,6 +15,12 @@ _MIGRATIONS = [
         "ALTER TABLE AGENT_RUNS ADD COLUMN IF NOT EXISTS WORKFLOW_TEMPLATE_ID VARCHAR(36)",
     ),
     (
+        # Links a run back to the schedule that fired it (null for manual/ad-hoc
+        # runs) so Run History can badge and filter scheduled runs reliably.
+        "add_schedule_id_to_agent_runs",
+        "ALTER TABLE AGENT_RUNS ADD COLUMN IF NOT EXISTS SCHEDULE_ID VARCHAR(36)",
+    ),
+    (
         "create_workflow_templates",
         """
         CREATE TABLE IF NOT EXISTS WORKFLOW_TEMPLATES (

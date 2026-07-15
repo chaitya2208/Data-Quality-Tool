@@ -60,6 +60,7 @@ def run_batch(
     schema_name: Optional[str] = None,
     table: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
+    schedule_id: Optional[str] = None,
 ) -> Tuple[str, List]:
     """
     Expand the scope, create one pending AgentRun per target sharing a batch_id,
@@ -86,6 +87,7 @@ def run_batch(
             batch_id=batch_id,
             batch_index=idx,
             workflow_template_id=workflow_template_id,
+            schedule_id=schedule_id,
         )
         storage.create_agent_tasks(run.id, DB_AGENT_ORDER)
         runs.append(storage.get_agent_run(run.id))

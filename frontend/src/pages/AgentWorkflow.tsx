@@ -842,6 +842,11 @@ export default function AgentWorkflow() {
                       <AlertTriangle className="w-3 h-3" />Failed
                     </span>
                   )}
+                  {activeRun.schedule_id && (
+                    <span className="flex items-center gap-1 text-xs text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-500/40 px-2 py-0.5 rounded-full font-medium" title="Fired by a schedule">
+                      <Clock className="w-3 h-3" />Scheduled
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-gray-400 dark:text-gray-400 mt-0.5 font-mono truncate">
                   {activeRun.database}.{activeRun.schema_name}.{activeRun.table}

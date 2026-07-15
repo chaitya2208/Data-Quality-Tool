@@ -55,6 +55,7 @@ def _build_run_response(run) -> AgentRunResponse:
         instance_review_state=getattr(run, "instance_review_state", None),
         error_message=run.error_message,
         created_at=run.created_at,
+        schedule_id=getattr(run, "schedule_id", None),
         tasks=[_build_task_response(t) for t in run.tasks],
     )
 

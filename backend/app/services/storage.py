@@ -1384,6 +1384,7 @@ def _agent_run_from_row(row: dict, tasks: Optional[list] = None) -> SimpleNamesp
         error_message=row["ERROR_MESSAGE"],
         created_at=row["CREATED_AT"],
         workflow_template_id=row.get("WORKFLOW_TEMPLATE_ID"),
+        schedule_id=row.get("SCHEDULE_ID"),
         tasks=tasks if tasks is not None else [],
     )
 
@@ -1412,16 +1413,17 @@ def create_agent_run(
     run_id: Optional[str] = None,
     connection_id: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
+    schedule_id: Optional[str] = None,
 ) -> SimpleNamespace:
     run_id = run_id or _new_id()
     sf_session.execute(
         """
         INSERT INTO AGENT_RUNS
             (ID, CONNECTION_ID, BATCH_ID, BATCH_INDEX, DATABASE_NAME, SCHEMA_NAME,
-             TABLE_NAME, STATUS, WORKFLOW_TEMPLATE_ID)
+             TABLE_NAME, STATUS, WORKFLOW_TEMPLATE_ID, SCHEDULE_ID)
         VALUES
             (%(id)s, %(connection_id)s, %(batch_id)s, %(batch_index)s, %(database)s,
-             %(schema_name)s, %(table)s, %(status)s, %(workflow_template_id)s)
+             %(schema_name)s, %(table)s, %(status)s, %(workflow_template_id)s, %(schedule_id)s)
         """,
         {
             "id": run_id,
@@ -1433,6 +1435,7 @@ def create_agent_run(
             "table": table,
             "status": status,
             "workflow_template_id": workflow_template_id,
+            "schedule_id": schedule_id,
         },
     )
     return get_agent_run(run_id)
