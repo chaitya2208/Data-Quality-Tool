@@ -262,21 +262,44 @@ function DefinitionToggle({ definition }: { definition: RuleDefinition }) {
 
   const toggleMutation = useMutation({
     mutationFn: (is_active: boolean) => ruleLibraryApi.toggleDefinition(definition.id, is_active),
+    onMutate: async (is_active: boolean) => {
+      await queryClient.cancelQueries({ queryKey: ['rule-definitions'] })
+      const previous = queryClient.getQueryData(['rule-definitions'])
+      queryClient.setQueriesData({ queryKey: ['rule-definitions'] }, (old: any) => {
+        if (!old) return old
+        const newStatus = is_active ? 'active' : 'disabled'
+        if (Array.isArray(old))
+          return old.map((d: any) => d.id === definition.id ? { ...d, status: newStatus } : d)
+        if (old.items)
+          return { ...old, items: old.items.map((d: any) => d.id === definition.id ? { ...d, status: newStatus } : d) }
+        return old
+      })
+      return { previous }
+    },
+    onError: (_err, _vars, context: any) => {
+      if (context?.previous) queryClient.setQueryData(['rule-definitions'], context.previous)
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['rule-definitions'] })
       queryClient.invalidateQueries({ queryKey: ['rules-stats'] })
     },
   })
 
+  const isPending = toggleMutation.isPending
+  const optimisticActive = isPending
+    ? !(definition.status === 'active')
+    : definition.status === 'active'
+
   if (!canToggle) return <div className="w-6 flex-shrink-0" />
 
   return (
     <button
       onClick={e => { e.stopPropagation(); toggleMutation.mutate(!(definition.status === 'active')) }}
-      className="flex-shrink-0"
-      title={definition.status === 'active' ? 'Disable this check (all instances)' : 'Enable this check'}
+      className={`flex-shrink-0 transition-opacity ${isPending ? 'opacity-60' : ''}`}
+      title={optimisticActive ? 'Disable this check (all instances)' : 'Enable this check'}
+      disabled={isPending}
     >
-      {definition.status === 'active'
+      {optimisticActive
         ? <ToggleRight className="w-6 h-6 text-green-500 hover:text-green-600" />
         : <ToggleLeft className="w-6 h-6 text-gray-300 dark:text-gray-600 hover:text-gray-400 dark:hover:text-gray-500" />}
     </button>

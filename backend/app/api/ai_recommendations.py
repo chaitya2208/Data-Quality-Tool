@@ -233,6 +233,41 @@ def get_roles():
     return [RoleInfo(**r) for r in ctx["roles"]]
 
 
+@router.post("/source-type")
+def get_source_type(finding_ids: List[str]):
+    """
+    Fast endpoint — resolves the data source type for a list of findings without
+    calling Claude. Used by the AI-Fix page to know immediately (before the slow
+    recommendations call completes) whether to show Snowflake role/warehouse or
+    the Postgres connection pill.
+    """
+    for fid in finding_ids:
+        finding = storage.get_finding(fid)
+        if not finding:
+            continue
+        src_type, conn_name, conn_user = _get_connection_for_finding_impl(finding)
+        return {"source_type": src_type, "connection_name": conn_name, "connection_user": conn_user}
+    return {"source_type": "snowflake", "connection_name": None, "connection_user": None}
+
+
+def _get_connection_for_finding_impl(finding) -> tuple[str, str | None, str | None]:
+    """Internal helper shared by /source-type and /recommendations."""
+    try:
+        scan = storage.get_scan(finding.scan_id) if finding.scan_id else None
+        connection_id = scan.connection_id if scan else None
+        if connection_id:
+            conn = storage.get_connection_record(connection_id)
+            if conn:
+                return conn.type, conn.name, conn.username
+    except Exception:
+        pass
+    return "snowflake", None, None
+
+
+def _get_connection_for_finding(finding) -> tuple[str, str | None, str | None]:
+    return _get_connection_for_finding_impl(finding)
+
+
 @router.post("/recommendations", response_model=List[AIRecommendation])
 def get_ai_recommendations(finding_ids: List[str]):
     """
@@ -260,6 +295,11 @@ def get_ai_recommendations(finding_ids: List[str]):
             rec.source_type      = conn_info["source_type"]
             rec.connection_name  = conn_info["connection_name"]
             rec.connection_user  = conn_info["connection_user"]
+
+        src_type, conn_name, conn_user = _get_connection_for_finding(finding)
+        rec.source_type = src_type
+        rec.connection_name = conn_name
+        rec.connection_user = conn_user
 
         recommendations.append(rec)
     return recommendations

@@ -3,9 +3,7 @@ WorkflowCoordinator — pipeline:
 
   Coordinator
       ↓
-  [Metadata Agent ∥ Rules Fetch Agent ∥ Relationship Discovery Agent]   ← parallel threads
-      ↓
-  Profiler Agent                         ← deterministic stats (needs column_assets)
+  [Metadata Agent ∥ Rules Fetch Agent ∥ Relationship Discovery Agent ∥ Profiling Agent]   ← parallel threads
       ↓
   Rule Intelligence Agent                ← deterministic candidates + Claude proposals
       ↓
@@ -56,8 +54,20 @@ class WorkflowCoordinator:
         try:
             self._execute()
         except Exception as e:
-            logger.error(f"[Coordinator] Unhandled error in run {self.run_id}: {e}")
-            self._mark_run_failed(str(e))
+            # Structured error handlers inside _execute already own state
+            # transitions for every anticipated failure — a bare fail() here is
+            # for the truly unexpected (bug in the coordinator itself). Log the
+            # full traceback so it's actually debuggable, and only mark failed
+            # if the run isn't already in a terminal state, else this
+            # double-invokes _advance_batch and can skip the next table.
+            import traceback
+            logger.error(
+                f"[Coordinator] Unhandled error in run {self.run_id}: "
+                f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            )
+            run = storage.get_agent_run(self.run_id)
+            if run and run.status not in ("completed", "failed", "awaiting_fixes", "awaiting_rule_review"):
+                self._mark_run_failed(f"Unhandled coordinator error: {type(e).__name__}: {e}")
 
     def _execute(self) -> None:
         run = storage.get_agent_run(self.run_id)
@@ -108,8 +118,7 @@ class WorkflowCoordinator:
         self._start_task(meta_task)
         self._start_task(rules_task)
         self._start_task(reldisc_task)
-        if profile_task:
-            self._start_task(profile_task)
+        self._start_task(profile_task)
 
         meta_result    = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
         rules_result   = {"rule_codes": None, "error": None}
@@ -177,8 +186,6 @@ class WorkflowCoordinator:
             # freshness_signals / closed_set_columns). Runs in parallel — the
             # facts are derived from (db, schema, table, connection_id), so this
             # no longer waits for column metadata to be persisted.
-            if not profile_task:
-                return
             try:
                 from app.services.agents.profiling_agent import ProfilingAgent
                 prof = ProfilingAgent(None).run(run.database, run.schema_name, run.table, run.connection_id)
@@ -243,16 +250,51 @@ class WorkflowCoordinator:
             logger.warning(f"[Coordinator] Profiling failed: {profile_result['error']}, continuing with no deterministic facts")
         profiler_result = profile_result["facts"] or {}
 
+        # ── Sweep stale pending proposals from prior runs ─────────────────────
+        # A pending instance from an earlier run that was never approved
+        # clutters this scan's review UI and confuses Claude (he sees the
+        # same target proposed again as "already pending" but hasn't seen the
+        # user reject it). Reject them with a clear reason so fingerprint
+        # dedup still catches a genuine re-proposal, but they no longer appear
+        # in the new review as unaddressed backlog.
+        stale_pending = storage.list_stale_pending_instances(
+            database_name=run.database,
+            schema_name=run.schema_name,
+            table_name=run.table,
+            except_run_id=run.id,
+        )
+        for inst in stale_pending:
+            storage.update_instance(
+                inst.id,
+                status="rejected",
+                rejection_reason="Superseded by a new scan before the prior review was completed.",
+            )
+        if stale_pending:
+            logger.info(
+                f"[Coordinator] Swept {len(stale_pending)} stale pending proposal(s) "
+                f"from prior runs on {run.database}.{run.schema_name}.{run.table}"
+            )
+
         # ── Rule Intelligence Agent ───────────────────────────────────────────
         intel_task = self._get_task("rule_intelligence_agent")
         self._start_task(intel_task)
         intel_result = None
         try:
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
+            from app.services.datasources import get_source
+            # Pass the run's own source so proposal-time SQL execution and the
+            # get_sample_rows tool run against the analysed database, not the
+            # app's shared Snowflake session (audit finding #4).
+            source = None
+            try:
+                source = get_source(run.connection_id)
+            except Exception as _src_err:
+                logger.warning(f"[Coordinator] Could not resolve source for rule_intelligence: {_src_err}")
             agent = RuleIntelligenceAgent()
             intel_result = agent.run(
                 table_asset, column_assets, existing_definitions, run.id,
                 profiler_result=profiler_result, relationship_catalog=relationship_catalog,
+                source=source,
             )
 
             classification       = intel_result["classification"]
@@ -272,6 +314,11 @@ class WorkflowCoordinator:
                     {"reason": s["reason"], "fingerprint": s["fingerprint"][:12]}
                     for s in suppressed
                 ],
+                "sample_tool_calls": len(intel_result.get("tool_calls", [])),
+                "sample_reasons": [
+                    (tc.get("input") or {}).get("reason", "")
+                    for tc in intel_result.get("tool_calls", [])
+                ],
             })
         except Exception as e:
             # Rule Intelligence is a core node — if it throws, the run has no
@@ -279,7 +326,11 @@ class WorkflowCoordinator:
             # zero proposals (that reads as a clean run in Run History). Fail the
             # whole run with this node's error + time, skip the remaining stages,
             # and let the batch advance to the next table.
-            logger.error(f"[Coordinator] RuleIntelligenceAgent failed: {e}")
+            import traceback
+            logger.error(
+                f"[Coordinator] RuleIntelligenceAgent failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
             self._fail_task(intel_task, str(e))
             self._skip_tasks(["findings_agent", "verification_agent"])
             self._mark_run_failed(f"Rule Intelligence failed: {e}")
@@ -293,9 +344,18 @@ class WorkflowCoordinator:
         active_entries = []
         skipped_entries = []
 
-        # Existing instances — keep_running decision only, never re-approved
+        # Existing instances — keep_running decision only, never re-approved.
+        # Decisions are keyed per-instance (instances_evaluated) so two
+        # instances of the same definition (e.g. accepted_values on STATUS
+        # AND on CURRENCY_CODE) get INDEPENDENT keep_running verdicts.
+        # Falls back to the legacy definition-level key if the model still
+        # returned that shape.
+        instances_evaluated = classification.get("instances_evaluated") or {}
+        legacy_defs_evaluated = classification.get("definitions_evaluated") or {}
         for inst in existing_instances:
-            decision = classification.get("definitions_evaluated", {}).get(inst.definition_id, {})
+            decision = instances_evaluated.get(inst.id)
+            if decision is None:
+                decision = legacy_defs_evaluated.get(inst.definition_id, {})
             definition = storage.get_definition(inst.definition_id)
             entry = {
                 "instance_id":       inst.id,
@@ -402,13 +462,42 @@ class WorkflowCoordinator:
         # state so the reviewer sees "N signals unaddressed" instead of a clean
         # screen that hides the gap.
         signals_missed = intel_result.get("signals_missed", [])
+        ai_rules_proposed = len([p for p in proposed_instances if p["kind"] == "new"])
+
+        # ── Unused library bucket ─────────────────────────────────────────────
+        # Definitions the agent knew about but that ended up with NO instance
+        # on this table (neither existing nor newly proposed). Surfaced so the
+        # reviewer can manually activate one — without this bucket the ~20+
+        # library definitions Claude ignored are invisible in the UI, and the
+        # reviewer has no way to discover "we have an SLA breach detector, I
+        # could turn that on for this table" short of clicking through the
+        # rule library page. See instance_review_state schema.
+        used_def_ids = {
+            e["definition_id"] for e in active_entries + skipped_entries if e.get("definition_id")
+        }
+        unused_library = []
+        for d in existing_definitions:
+            if d.id in used_def_ids:
+                continue
+            unused_library.append({
+                "definition_id":  d.id,
+                "name":           d.name,
+                "description":    d.description or "",
+                "category":       getattr(d, "category", "data_quality"),
+                "template_shape": getattr(d, "template_shape", None),
+                "check_kind":     getattr(d, "check_kind", None),
+                "default_severity": getattr(d, "default_severity", "medium"),
+            })
+
         storage.update_agent_run(
             self.run_id,
-            ai_rules_count=len([p for p in proposed_instances if p["kind"] == "new"]),
+            ai_rules_count=ai_rules_proposed,
             instance_review_state={
                 "active": active_entries,
                 "skipped": skipped_entries,
+                "unused_library": unused_library,
                 "signals_missed": signals_missed,
+                "ai_rules_proposed": ai_rules_proposed,
                 # True when the model's response couldn't be parsed even after a
                 # retry — the reviewer should treat "0 proposals" with suspicion
                 # rather than as confirmation the table is fully covered.
@@ -480,12 +569,13 @@ class WorkflowCoordinator:
 
         # Back-fill outcome counts on the intelligence log so the vector store
         # reflects whether Claude's proposals were accepted or rejected.
-        # Also persist structured review lessons so future runs on similar
-        # tables learn what kinds of proposals humans accept or reject here.
+        # Each best-effort step below has its own try/except so a failure in
+        # one doesn't get logged as a failure of another (audit finding #15).
+        new_instances_rejected = sum(
+            1 for e in skipped_entries if e.get("is_new_instance")
+        )
+
         try:
-            new_instances_rejected = sum(
-                1 for e in skipped_entries if e.get("is_new_instance")
-            )
             log = storage.get_intelligence_log_for_run(self.run_id)
             if log:
                 storage.update_intelligence_log_outcomes(
@@ -493,8 +583,12 @@ class WorkflowCoordinator:
                     approved_count=new_instances_approved,
                     rejected_count=new_instances_rejected,
                 )
+        except Exception as e:
+            logger.warning(f"[Coordinator] Could not update intelligence log outcomes: {e}")
 
-            # Build structured lessons from this review round
+        # Persist structured review lessons so future runs on similar tables
+        # learn what humans accept or reject here.
+        try:
             run_obj = storage.get_agent_run(self.run_id)
             review_state = (run_obj.instance_review_state or {}) if run_obj else {}
             lessons = self._build_review_lessons(
@@ -507,9 +601,12 @@ class WorkflowCoordinator:
                     table_fqn=f"{run.database}.{run.schema_name}.{run.table}",
                     lessons=lessons,
                 )
+        except Exception as e:
+            logger.warning(f"[Coordinator] Could not append review lessons: {e}")
 
-            # Synthesise accumulated lessons into a reusable memo — best-effort,
-            # background thread so it never blocks the findings pipeline.
+        # Synthesise accumulated lessons into a reusable memo — best-effort,
+        # background thread so it never blocks the findings pipeline.
+        try:
             table_type = (
                 (storage.get_intelligence_log_for_run(self.run_id) or SimpleNamespace(table_type="unknown"))
                 .table_type or "unknown"
@@ -521,7 +618,7 @@ class WorkflowCoordinator:
                 daemon=True,
             ).start()
         except Exception as e:
-            logger.warning(f"[Coordinator] Could not update intelligence log outcomes: {e}")
+            logger.warning(f"[Coordinator] Could not kick feedback synthesis: {e}")
 
         # ── Re-fetch assets ───────────────────────────────────────────────────
         scan = storage.get_scan(run.scan_id)
@@ -601,32 +698,40 @@ class WorkflowCoordinator:
                 "rules_used":         rules_used,
                 "rules_unused":       rules_unused,
             })
-
-            # ── Findings Explanation Agent ────────────────────────────────
-            # Best-effort AI root-cause + fix-action annotations on each
-            # firing instance. Runs after the findings task is marked
-            # complete so a failure here never affects the run status.
-            if findings:
-                try:
-                    from app.services.agents.findings_explanation_agent import FindingsExplanationAgent
-                    FindingsExplanationAgent().run(
-                        findings=findings,
-                        table_asset=table_asset,
-                        run_id=run.id,
-                    )
-                except Exception as _exp_err:
-                    logger.warning(f"[Coordinator] FindingsExplanationAgent failed (non-fatal): {_exp_err}")
         except Exception as e:
             self._fail_task(findings_task, str(e))
             self._skip_tasks(["verification_agent"])
             self._mark_run_failed(str(e), advance=False)  # already advanced at review
             return
 
+        # Transition to awaiting_fixes immediately — before explanation agent so
+        # the UI banner appears without waiting for Claude explanation calls.
         run = storage.update_agent_run(self.run_id, status="awaiting_fixes")
         logger.info(
             f"[Coordinator] Run {self.run_id} — pipeline complete. "
             f"{run.findings_count} findings, {run.ai_rules_count} AI rules persisted."
         )
+
+        # ── Findings Explanation Agent (background) ───────────────────────────
+        # Runs in a daemon thread so it never delays the awaiting_fixes status.
+        # Best-effort — a failure here never affects the run.
+        if findings:
+            _findings_snap = list(findings)
+            _table_snap = table_asset
+            _run_id_snap = run.id
+            _connection_id_snap = run.connection_id
+            def _run_explanation():
+                try:
+                    from app.services.agents.findings_explanation_agent import FindingsExplanationAgent
+                    FindingsExplanationAgent().run(
+                        findings=_findings_snap,
+                        table_asset=_table_snap,
+                        run_id=_run_id_snap,
+                        connection_id=_connection_id_snap,
+                    )
+                except Exception as _exp_err:
+                    logger.warning(f"[Coordinator] FindingsExplanationAgent failed (non-fatal): {_exp_err}")
+            threading.Thread(target=_run_explanation, daemon=True).start()
 
         # Start background auto-verification (every 5 min while awaiting fixes)
         from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
@@ -694,13 +799,12 @@ class WorkflowCoordinator:
             return
 
         # Skip unused pipeline stages gracefully
-        for skipped in ["rules_fetch_agent", "relationship_discovery_agent",
-                        "profiling_agent", "rule_intelligence_agent"]:
-            t = self._get_task(skipped)
-            if t:
-                self._skip_task(t)
+        self._skip_tasks([
+            "rules_fetch_agent", "relationship_discovery_agent",
+            "profiling_agent", "rule_intelligence_agent",
+        ])
 
-        existing_column_names = {c.column_name.upper() for c in column_assets}
+        existing_column_names = {c.column_name.upper() for c in column_assets if c.column_name}
 
         # Re-instantiate each pattern for this target table
         from app.services.rule_sql_templates import render_template
@@ -813,9 +917,7 @@ class WorkflowCoordinator:
             })
         except Exception as e:
             self._fail_task(findings_task, str(e))
-            t = self._get_task("verification_agent")
-            if t:
-                self._skip_task(t)
+            self._skip_tasks(["verification_agent"])
             self._mark_run_failed(str(e), advance=False)
             return
 
@@ -877,7 +979,18 @@ class WorkflowCoordinator:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get_task(self, name: str) -> Any:
-        return storage.get_agent_task(self.run_id, name)
+        """Return the AGENT_TASKS row for this agent, or self-heal one into
+        existence if AGENT_ORDER has drifted since this run was seeded.
+        Missing rows used to silently no-op every subsequent transition (audit
+        finding #3) — a whole agent could execute invisibly. Loud is better."""
+        task = storage.get_agent_task(self.run_id, name)
+        if task is None:
+            logger.warning(
+                f"[Coordinator] AGENT_TASKS row missing for run={self.run_id} agent={name} — "
+                "self-healing (AGENT_ORDER drift?)"
+            )
+            task = storage.create_agent_task(self.run_id, name)
+        return task
 
     def _start_task(self, task: Any) -> None:
         storage.update_agent_task(task.id, status="running", started_at=datetime.utcnow())
@@ -894,8 +1007,7 @@ class WorkflowCoordinator:
     def _skip_tasks(self, names: List[str]) -> None:
         for name in names:
             t = self._get_task(name)
-            if t:
-                self._skip_task(t)
+            self._skip_task(t)
 
     def _mark_run_failed(self, error: str, advance: bool = True) -> None:
         run = storage.get_agent_run(self.run_id)

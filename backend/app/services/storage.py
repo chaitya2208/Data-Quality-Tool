@@ -504,6 +504,18 @@ def update_finding(finding_id: str, **fields: Any) -> SimpleNamespace:
     return get_finding(finding_id)
 
 
+def update_finding_evidence(finding_id: str, evidence: dict) -> None:
+    """Update the EVIDENCE VARIANT column for a finding using PARSE_JSON."""
+    sf_session.execute(
+        """
+        UPDATE FINDINGS
+        SET EVIDENCE = PARSE_JSON(%(evidence)s), UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE ID = %(id)s
+        """,
+        {"id": finding_id, "evidence": _json_or_null(evidence)},
+    )
+
+
 # Open (non-closed) finding statuses — anything not here is considered resolved/
 # closed and won't be superseded or shown under "Detected".
 _OPEN_FINDING_STATUSES = ("detected", "validated", "in_progress")
@@ -671,11 +683,26 @@ def get_definition_by_template_shape(template_shape: str) -> Optional[SimpleName
     name/description similarity or creating a brand-new definition, so every
     table/column proposing the same shape reuses one definition via its own
     TARGET_CONFIG/THRESHOLD_CONFIG/SEVERITY/RATIONALE instead of spawning a
-    duplicate. Prefers the highest-approval-count match if more than one
-    exists (e.g. a pre-canonicalization duplicate that's still active)."""
+    duplicate. When more than one active definition exists for the shape,
+    prefer the one with the most LIVE active instances — computed from
+    RULE_INSTANCES, not the monotonic RULE_DEFINITIONS.APPROVAL_COUNT column,
+    which never decrements on rejection/disable and so points at the most
+    historically-approved definition rather than the most currently useful
+    one (audit finding #8)."""
     rows = sf_session.query(
-        "SELECT * FROM RULE_DEFINITIONS WHERE TEMPLATE_SHAPE = %(shape)s AND STATUS != 'disabled' "
-        "ORDER BY APPROVAL_COUNT DESC, CREATED_AT ASC LIMIT 1",
+        """
+        SELECT d.*, COALESCE(i.ACTIVE_COUNT, 0) AS ACTIVE_COUNT
+        FROM RULE_DEFINITIONS d
+        LEFT JOIN (
+            SELECT DEFINITION_ID, COUNT(*) AS ACTIVE_COUNT
+            FROM RULE_INSTANCES
+            WHERE STATUS = 'active'
+            GROUP BY DEFINITION_ID
+        ) i ON i.DEFINITION_ID = d.ID
+        WHERE d.TEMPLATE_SHAPE = %(shape)s AND d.STATUS != 'disabled'
+        ORDER BY ACTIVE_COUNT DESC, d.CREATED_AT ASC
+        LIMIT 1
+        """,
         {"shape": template_shape},
     )
     return _definition_from_row(rows[0]) if rows else None
@@ -688,25 +715,41 @@ def list_definitions(
     skip: int = 0,
     limit: int = 500,
 ) -> tuple[int, list[SimpleNamespace]]:
-    where, params = [], {}
+    where, where_prefixed, params = [], [], {}
     if source:
         where.append("SOURCE = %(source)s")
+        where_prefixed.append("d.SOURCE = %(source)s")
         params["source"] = source
     if status:
         where.append("STATUS = %(status)s")
+        where_prefixed.append("d.STATUS = %(status)s")
         params["status"] = status
     if category:
         where.append("CATEGORY = %(category)s")
+        where_prefixed.append("d.CATEGORY = %(category)s")
         params["category"] = category
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    where_sql_prefixed = f"WHERE {' AND '.join(where_prefixed)}" if where_prefixed else ""
 
     total_rows = sf_session.query(f"SELECT COUNT(*) AS CNT FROM RULE_DEFINITIONS {where_sql}", params)
     total = total_rows[0]["CNT"] if total_rows else 0
 
+    # Rank by live active-instance count instead of the monotonic
+    # APPROVAL_COUNT column (audit finding #8) so the Rules Library shows the
+    # definitions actually used today at the top, not the ones with the most
+    # historical approvals (which never decrements on rejection/disable).
     rows = sf_session.query(
         f"""
-        SELECT * FROM RULE_DEFINITIONS {where_sql}
-        ORDER BY APPROVAL_COUNT DESC, CREATED_AT DESC
+        SELECT d.*, COALESCE(i.ACTIVE_COUNT, 0) AS ACTIVE_COUNT
+        FROM RULE_DEFINITIONS d
+        LEFT JOIN (
+            SELECT DEFINITION_ID, COUNT(*) AS ACTIVE_COUNT
+            FROM RULE_INSTANCES
+            WHERE STATUS = 'active'
+            GROUP BY DEFINITION_ID
+        ) i ON i.DEFINITION_ID = d.ID
+        {where_sql_prefixed}
+        ORDER BY ACTIVE_COUNT DESC, d.CREATED_AT DESC
         LIMIT %(limit)s OFFSET %(skip)s
         """,
         {**params, "limit": limit, "skip": skip},
@@ -716,6 +759,15 @@ def list_definitions(
 
 def list_all_definitions() -> list[SimpleNamespace]:
     rows = sf_session.query("SELECT * FROM RULE_DEFINITIONS")
+    return [_definition_from_row(r) for r in rows]
+
+
+def list_active_definitions() -> list[SimpleNamespace]:
+    """Single-query fetch of all active definitions — no COUNT, no JOIN.
+    Used by RulesFetchAgent where only the definition objects are needed."""
+    rows = sf_session.query(
+        "SELECT * FROM RULE_DEFINITIONS WHERE STATUS = 'active' ORDER BY CREATED_AT DESC"
+    )
     return [_definition_from_row(r) for r in rows]
 
 
@@ -792,7 +844,15 @@ def ensure_definition(
     allowed_scopes: list[str],
 ) -> SimpleNamespace:
     """Return the python_handler definition for `handler_key`, auto-creating it
-    (as system/active) if missing. Also ensures one global instance exists."""
+    (as system/active) if missing.
+
+    NOTE 2026-07-15: this used to also call ensure_global_instance() to create
+    a DATABASE_NAME='*' instance so the check auto-fired on every scan of
+    every table. That model is gone — a python_handler definition now runs on
+    a table only when RuleIntelligence proposed it (with human review) as a
+    per-table instance. The definition still exists in the library; Claude
+    picks it per table like any other check. See rule_engine.initialize_default_rules
+    and dynamic_rules._ensure_rule for the callers."""
     existing = get_definition_by_handler_key(handler_key)
     if not existing:
         existing = create_definition(
@@ -808,7 +868,6 @@ def ensure_definition(
             owner="data-governance-team",
             created_by="system",
         )
-    ensure_global_instance(existing)
     return existing
 
 
@@ -1127,6 +1186,31 @@ def ensure_global_instance(definition: SimpleNamespace) -> SimpleNamespace:
     )
 
 
+def list_stale_pending_instances(
+    database_name: str,
+    schema_name: str,
+    table_name: str,
+    except_run_id: str,
+) -> list[SimpleNamespace]:
+    """Pending RULE_INSTANCES on this table from ANY source_run_id other than
+    `except_run_id`. Used by the coordinator to sweep leftover proposals from
+    prior runs that were never approved — without this, each new scan on a
+    table accumulates review-panel clutter that Claude also sees as "already
+    pending" and won't re-propose."""
+    rows = sf_session.query(
+        """
+        SELECT * FROM RULE_INSTANCES
+        WHERE UPPER(DATABASE_NAME) = UPPER(%(db)s)
+          AND UPPER(SCHEMA_NAME)   = UPPER(%(sc)s)
+          AND UPPER(TABLE_NAME)    = UPPER(%(tb)s)
+          AND STATUS = 'pending'
+          AND (SOURCE_RUN_ID IS NULL OR SOURCE_RUN_ID != %(run_id)s)
+        """,
+        {"db": database_name, "sc": schema_name, "tb": table_name, "run_id": except_run_id},
+    )
+    return [_instance_from_row(r) for r in rows]
+
+
 def update_instance(instance_id: str, **fields: Any) -> SimpleNamespace:
     """Partial update. JSON fields (target_config, threshold_config) are
     auto-detected."""
@@ -1402,6 +1486,15 @@ def create_agent_tasks(run_id: str, agent_names: list[str]) -> None:
         )
 
 
+def create_agent_task(run_id: str, agent_name: str) -> SimpleNamespace:
+    """Insert one AGENT_TASKS row and return it. Used by the coordinator's
+    self-heal path when AGENT_ORDER gains a new agent but pre-existing runs
+    have no row for it — creating on demand keeps state transitions visible
+    instead of silently no-op'ing (audit finding #3)."""
+    create_agent_tasks(run_id, [agent_name])
+    return get_agent_task(run_id, agent_name)
+
+
 def get_agent_run(run_id: str, with_tasks: bool = True) -> Optional[SimpleNamespace]:
     rows = sf_session.query("SELECT * FROM AGENT_RUNS WHERE ID = %(id)s", {"id": run_id})
     if not rows:
@@ -1417,7 +1510,7 @@ def list_agent_runs(limit: int = 20) -> list[SimpleNamespace]:
     result = []
     for r in rows:
         try:
-            result.append(_agent_run_from_row(r, tasks=list_agent_tasks(r["ID"])))
+            result.append(_agent_run_from_row(r, tasks=[]))
         except Exception as e:
             logger.warning(f"[storage] Skipping malformed run {r.get('ID')}: {e}")
     return result
@@ -1583,7 +1676,7 @@ def create_cache_entry(
             "impact": impact,
         },
     )
-    return get_cache_entry(entry_id)
+    return get_cache_entry(cache_key)
 
 
 def increment_cache_hit(cache_key: str) -> None:
@@ -2028,7 +2121,19 @@ def create_intelligence_log(
             "model_used": model_used,
         },
     )
-    return get_intelligence_log(log_id)
+    # Return a minimal namespace with just the id — avoids INSERT→SELECT
+    # timing issues where Snowflake hasn't made the row visible yet.
+    result = get_intelligence_log(log_id)
+    if result:
+        return result
+    ns = SimpleNamespace(
+        id=log_id, run_id=run_id, table_fqn=table_fqn,
+        table_type=table_type, table_type_confidence=table_type_confidence,
+        thinking=thinking, proposals_count=proposals_count,
+        suppressed_count=suppressed_count, approved_count=0, rejected_count=0,
+        model_used=model_used, signals_used=signals_used,
+    )
+    return ns
 
 
 def get_intelligence_log(log_id: str) -> Optional[SimpleNamespace]:
@@ -2044,6 +2149,79 @@ def get_intelligence_log_for_run(run_id: str) -> Optional[SimpleNamespace]:
         {"run_id": run_id},
     )
     return _intelligence_log_from_row(rows[0]) if rows else None
+
+
+def log_critique_drop(
+    run_id: str,
+    table_fqn: str,
+    proposal: dict,
+    scores: dict,
+    mean_score: float,
+    drop_reason: str,
+) -> None:
+    """Persist a self-critique drop so future runs can see the shapes that
+    keep getting cut and why. Best-effort — never blocks the pipeline."""
+    try:
+        proposal_name = (
+            (proposal.get("new_definition") or {}).get("name")
+            or proposal.get("definition_id")
+            or ""
+        )[:500]
+        sf_session.execute(
+            """
+            INSERT INTO RULE_CRITIQUE_DROPS
+                (ID, RUN_ID, TABLE_FQN, PROPOSAL_NAME, DEFINITION_ID,
+                 COLUMN_NAME, TEMPLATE_SHAPE, EVIDENCE_SCORE, IMPACT_SCORE,
+                 APPROVAL_SCORE, MEAN_SCORE, DROP_REASON, PROPOSAL_JSON)
+            SELECT %(id)s, %(run_id)s, %(table_fqn)s, %(proposal_name)s,
+                   %(definition_id)s, %(column_name)s, %(template_shape)s,
+                   %(evidence)s, %(impact)s, %(approval)s, %(mean)s,
+                   %(reason)s, PARSE_JSON(%(proposal_json)s)
+            """,
+            {
+                "id": _new_id(),
+                "run_id": run_id,
+                "table_fqn": table_fqn,
+                "proposal_name": proposal_name,
+                "definition_id": (proposal.get("definition_id") or "")[:500],
+                "column_name": (proposal.get("column_name") or "")[:500],
+                "template_shape": (proposal.get("template_shape") or "")[:100],
+                "evidence": scores.get("evidence"),
+                "impact": scores.get("impact"),
+                "approval": scores.get("approval"),
+                "mean": mean_score,
+                "reason": (drop_reason or "")[:2000],
+                "proposal_json": _json_or_null(proposal),
+            },
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[storage] log_critique_drop failed: {e}")
+
+
+def get_intelligence_logs_for_table(table_fqn: str, limit: int = 3) -> list:
+    """Most recent intelligence logs for THIS exact table — used by
+    _format_past_context to inject same-table history into the prompt so
+    Claude can see what it decided last time on the same target instead of
+    silently re-deriving everything."""
+    try:
+        rows = sf_session.query(
+            """
+            SELECT * FROM RULE_INTELLIGENCE_LOGS
+            WHERE TABLE_FQN = %(fqn)s
+            ORDER BY CREATED_AT DESC
+            LIMIT %(limit)s
+            """,
+            {"fqn": table_fqn, "limit": limit},
+        )
+        return [_intelligence_log_from_row(r) for r in rows]
+    except Exception as e:
+        # A past-context read that dies silently was audit finding #6 — every
+        # scan pretended "no history yet" whether that was true or a broken
+        # query. Log the type + message so the log at least says "this
+        # channel is broken", without breaking the caller.
+        logger.warning(f"[storage] get_intelligence_logs_for_table failed: {type(e).__name__}: {e}")
+        return []
 
 
 def append_intelligence_log_lessons(
@@ -2119,7 +2297,8 @@ def get_review_lessons_for_table(table_fqn: str, limit: int = 20) -> list:
             }
             for r in rows
         ]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[storage] get_review_lessons_for_table failed: {type(e).__name__}: {e}")
         return []
 
 
@@ -2217,7 +2396,8 @@ def search_similar_intelligence(table_fqn: str, limit: int = 5) -> list[SimpleNa
             },
         )
         return [_intelligence_log_from_row(r) for r in rows]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[storage] search_similar_intelligence failed: {type(e).__name__}: {e}")
         return []
 
 
@@ -2247,7 +2427,8 @@ def get_feedback_memo(bare_table_name: str, table_type: str) -> Optional[dict]:
         memo["_lesson_count"] = rows[0].get("LESSON_COUNT", 0)
         memo["_updated_at"] = str(rows[0].get("UPDATED_AT", ""))
         return memo
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[storage] get_feedback_memo failed: {type(e).__name__}: {e}")
         return None
 
 
@@ -2329,5 +2510,6 @@ def get_lessons_for_synthesis(
             }
             for r in rows
         ]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[storage] get_lessons_for_synthesis failed: {type(e).__name__}: {e}")
         return []

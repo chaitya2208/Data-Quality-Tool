@@ -200,6 +200,16 @@ class SnowflakeSource(DataSource):
         """)
         return [{"value": r.get("VALUE"), "count": r.get("OCCURRENCES")} for r in rows]
 
+    def bottom_values(self, database: str, schema: str, table: str, column: str, limit: int = 5) -> List[Dict[str, Any]]:
+        col = self.quote_ident(column)
+        rows = sf_session.query(f"""
+            SELECT {col} AS VALUE, COUNT(*) AS OCCURRENCES
+            FROM {self._fqn(database, schema, table)}
+            WHERE {col} IS NOT NULL GROUP BY {col}
+            ORDER BY OCCURRENCES ASC LIMIT {int(limit)}
+        """)
+        return [{"value": r.get("VALUE"), "count": r.get("OCCURRENCES")} for r in rows]
+
     def duplicate_count(self, database: str, schema: str, table: str, column: str) -> Optional[int]:
         col = self.quote_ident(column)
         try:

@@ -69,14 +69,20 @@ export default function AIFix() {
     staleTime: 5 * 60 * 1000, // cache for 5 min — avoid re-calling Claude on re-render
   })
 
-  // Which data source these findings belong to. All findings in one AI-Fix
-  // session share a connection, so the first recommendation's source_type is
-  // authoritative. Postgres/RDS fixes run as the connection's user — no
-  // Snowflake role/warehouse — so the UI branches on this.
-  const firstRec       = recommendations?.[0]
-  const isPostgres     = firstRec?.source_type === 'postgres'
-  const connectionName = firstRec?.connection_name ?? ''
-  const connectionUser = firstRec?.connection_user ?? ''
+
+  // Fast source-type lookup — resolves immediately from scan/connection data,
+  // no Claude call. Drives whether to show Snowflake role/warehouse or the
+  // Postgres connection pill before recommendations even load.
+  const { data: sourceTypeData } = useQuery({
+    queryKey: ['ai-source-type', findingIds],
+    queryFn: () => aiApi.getSourceType(findingIds).then(r => r.data),
+    enabled: findingIds.length > 0,
+    staleTime: Infinity,
+  })
+
+  const isPostgres     = sourceTypeData?.source_type === 'postgres'
+  const connectionName = sourceTypeData?.connection_name ?? recommendations?.[0]?.connection_name ?? ''
+  const connectionUser = sourceTypeData?.connection_user ?? recommendations?.[0]?.connection_user ?? ''
 
   const executeMutation = useMutation({
     mutationFn: ({ findingId, sqlQuery }: { findingId: string; sqlQuery: string }) =>
@@ -148,8 +154,8 @@ export default function AIFix() {
             </p>
           </div>
 
-          {/* Role + Warehouse dropdowns — Snowflake only */}
-          {!isPostgres && (
+          {/* Role + Warehouse dropdowns — Snowflake only, hidden until source type resolves */}
+          {sourceTypeData && !isPostgres && (
           <div className="flex flex-wrap items-end gap-3">
             {/* Role dropdown */}
             <div className="flex flex-col gap-1">
@@ -223,7 +229,7 @@ export default function AIFix() {
       </div>
 
       {/* Active context pill — Snowflake role+warehouse */}
-      {!isPostgres && canExecute && (
+      {sourceTypeData && !isPostgres && canExecute && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <span className="flex items-center gap-1.5 bg-purple-50 border border-purple-200 text-purple-800 px-3 py-1.5 rounded-full font-medium">
             <ShieldCheck className="w-3.5 h-3.5" /> {effectiveRole}
@@ -250,7 +256,7 @@ export default function AIFix() {
         </div>
       )}
 
-      {!isPostgres && !canExecute && !loadingWarehouses && !loadingRoles && (
+      {sourceTypeData && !isPostgres && !canExecute && !loadingWarehouses && !loadingRoles && (
         <div className="bg-yellow-50 dark:bg-yellow-950/40 border border-yellow-200 dark:border-yellow-500/40 rounded-lg p-3 text-sm text-yellow-800 dark:text-yellow-300">
           ⚠️ Could not load warehouse or role from Snowflake. Check your connection.
         </div>

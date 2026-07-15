@@ -287,6 +287,16 @@ class PostgresSource(DataSource):
         """)
         return [{"value": r["value"], "count": r["count"]} for r in rows]
 
+    def bottom_values(self, database: str, schema: str, table: str, column: str, limit: int = 5) -> List[Dict[str, Any]]:
+        col = self.quote_ident(column)
+        rows = self._query(f"""
+            SELECT {col} AS value, COUNT(*) AS count
+            FROM {self._rel(schema, table)}
+            WHERE {col} IS NOT NULL GROUP BY {col}
+            ORDER BY count ASC LIMIT {int(limit)}
+        """)
+        return [{"value": r["value"], "count": r["count"]} for r in rows]
+
     def duplicate_count(self, database: str, schema: str, table: str, column: str) -> Optional[int]:
         col = self.quote_ident(column)
         try:

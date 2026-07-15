@@ -31,7 +31,7 @@ from typing import List, Optional, Dict, Any, Set
 from app.services import storage
 from app.services.fingerprint import compute_fingerprint
 from app.services.snowflake_session import session as sf_session
-from app.services.claude_client import ask_claude, ask_claude_agentic
+from app.services.claude_client import ask_claude, ask_claude_agentic, ask_claude_json, _strip_fences
 from app.services.sql_validation import validate_sql
 from app.services.rule_sql_templates import TEMPLATE_SHAPES, render_template
 from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
@@ -43,9 +43,30 @@ logger = logging.getLogger(__name__)
 # static validation but is accidentally expensive — see _execute_check_sql.
 _CHECK_SQL_TIMEOUT_SECONDS = 120
 
+def _template_shape_doc_line(name: str, spec: dict) -> str:
+    """Human-readable line for one template shape.
+
+    Includes optional_params separately so Claude sees them as "at least one
+    of ...". Without this, `range` shows `needs: none` (params is [] because
+    min_value / max_value are optional), which is what caused the silent
+    two-proposal discard the first time we ran the rebalanced prompt — Claude
+    picked `range` for PRICE and STOCK_QTY, sent empty threshold_config, and
+    render_template raised ValueError.
+    """
+    parts = [f"scope={spec['scope']}"]
+    required = spec.get("params") or []
+    optional = spec.get("optional_params") or []
+    if required:
+        parts.append(f"required threshold_config keys: {required}")
+    if optional:
+        parts.append(f"optional (at least one required): {optional}")
+    if not required and not optional:
+        parts.append("no threshold_config keys needed")
+    return f"  - {name} ({', '.join(parts)})"
+
+
 _TEMPLATE_SHAPES_DOC = "\n".join(
-    f"  - {name} (scope={spec['scope']}, needs threshold_config keys: {spec['params'] or 'none'})"
-    for name, spec in TEMPLATE_SHAPES.items()
+    _template_shape_doc_line(name, spec) for name, spec in TEMPLATE_SHAPES.items()
 )
 
 # Tool available to Claude during the rule-intelligence agentic loop.
@@ -56,12 +77,19 @@ _SAMPLE_TOOL_SCHEMA = [
     {
         "name": "get_sample_rows",
         "description": (
-            "Fetch sample rows from the table being analysed. Use this when "
-            "the column statistics and top_values you already have are not "
-            "enough to decide whether a check is worth proposing — for "
-            "example: a sparse column where top_values covers only nulls, a "
-            "suspected format pattern you want to verify, or a multi-column "
-            "relationship you need concrete row evidence for. "
+            "Fetch evidence from the table being analysed. Three modes:\n"
+            "  mode=\"sample\" (default): return raw rows, optionally filtered "
+            "by a WHERE predicate. Use for verifying a suspected multi-column "
+            "relationship or seeing what a sparse column's non-null rows "
+            "actually look like.\n"
+            "  mode=\"distinct\": return a distinct-value listing for ONE "
+            "column with occurrence counts — both the most-frequent (top) and "
+            "the least-frequent (tail). The tail is where typos, deprecated "
+            "codes, and one-off values hide; useful before proposing an "
+            "accepted_values or regex check.\n"
+            "  mode=\"nulls\": return null% and a sample of NON-null rows for "
+            "ONE column. Useful when top_values covers only NULL and you need "
+            "to see the actual populated data before proposing a check.\n"
             "Only query the table you were given — requests for other tables "
             "will be rejected. Column names must match the schema exactly. "
             "Results are capped at 20 rows."
@@ -69,33 +97,43 @@ _SAMPLE_TOOL_SCHEMA = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["sample", "distinct", "nulls"],
+                    "description": (
+                        "sample = raw rows (default); distinct = value+count "
+                        "listing for one column (top and tail); nulls = null% "
+                        "plus non-null rows for one column."
+                    ),
+                },
                 "columns": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Subset of columns to return. Use a focused list — "
-                        "omit columns you already understand. Leave empty to "
-                        "return all columns (capped at 10)."
+                        "For mode=sample: subset of columns to return (leave "
+                        "empty for all, capped at 10). For mode=distinct or "
+                        "mode=nulls: EXACTLY ONE column — the one being "
+                        "investigated."
                     ),
                 },
                 "where_clause": {
                     "type": "string",
                     "description": (
                         "Optional WHERE predicate (no WHERE keyword). "
-                        "Example: \"STATUS IS NULL\" or \"AMOUNT < 0\". "
-                        "Must be a pure filter — no subqueries, no JOINs, "
-                        "no aggregates."
+                        "Only honored for mode=sample. Example: "
+                        "\"STATUS IS NULL\" or \"AMOUNT < 0\". Must be a "
+                        "pure filter — no subqueries, no JOINs, no aggregates."
                     ),
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Number of rows to return (1-20, default 10).",
+                    "description": "Number of rows/values to return (1-20, default 10).",
                     "minimum": 1,
                     "maximum": 20,
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Why you need these rows — logged for observability.",
+                    "description": "Why you need this — logged for observability.",
                 },
             },
             "required": [],
@@ -114,12 +152,27 @@ Given a table schema, real column statistics computed from the live data,
 and the library of check DEFINITIONS this system already knows about (plus
 what is already running or pending on this exact table), you will:
 1. Classify the table type (fact/dimension/staging/config/audit/reference)
-2. For each existing definition that is already active or pending on THIS
-   table, decide whether it should keep running (rarely — only if clearly
-   irrelevant to this table's business purpose)
-3. Propose NEW instances: either a new application of an EXISTING definition
-   to a column/table on THIS table that doesn't have one yet, or — only if no
-   existing definition covers the concept — a genuinely NEW check.
+2. Actively review each EXISTING instance already active or pending on THIS
+   table (listed below with its instance_id, target column, and any
+   threshold config). For every one, decide keep_running=true or false —
+   this is not a rubber stamp. Flip to false when:
+     - the target column no longer exists, has changed type, or its
+       observed stats make the check nonsensical (e.g. accepted_values
+       list on a numeric column, freshness threshold on a non-date column,
+       regex pattern that no non-null value could possibly match)
+     - the check duplicates work another active instance already covers
+       with a stricter or better-targeted variant
+     - the table's business purpose (per your classification) makes the
+       check semantically wrong (e.g. a freshness check on a static
+       reference table)
+   Default is keep_running=true — but only after you've weighed the
+   instance against the current stats. Silent defaults on obviously-broken
+   instances waste reviewer time.
+3. Propose NEW instances. When an existing definition genuinely fits (same
+   concept + threshold shape), reuse it. But when this table has a
+   domain-specific check no existing definition covers, propose a
+   new_definition rather than force-fit an unrelated one — the library is
+   supposed to grow.
 4. Every new check MUST be backed by a real, executable SQL check — never a
    one-time opinion. Prefer one of these known template shapes when it fits
    (Claude just names the shape + the target/params, no SQL to write):
@@ -134,13 +187,17 @@ what is already running or pending on this exact table), you will:
 5. Use the column statistics (null%, distinct count, min/max, top values)
    to decide whether a check is worth proposing and whether it's currently
    violated — you have real numbers, not just a 3-row guess.
-6. You have access to a tool: get_sample_rows. Call it when the column
+6. You have access to a tool: get_sample_rows. It supports three modes:
+   `mode="sample"` (default) returns raw rows with an optional WHERE filter;
+   `mode="distinct"` returns distinct values + counts (top AND tail — the
+   tail is where typos, legacy values, and one-offs hide); `mode="nulls"`
+   returns null% and a sample of non-null rows. Call it when the column
    statistics alone are not enough to be confident — for example: a column
-   whose top_values are all NULL and you want to know if non-null values
-   follow a pattern; a suspected multi-column constraint you want to verify
-   with a filtered sample; or a column you want to see before proposing an
-   accepted_values or regex check. Do NOT call it for columns you already
-   have enough evidence for. You may call it up to 5 times total.
+   whose top_values are all NULL and you want to see the non-null pattern;
+   a suspected multi-column constraint; a column you're about to propose an
+   accepted_values or regex check on. If you're less than 70% sure a
+   proposal is right, call get_sample_rows first — prefer skipping a
+   proposal over guessing. You may call it up to 5 times total.
 
 Respond with valid JSON only — no markdown, no prose outside the JSON.
 Be thorough, but NEVER propose an instance that duplicates something already
@@ -177,6 +234,27 @@ every value in your accepted_values list MUST come from that observed set —
 any value you list that wasn't actually observed will be silently removed
 before the check can run, so there is no benefit to padding the list from
 assumed/world knowledge."""
+
+# Fallback system prompt — same instructions but bullet 6 (get_sample_rows) is
+# rewritten to state that no tool is available in this call, so Claude doesn't
+# waste reasoning on a nonexistent affordance and doesn't complain the tool is
+# missing when the fallback path (no-tools ask_claude) is used.
+SYSTEM_PROMPT_NO_TOOLS = SYSTEM_PROMPT.replace(
+    "6. You have access to a tool: get_sample_rows. It supports three modes:\n"
+    "   `mode=\"sample\"` (default) returns raw rows with an optional WHERE filter;\n"
+    "   `mode=\"distinct\"` returns distinct values + counts (top AND tail — the\n"
+    "   tail is where typos, legacy values, and one-offs hide); `mode=\"nulls\"`\n"
+    "   returns null% and a sample of non-null rows. Call it when the column\n"
+    "   statistics alone are not enough to be confident — for example: a column\n"
+    "   whose top_values are all NULL and you want to see the non-null pattern;\n"
+    "   a suspected multi-column constraint; a column you're about to propose an\n"
+    "   accepted_values or regex check on. If you're less than 70% sure a\n"
+    "   proposal is right, call get_sample_rows first — prefer skipping a\n"
+    "   proposal over guessing. You may call it up to 5 times total.\n\n",
+    "6. No sample-row tool is available in this call — decide from the column\n"
+    "   statistics and signals alone. If the evidence isn't enough for a\n"
+    "   confident proposal, prefer to skip it rather than guess.\n\n",
+)
 
 USER_PROMPT_TEMPLATE = """Table: {fqn}
 Row count: {row_count}
@@ -218,11 +296,12 @@ Respond with this JSON:
   "table_type": "fact|dimension|staging|config|audit|reference|unknown",
   "table_type_confidence": <0-100>,
   "table_type_reason": "one sentence",
-  "definitions_evaluated": {{
-    "<definition_id>": {{
+  "reasoning": "your full first-person deliberation for this analysis — what signals you examined and what each told you, why each proposal is justified by the specific stats/signals, what you considered but ruled out and why, and any caveats. Continuous prose, no headers/bullets. Every sentence must cite a specific column/stat/signal — no preamble, no restating fields already in this JSON, no closing summary. Keep it dense; skip filler.",
+  "instances_evaluated": {{
+    "<instance_id>": {{
       "keep_running": true/false,
       "severity_override": null or "critical|high|medium|low",
-      "reason": "one sentence"
+      "reason": "one sentence — cite the specific column/stat/definition-mismatch that motivated your decision, especially when flipping to false"
     }}
   }},
   "signals_evaluated": {{
@@ -235,9 +314,9 @@ Respond with this JSON:
     {{
       "definition_id": "<existing definition id>" or null,
       "new_definition": null or {{
-        "name": "Short descriptive name",
+        "name": "Short GENERIC concept name — a definition is a reusable concept in the library and will be applied to OTHER tables/columns later, so avoid table- or column-specific words. GOOD: 'Numeric Range Violation', 'Negative Value in Numeric Measure', 'Cross-Column Timestamp Ordering'. BAD: 'Non-negative Order Amount', 'Positive Price Check', 'ORDER_ID uniqueness' — those don't generalize when reused on HOURS_WORKED or another _AMOUNT column.",
         "category": "data_quality|schema|naming|security|ownership",
-        "description": "What this checks and why it matters"
+        "description": "What this concept checks and why it matters, written to make sense on any table it might be applied to. The specific column/threshold/table on THIS instance goes in the rationale field, not here."
       }},
       "scope": "table" or "column" or "multi_column" or "cross_table",
       "column_name": "COLUMN_NAME_IF_COLUMN_SCOPE or null",
@@ -255,9 +334,11 @@ Respond with this JSON:
 }}
 
 IMPORTANT REQUIREMENTS:
-- Every definitions_evaluated entry MUST cover every definition listed as
-  "ALREADY ACTIVE OR PENDING ON THIS TABLE" above — decide keep_running for
-  each one.
+- Every instances_evaluated entry MUST cover every instance_id listed as
+  "ALREADY ACTIVE OR PENDING ON THIS TABLE" above — decide keep_running
+  per-instance. Two instances of the same definition (e.g. two accepted_values
+  checks on different columns) get INDEPENDENT decisions — keep the sensible
+  one and skip the nonsensical one; they are not linked.
 - Every signals_evaluated entry MUST cover every signal_id listed under
   DETERMINISTIC SIGNALS above — decide propose_instance for each one.
 - new_instances entries with definition_id set reuse an existing definition
@@ -266,10 +347,17 @@ IMPORTANT REQUIREMENTS:
 - Every new_instances entry MUST set exactly one of template_shape or
   draft_sql — never both null, never both set. A check with neither is
   useless: it can never actually run.
+- When you pick a template_shape, populate threshold_config with the exact
+  keys listed above for that shape. For range specifically, supply at least
+  one of {{"min_value": ..., "max_value": ...}} — an empty threshold_config
+  for range is silently discarded. If neither bound applies, use a different
+  shape (accepted_values, regex_match) or draft_sql instead.
 - Base violation_detected and violation_evidence on the COLUMN STATISTICS
   and SAMPLE DATA given above, not assumption.
-- Generate 1-5 new_instances. Skip if this table is already well covered by
-  what's active/pending — do not force new suggestions.
+- Propose every check the data actually supports. There is no cap — the
+  reviewer's job is to filter. Every entry MUST cite a specific column,
+  stat, or signal in its rationale/violation_evidence; skip anything you
+  can't ground that way. Skipping is better than guessing.
 - Your ENTIRE response must be a single valid JSON object starting with {{ and ending with }}."""
 
 VALID_CATEGORIES = {"naming", "documentation", "ownership", "schema", "data_quality", "security", "performance"}
@@ -285,6 +373,16 @@ class RuleIntelligenceAgent:
     def __init__(self):
         self._severity_backup: Dict[str, str] = {}
         self._closed_set_columns: Dict[str, dict] = {}
+        # Data source used for source-side queries (rule-SQL execution at
+        # proposal time, get_sample_rows tool). None → fall back to the app's
+        # shared Snowflake session; kept as instance state to avoid threading
+        # `source` through every internal helper signature (audit finding #4).
+        self._source: Any = None
+        # Per-channel status for past-context reads (audit finding #6):
+        # "ok" | "empty" | "error:<ExcType>". Written by _format_past_context,
+        # read into signals_used so the intelligence log shows which past
+        # signals actually reached Claude.
+        self._past_context_health: Dict[str, str] = {}
 
     def run(
         self,
@@ -294,6 +392,7 @@ class RuleIntelligenceAgent:
         run_id: str,
         profiler_result: Optional[Dict[str, Any]] = None,
         relationship_catalog: Optional[List[Any]] = None,
+        source: Any = None,
     ) -> Dict[str, Any]:
         """
         Returns a result dict with:
@@ -327,6 +426,7 @@ class RuleIntelligenceAgent:
         profiler_result = profiler_result or {}
         relationship_catalog = relationship_catalog or []
         self._closed_set_columns = profiler_result.get("closed_set_columns") or {}
+        self._source = source
 
         existing_instances = self._existing_instances_for_table(table_asset)
         rejected_instances = self._rejected_instances_for_table(table_asset)
@@ -392,7 +492,7 @@ class RuleIntelligenceAgent:
             past_context=past_context_text,
         )
 
-        raw, thinking, tool_calls = self._call_model(prompt, table_asset)
+        raw, tool_calls, used_fallback = self._call_model(prompt, table_asset)
         parsed = self._extract_json(raw)
 
         # A parse failure (malformed/truncated response) is NOT the same as a
@@ -416,7 +516,10 @@ class RuleIntelligenceAgent:
                 "Respond again with ONLY a single valid JSON object matching the "
                 "schema above — no markdown fences, no prose before or after."
             )
-            raw, _retry_thinking, _retry_tools = self._call_model(repair_prompt, table_asset)
+            raw, _retry_tools, _retry_fallback = self._call_model(repair_prompt, table_asset)
+            # Fold retry's fallback state — if either call fell back, the run
+            # was degraded.
+            used_fallback = used_fallback or _retry_fallback
             parsed = self._extract_json(raw)
 
         if not parsed:
@@ -437,12 +540,19 @@ class RuleIntelligenceAgent:
                 proposals=parsed["new_instances"],
                 table_asset=table_asset,
                 column_stats_text=column_stats_text,
+                run_id=run_id,
             )
 
         classification = {
             "table_type":            parsed.get("table_type", "unknown"),
             "table_type_confidence": parsed.get("table_type_confidence", 50),
             "table_type_reason":     parsed.get("table_type_reason", ""),
+            # Preferred new shape (keyed by instance_id). Preserved for the
+            # coordinator's per-instance keep_running lookup.
+            "instances_evaluated":   parsed.get("instances_evaluated", {}),
+            # Backward-compat: earlier prompts asked for definitions_evaluated
+            # (keyed by definition_id). Some tests/logs may still send it.
+            # Coordinator falls through to this if instances_evaluated is empty.
             "definitions_evaluated": parsed.get("definitions_evaluated", {}),
             "signals_evaluated":     parsed.get("signals_evaluated", {}),
         }
@@ -461,13 +571,22 @@ class RuleIntelligenceAgent:
                     {"reason": (tc.get("input") or {}).get("reason", ""), "where": (tc.get("input") or {}).get("where_clause", "")}
                     for tc in tool_calls
                 ],
+                # True when the agentic call failed and we fell back to a
+                # no-tools ask_claude. Distinguishes a degraded run from a
+                # normal one in the intelligence log (audit finding #13).
+                "used_fallback": used_fallback,
+                # Per-channel past-context health from _format_past_context —
+                # "ok" | "empty" | "error:<ExcType>". Surfaces silent read
+                # failures that would otherwise look like "no history yet"
+                # (audit finding #6).
+                "past_context_health": dict(self._past_context_health),
             }
             log = storage.create_intelligence_log(
                 run_id=run_id,
                 table_fqn=table_asset.fqn,
-                table_type=classification["table_type"],
-                table_type_confidence=classification["table_type_confidence"],
-                thinking=thinking,
+                table_type=classification["table_type"] or "unknown",
+                table_type_confidence=int(classification["table_type_confidence"] or 0),
+                thinking=parsed.get("reasoning") or "",
                 signals_used=signals_used,
                 proposals_count=len(parsed.get("new_instances", [])),
                 suppressed_count=len(suppressed),
@@ -475,13 +594,15 @@ class RuleIntelligenceAgent:
             intelligence_log_id = log.id
             logger.info(f"[RuleIntelligence] Intelligence log saved: {intelligence_log_id}")
         except Exception as e:
-            logger.warning(f"[RuleIntelligence] Could not save intelligence log: {e}")
+            import traceback
+            logger.warning(f"[RuleIntelligence] Could not save intelligence log: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
-        # Normalize: fill missing decisions with default (keep_running=True)
+        # Normalize: fill missing decisions with default (keep_running=True).
+        # New shape is per-instance; legacy per-definition fallback kept for
+        # runs replayed against older model responses.
         for inst in existing_instances:
-            def_id = inst.definition_id
-            if def_id not in classification["definitions_evaluated"]:
-                classification["definitions_evaluated"][def_id] = {
+            if inst.id not in classification["instances_evaluated"] and inst.definition_id not in classification["definitions_evaluated"]:
+                classification["instances_evaluated"][inst.id] = {
                     "keep_running": True, "severity_override": None,
                     "reason": "Default — not explicitly re-evaluated",
                 }
@@ -527,6 +648,7 @@ class RuleIntelligenceAgent:
             "signals_missed": signals_missed,
             "parse_failed": parse_failed,
             "intelligence_log_id": intelligence_log_id,
+            "tool_calls": tool_calls,
         }
 
     # ── Existing-state gathering ──────────────────────────────────────────
@@ -798,10 +920,9 @@ class RuleIntelligenceAgent:
                 f"Return only the corrected SQL."
             )
             try:
-                fixed_sql = ask_claude(repair_prompt, system=repair_system, max_tokens=2000).strip()
-                # Strip any accidental markdown fences the model added
-                fixed_sql = re.sub(r"^```[a-z]*\n?", "", fixed_sql, flags=re.IGNORECASE)
-                fixed_sql = re.sub(r"\n?```$", "", fixed_sql).strip()
+                fixed_sql = _strip_fences(
+                    ask_claude(repair_prompt, system=repair_system, max_tokens=2000)
+                )
                 check = validate_sql(fixed_sql, allowed_tables=allowed_tables)
                 if check.is_valid:
                     logger.info(f"[RuleIntelligence] SQL repair succeeded on attempt {attempt + 1}")
@@ -820,19 +941,29 @@ class RuleIntelligenceAgent:
         caught by static validation). Only ever called with SELECT-only,
         single-statement, table-scoped SQL that already passed validate_sql().
 
-        Bounded by a server-side statement timeout: validate_sql() proves the
-        SQL is SELECT-only and table-scoped, but NOT that it's cheap — an
-        AI-authored draft_sql with an accidental cartesian join passes
-        validation yet could scan billions of rows. The timeout caps that
-        blast radius; a query that exceeds it is cancelled and the candidate
-        discarded (execution returned None) rather than proposed."""
+        Runs against the run's own DataSource (Snowflake or Postgres/RDS) when
+        one is available — otherwise falls back to the shared Snowflake
+        session so legacy call sites still work.
+
+        Bounded by a server-side statement timeout on Snowflake: validate_sql()
+        proves the SQL is SELECT-only and table-scoped, but NOT that it's
+        cheap — an AI-authored draft_sql with an accidental cartesian join
+        passes validation yet could scan billions of rows. The timeout caps
+        that blast radius on Snowflake; for other sources the query runs to
+        completion, so validate_sql's static checks are the only guard.
+        DataSource.query returns UPPERCASE keys on Snowflake and lowercase on
+        Postgres — read both.
+        """
         try:
-            rows = sf_session.query(rule_sql, timeout=_CHECK_SQL_TIMEOUT_SECONDS)
+            if self._source is not None:
+                rows = self._source.query(rule_sql)
+            else:
+                rows = sf_session.query(rule_sql, timeout=_CHECK_SQL_TIMEOUT_SECONDS)
             if not rows:
                 return None
             row = rows[0]
-            failed = row.get("FAILED_COUNT")
-            total = row.get("TOTAL_COUNT")
+            failed = row.get("FAILED_COUNT", row.get("failed_count"))
+            total = row.get("TOTAL_COUNT", row.get("total_count"))
             if failed is None or total is None:
                 logger.warning(f"[RuleIntelligence] Check SQL did not return FAILED_COUNT/TOTAL_COUNT: {row}")
                 return None
@@ -892,29 +1023,108 @@ class RuleIntelligenceAgent:
         if definition_id:
             definition = storage.get_definition(definition_id)
             if not definition:
-                logger.warning(f"[RuleIntelligence] Claude referenced unknown definition_id={definition_id}")
-                return None
-        elif template_shape and storage.get_definition_by_template_shape(template_shape):
-            # Deterministic backstop — checked BEFORE the fuzzy-similarity
-            # path so it works even for a candidate Claude never attaches a
-            # definition_id to. A canonical definition for this shape already
-            # exists system-wide; always reuse it instead of letting a new
-            # per-table/per-column duplicate spawn. The candidate's own
-            # name/description (if any) is discarded — its business-specific
-            # rationale is preserved separately via RULE_INSTANCES.RATIONALE.
-            definition = storage.get_definition_by_template_shape(template_shape)
-        elif new_definition_data:
-            # Check if this "new" concept actually matches an existing one by
-            # name/description similarity — Claude sometimes re-describes a
-            # concept that already has a definition under a different id.
-            matched = self._find_similar_definition(new_definition_data, existing_definitions)
-            if matched:
-                definition = matched
+                # Claude referenced a definition that doesn't exist — instead
+                # of dropping the candidate, promote it: try the template_shape
+                # canonical, then similarity-match new_definition_data, then
+                # synthesize a new_definition from rationale so the intent
+                # survives to the reviewer. Same fall-through paths the "no
+                # definition_id" branches below already use.
+                logger.info(
+                    f"[RuleIntelligence] Unknown definition_id={definition_id} — "
+                    "promoting candidate via template_shape/similarity/synthesis"
+                )
+                definition_id = None
+            elif template_shape and definition.template_shape != template_shape:
+                # Shape mismatch guard: Claude picked template_shape=X but
+                # attached a definition_id whose canonical shape is Y (or is
+                # None — a python_handler def which by design has no template
+                # shape). This happens because UUIDs are opaque tokens; the
+                # model copied the wrong one from the library list. Concrete
+                # example: candidate template_shape="freshness" on LAST_UPDATED
+                # wired to definition "OHLC Range Consistency" (python_handler,
+                # template_shape=None). Drop the wrong id and fall through to
+                # the template-shape canonical / similarity / synthesis path so
+                # the intent survives, attached to a definition that actually
+                # matches the shape.
+                logger.warning(
+                    f"[RuleIntelligence] Shape mismatch: candidate template_shape={template_shape!r} "
+                    f"but definition_id={definition_id} points to '{definition.name}' "
+                    f"(shape={definition.template_shape!r}) — discarding definition_id, "
+                    "will re-resolve via template_shape canonical."
+                )
+                definition = None
+                definition_id = None
+
+        if not definition and not definition_id:
+            if template_shape and storage.get_definition_by_template_shape(template_shape):
+                # Deterministic backstop — checked BEFORE the fuzzy-similarity
+                # path so it works even for a candidate Claude never attaches a
+                # definition_id to. A canonical definition for this shape already
+                # exists system-wide; always reuse it instead of letting a new
+                # per-table/per-column duplicate spawn. The candidate's own
+                # name/description (if any) is discarded — its business-specific
+                # rationale is preserved separately via RULE_INSTANCES.RATIONALE.
+                definition = storage.get_definition_by_template_shape(template_shape)
+            elif new_definition_data:
+                # Check if this "new" concept actually matches an existing one by
+                # name/description similarity — Claude sometimes re-describes a
+                # concept that already has a definition under a different id.
+                matched = self._find_similar_definition(new_definition_data, existing_definitions)
+                if matched:
+                    definition = matched
+                else:
+                    definition = None  # not persisted yet — staged below
+                    is_new_definition = True
+            elif candidate.get("rationale"):
+                # No definition_id, no template_shape-backed canonical, no
+                # explicit new_definition — but rationale exists. Synthesize a
+                # new_definition from the rationale so the reviewer sees a
+                # named concept instead of us silently discarding the proposal.
+                #
+                # Two library-bloat defences here (audit finding #9):
+                #  1. Name is derived deterministically from template_shape +
+                #     column_name / scope when possible — so a re-run whose
+                #     rationale wording drifted still produces the same name
+                #     and matches by name-similarity next round. Only when
+                #     nothing structural is available do we fall back to
+                #     rationale-prose truncation.
+                #  2. Similarity match runs against ALL definitions (proposed
+                #     + active + disabled), not just active — a previously
+                #     synthesized-but-not-yet-approved definition would
+                #     otherwise be invisible and duplicated every scan. And
+                #     because rationale prose is fuzzier than a real name,
+                #     we use a lower threshold (0.5) here than the deliberate
+                #     new_definition path above (0.7).
+                rationale_text = candidate.get("rationale", "").strip()
+                stable_name = self._stable_synthesized_name(
+                    template_shape=candidate.get("template_shape"),
+                    scope=scope,
+                    column_name=column_name,
+                    rationale=rationale_text,
+                )
+                synthesized = {
+                    "name": stable_name,
+                    "description": rationale_text[:500],
+                    "category": "data_quality",
+                }
+                try:
+                    all_defs = storage.list_all_definitions()
+                except Exception as e:
+                    logger.warning(f"[RuleIntelligence] list_all_definitions failed, falling back to active: {e}")
+                    all_defs = existing_definitions
+                matched = self._find_similar_definition(synthesized, all_defs, threshold=0.5)
+                if matched:
+                    logger.info(
+                        f"[RuleIntelligence] Synthesis matched existing definition "
+                        f"'{matched.name}' (status={matched.status}) — reusing"
+                    )
+                    definition = matched
+                else:
+                    new_definition_data = synthesized
+                    candidate["new_definition"] = synthesized  # so downstream persist path sees it
+                    is_new_definition = True
             else:
-                definition = None  # not persisted yet — staged below
-                is_new_definition = True
-        else:
-            return None
+                return None
 
         severity = candidate.get("severity") or (definition.default_severity if definition else "medium")
         if severity not in VALID_SEVERITIES:
@@ -941,9 +1151,15 @@ class RuleIntelligenceAgent:
             rule_sql, threshold_config = self._build_rule_sql(render_candidate, table_asset, target_config)
             label = new_definition_data.get("name", "?") if new_definition_data else (definition.name if definition else "?")
             if not rule_sql:
+                # Include the shape + what Claude sent so a silent drop is
+                # actually debuggable — the two range-template discards on the
+                # first real scan showed up as generic "no valid SQL" lines
+                # in the log with no way to see it was an empty threshold_config.
                 logger.info(
                     f"[RuleIntelligence] Discarding candidate '{label}' — "
-                    "no valid template_shape or draft_sql resolved to executable SQL"
+                    f"no executable SQL resolved. shape={effective_template_shape!r} "
+                    f"threshold_config={candidate.get('threshold_config')!r} "
+                    f"draft_sql={'yes' if candidate.get('draft_sql') else 'no'}"
                 )
                 return None
             # Actually run it now — real query result beats Claude's
@@ -1023,7 +1239,16 @@ class RuleIntelligenceAgent:
             "source_run_id": run_id,
         }
 
-    def _find_similar_definition(self, new_def: dict, existing_definitions: List[Any]) -> Optional[Any]:
+    def _find_similar_definition(
+        self,
+        new_def: dict,
+        existing_definitions: List[Any],
+        threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    ) -> Optional[Any]:
+        """Best-match by word overlap on name+description. `threshold` defaults
+        to the codebase-wide default (0.7); the synthesis path passes a lower
+        value (0.5) because rationale prose wording drifts more than deliberate
+        `new_definition` names do."""
         name = new_def.get("name", "")
         desc = new_def.get("description", "")
         combined = f"{name} {desc}"
@@ -1032,7 +1257,25 @@ class RuleIntelligenceAgent:
             score = word_overlap_score(combined, f"{d.name} {d.description or ''}")
             if score > best_score:
                 best_score, best = score, d
-        return best if best_score >= DEFAULT_SIMILARITY_THRESHOLD else None
+        return best if best_score >= threshold else None
+
+    @staticmethod
+    def _stable_synthesized_name(
+        template_shape: Optional[str],
+        scope: str,
+        column_name: Optional[str],
+        rationale: str,
+    ) -> str:
+        """Deterministic name for a synthesized definition — same inputs across
+        runs produce the same name so similarity match hits on re-run, closing
+        the library-bloat loop that rationale-prose slugs left open."""
+        if template_shape:
+            target = column_name or scope or "table"
+            return f"AI: {template_shape} on {target}"[:100]
+        if column_name:
+            return f"AI check on {column_name}"[:100]
+        # Nothing structural to hook to — fall back to rationale prefix.
+        return (rationale[:60].rstrip(".,;:") or "AI-proposed check")
 
     # ── Classification decision helpers (consumed by coordinator) ────────
 
@@ -1065,7 +1308,8 @@ class RuleIntelligenceAgent:
         proposals: list,
         table_asset: Any,
         column_stats_text: str,
-        min_score: int = 3,
+        run_id: str,
+        min_score: float = 2.0,
     ) -> list:
         """Second-pass call: Claude reads its own proposals and scores each
         1-5 on three dimensions:
@@ -1077,13 +1321,37 @@ class RuleIntelligenceAgent:
         before it enters _process_candidate and hits fingerprinting/SQL execution.
         Deterministic candidates never enter this path (they're already processed).
 
+        Novel proposals (definition_id is None AND new_definition is set) are
+        deliberately routed AROUND this critique — their evidence is naturally
+        weaker than an existing-reuse proposal's, so they used to be cut
+        hardest here, which starved the library of new concepts. The reviewer
+        is the filter for novel concepts; critique is reserved for existing-
+        reuse proposals where the "does this belong here?" question is real.
+
         Uses a fast non-thinking call — this is a scoring/filtering task, not
         an exploration task.
         """
         if not proposals:
             return proposals
 
-        proposals_json = json.dumps(proposals, indent=2)
+        novel_indices: Set[int] = set()
+        critique_targets: List[dict] = []
+        critique_index_map: List[int] = []
+        for i, p in enumerate(proposals):
+            if p.get("definition_id") is None and p.get("new_definition"):
+                novel_indices.add(i)
+                continue
+            critique_index_map.append(i)
+            critique_targets.append(p)
+
+        if not critique_targets:
+            logger.info(
+                f"[RuleIntelligence] Self-critique bypassed — all {len(proposals)} "
+                "proposals are novel (new_definition set), keeping as-is"
+            )
+            return proposals
+
+        proposals_json = json.dumps(critique_targets, indent=2)
         critique_prompt = (
             f"Table: {table_asset.fqn}\n"
             f"Row count: {table_asset.row_count or 'unknown'}\n\n"
@@ -1100,19 +1368,31 @@ class RuleIntelligenceAgent:
             '{"scores": [{"index": 0, "evidence": <1-5>, "impact": <1-5>, "approval": <1-5>, '
             '"drop_reason": null or "one sentence why this is weak"}, ...]}'
         )
-        try:
-            raw = ask_claude(critique_prompt, system=self._CRITIQUE_SYSTEM, max_tokens=4000)
-            raw = raw.strip()
-            raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"\n?```$", "", raw).strip()
-            critique = json.loads(raw)
-            scores_by_index = {s["index"]: s for s in critique.get("scores", [])}
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] Self-critique parse failed ({e}) — keeping all proposals")
+        critique = ask_claude_json(
+            critique_prompt,
+            system=self._CRITIQUE_SYSTEM,
+            max_tokens=4000,
+            label="self_critique",
+        )
+        if critique is None:
+            logger.warning("[RuleIntelligence] Self-critique returned no parseable JSON — keeping all proposals")
             return proposals
+        # Scores are indexed against critique_targets (the subset actually
+        # submitted). Remap back to the full proposals list before the drop
+        # loop so per-proposal indices line up.
+        scores_by_index: Dict[int, dict] = {}
+        for s in critique.get("scores", []):
+            local_i = s.get("index")
+            if local_i is None or local_i < 0 or local_i >= len(critique_index_map):
+                continue
+            scores_by_index[critique_index_map[local_i]] = s
 
         kept = []
         for i, proposal in enumerate(proposals):
+            if i in novel_indices:
+                # Novel proposals bypass critique — keep them all.
+                kept.append(proposal)
+                continue
             score_entry = scores_by_index.get(i)
             if not score_entry:
                 kept.append(proposal)
@@ -1131,6 +1411,18 @@ class RuleIntelligenceAgent:
                     f"— {reason} (evidence={score_entry.get('evidence')}, "
                     f"impact={score_entry.get('impact')}, approval={score_entry.get('approval')})"
                 )
+                storage.log_critique_drop(
+                    run_id=run_id,
+                    table_fqn=table_asset.fqn,
+                    proposal=proposal,
+                    scores={
+                        "evidence": score_entry.get("evidence"),
+                        "impact":   score_entry.get("impact"),
+                        "approval": score_entry.get("approval"),
+                    },
+                    mean_score=mean,
+                    drop_reason=reason,
+                )
 
         dropped = len(proposals) - len(kept)
         if dropped:
@@ -1144,28 +1436,69 @@ class RuleIntelligenceAgent:
         intelligence logs and format them as grounded guidance.
 
         Injection order (most actionable first):
-          1. Synthesised feedback memo — cross-run patterns Claude distilled
+          1. Same-table history — what YOU decided on THIS exact table before.
+          2. Synthesised feedback memo — cross-run patterns Claude distilled
              from many human decisions, e.g. "always approve non-negative on
              AMOUNT columns; always reject column-comment checks here."
-          2. Raw approve/reject lessons — individual human decisions.
-          3. Past thinking blobs from similar tables.
+          3. Raw approve/reject lessons — individual human decisions.
+          4. Past thinking blobs from similar tables.
         """
         parts = []
+        # Track which past-context channels returned data vs empty vs errored.
+        # Empty is fine (nothing to learn from yet), errored means the query
+        # itself failed — the difference matters for debugging why Claude
+        # keeps missing obvious cross-run patterns (audit finding #6). Storage
+        # already logs the actual exception; this dict just records "did it
+        # answer" so the intelligence log can carry the health flags.
+        health = {
+            "same_table_logs": "empty",
+            "feedback_memo": "empty",
+            "review_lessons": "empty",
+            "similar_intelligence": "empty",
+        }
+
+        # ── Same-table history (highest signal — your own past decisions) ─
+        try:
+            same_table_logs = storage.get_intelligence_logs_for_table(table_asset.fqn, limit=3)
+            health["same_table_logs"] = "ok" if same_table_logs else "empty"
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] same-table history fetch failed: {e}")
+            same_table_logs = []
+            health["same_table_logs"] = f"error:{type(e).__name__}"
+
+        if same_table_logs:
+            latest = same_table_logs[0]
+            older = same_table_logs[1:]
+            lines = [
+                "  YOUR LAST RUN ON THIS EXACT TABLE:",
+                f"    table_type={latest.table_type} (confidence={latest.table_type_confidence})  "
+                f"proposals={latest.proposals_count}  "
+                f"approved={latest.approved_count}  rejected={latest.rejected_count}  "
+                f"at={latest.created_at}",
+            ]
+            if latest.thinking:
+                lines.append(f"    Prior reasoning: {latest.thinking[:800]}")
+            if older:
+                lines.append(f"  Earlier runs on this table: {len(older)} more log(s) in RULE_INTELLIGENCE_LOGS")
+            parts.append("\n".join(lines))
 
         # ── Synthesised feedback memo (highest signal) ───────────────────
+        memo = None
         try:
             bare_table = table_asset.fqn.upper().split(".")[-1]
             # We don't know table_type yet (that's Claude's output), so we try
             # common types; the memo for the right type will have higher
             # confidence and the others will be absent.
-            memo = None
             for ttype in ["fact", "dimension", "staging", "audit", "reference", "config", "unknown"]:
                 m = storage.get_feedback_memo(bare_table, ttype)
                 if m and m.get("confidence", 0) >= 40:
                     memo = m
                     break
-        except Exception:
+            health["feedback_memo"] = "ok" if memo else "empty"
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] feedback memo fetch failed: {e}")
             memo = None
+            health["feedback_memo"] = f"error:{type(e).__name__}"
 
         if memo:
             memo_lines = [f"  SYNTHESISED FEEDBACK MEMO (confidence={memo.get('confidence', '?')}%, based on {memo.get('_lesson_count', '?')} past reviews):"]
@@ -1182,8 +1515,11 @@ class RuleIntelligenceAgent:
         # ── Raw review lessons ───────────────────────────────────────────
         try:
             lessons = storage.get_review_lessons_for_table(table_asset.fqn, limit=20)
-        except Exception:
+            health["review_lessons"] = "ok" if lessons else "empty"
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] review lessons fetch failed: {e}")
             lessons = []
+            health["review_lessons"] = f"error:{type(e).__name__}"
 
         if lessons:
             approved = [l for l in lessons if l["verdict"] == "approved"]
@@ -1204,8 +1540,15 @@ class RuleIntelligenceAgent:
         # ── Past thinking blobs from similar tables ──────────────────────
         try:
             past_logs = storage.search_similar_intelligence(table_asset.fqn, limit=3)
-        except Exception:
+            health["similar_intelligence"] = "ok" if past_logs else "empty"
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] similar intelligence fetch failed: {e}")
             past_logs = []
+            health["similar_intelligence"] = f"error:{type(e).__name__}"
+
+        # Stash health on the instance so `signals_used` can pick it up when
+        # the intelligence log is written.
+        self._past_context_health = health
 
         for log in past_logs:
             outcome = f"approved={log.approved_count}, rejected={log.rejected_count}"
@@ -1221,64 +1564,168 @@ class RuleIntelligenceAgent:
     def _execute_sample_tool(self, table_asset: Any, inputs: dict) -> str:
         """Safe executor for the get_sample_rows tool call from Claude.
 
+        Dispatches on `mode`:
+          sample   — raw rows (default), optional WHERE
+          distinct — value+count listing for one column (top and tail)
+          nulls    — null% and non-null sample for one column
+
         Enforces:
-        - Only the target table can be queried (rejects any other fqn)
-        - WHERE clause is stripped of dangerous keywords
+        - Only the target table can be queried
+        - Identifiers pass _safe_identifier (letters/digits/underscore only)
+        - WHERE clause is stripped of dangerous keywords, semicolons rejected
         - Row cap of _SAMPLE_MAX_ROWS
         - SELECT-only (no DML)
         """
-        fqn = table_asset.fqn
-        columns = inputs.get("columns") or []
-        where_clause = (inputs.get("where_clause") or "").strip()
-        limit = min(int(inputs.get("limit") or 10), _SAMPLE_MAX_ROWS)
+        mode = (inputs.get("mode") or "sample").lower()
         reason = inputs.get("reason", "")
+        limit = min(int(inputs.get("limit") or 10), _SAMPLE_MAX_ROWS)
+        columns = inputs.get("columns") or []
 
-        logger.info(f"[RuleIntelligence] sample tool: cols={columns} where={where_clause!r} limit={limit} reason={reason!r}")
+        logger.info(
+            f"[RuleIntelligence] sample tool: mode={mode} cols={columns} "
+            f"limit={limit} reason={reason!r}"
+        )
+
+        try:
+            if mode == "distinct":
+                return self._sample_tool_distinct(table_asset, columns, limit)
+            if mode == "nulls":
+                return self._sample_tool_nulls(table_asset, columns, limit)
+            return self._sample_tool_rows(table_asset, columns, inputs.get("where_clause") or "", limit)
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] sample tool ({mode}) failed: {e}")
+            return f"Query failed: {e}"
+
+    @staticmethod
+    def _require_ident(name: str) -> str:
+        """Reject anything that isn't a plain identifier. Uses the same rule
+        rule_sql_templates._safe_identifier applies — letters, digits, and
+        underscore only — so Claude can't smuggle SQL through a column name."""
+        _IDENT_SAFE = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")
+        if not name or not all(c in _IDENT_SAFE for c in name):
+            raise ValueError(f"Unsafe column name: {name!r}")
+        return name
+
+    def _sample_tool_rows(self, table_asset: Any, columns: list, where_clause: str, limit: int) -> str:
+        fqn = table_asset.fqn
+        where_clause = where_clause.strip()
 
         # Safety: reject anything that could turn the filter into a second
         # statement or exfiltration query.
         _FORBIDDEN_WORDS = {"insert", "update", "delete", "drop", "truncate", "create",
                             "alter", "merge", "execute", "exec", "call", "grant", "revoke", "select"}
         where_lower = where_clause.lower()
-        # Semicolons are statement terminators — check with plain 'in', not \b
         if ";" in where_lower:
             return "Rejected: WHERE clause contains forbidden keyword ';'."
         for kw in _FORBIDDEN_WORDS:
             if re.search(r'\b' + kw + r'\b', where_lower):
                 return f"Rejected: WHERE clause contains forbidden keyword '{kw}'."
 
-        col_expr = ", ".join(columns[:_SAMPLE_DEFAULT_COLS]) if columns else "*"
+        safe_cols = [self._require_ident(c) for c in columns[:_SAMPLE_DEFAULT_COLS]]
+        col_expr = ", ".join(safe_cols) if safe_cols else "*"
         sql = f"SELECT {col_expr} FROM {fqn}"
         if where_clause:
             sql += f" WHERE {where_clause}"
         sql += f" LIMIT {limit}"
 
-        try:
-            rows = sf_session.query(sql)
-            if not rows:
-                return "(no rows matched)"
-            headers = list(rows[0].keys())[:_SAMPLE_DEFAULT_COLS]
-            lines = [" | ".join(headers), "-" * 60]
-            for row in rows:
-                vals = [str(row.get(h, ""))[:30] for h in headers]
-                lines.append(" | ".join(vals))
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] sample tool query failed: {e}")
-            return f"Query failed: {e}"
+        rows = self._source.query(sql) if self._source is not None else sf_session.query(sql)
+        if not rows:
+            return "(no rows matched)"
+        headers = list(rows[0].keys())[:_SAMPLE_DEFAULT_COLS]
+        lines = [" | ".join(headers), "-" * 60]
+        for row in rows:
+            vals = [str(row.get(h, ""))[:30] for h in headers]
+            lines.append(" | ".join(vals))
+        return "\n".join(lines)
+
+    def _sample_tool_distinct(self, table_asset: Any, columns: list, limit: int) -> str:
+        """Top-N + bottom-N distinct values with counts for one column. Uses
+        the DataSource primitives (top_values / bottom_values) so it goes
+        through the adapter's native ORDER BY and works on Snowflake + Postgres
+        with identical semantics."""
+        if len(columns) != 1:
+            return "Rejected: mode=distinct requires exactly one column."
+        col = self._require_ident(columns[0])
+        if self._source is None:
+            return "Rejected: mode=distinct requires a resolved data source."
+
+        top = self._source.top_values(
+            table_asset.database_name, table_asset.schema_name, table_asset.table_name,
+            col, limit=limit,
+        )
+        bottom = self._source.bottom_values(
+            table_asset.database_name, table_asset.schema_name, table_asset.table_name,
+            col, limit=limit,
+        )
+        lines = [f"Column {col} — top {len(top)} distinct values by frequency:"]
+        for tv in top:
+            lines.append(f"  {tv.get('value')!r:<40} count={tv.get('count')}")
+        lines.append(f"Column {col} — tail {len(bottom)} distinct values by frequency:")
+        for tv in bottom:
+            lines.append(f"  {tv.get('value')!r:<40} count={tv.get('count')}")
+        return "\n".join(lines)
+
+    def _sample_tool_nulls(self, table_asset: Any, columns: list, limit: int) -> str:
+        """Null% for one column + a sample of its NON-null rows. Useful when
+        top_values on a sparse column shows only NULL and Claude needs to see
+        actual populated values before proposing a check."""
+        if len(columns) != 1:
+            return "Rejected: mode=nulls requires exactly one column."
+        col = self._require_ident(columns[0])
+        fqn = table_asset.fqn
+
+        source = self._source if self._source is not None else sf_session
+        stat_rows = source.query(
+            f"SELECT COUNT(*) AS TOTAL, COUNT({col}) AS NON_NULLS FROM {fqn}"
+        )
+        stat = stat_rows[0] if stat_rows else {}
+        total = stat.get("TOTAL", stat.get("total")) or 0
+        non_nulls = stat.get("NON_NULLS", stat.get("non_nulls")) or 0
+        null_pct = round((total - non_nulls) / total * 100, 1) if total else 0.0
+
+        sample_rows = source.query(
+            f"SELECT {col} FROM {fqn} WHERE {col} IS NOT NULL LIMIT {limit}"
+        )
+        lines = [
+            f"Column {col} — total={total}, non_nulls={non_nulls}, null%={null_pct}",
+            f"Sample non-null values (up to {limit}):",
+        ]
+        if not sample_rows:
+            lines.append("  (no non-null rows found)")
+        else:
+            key = col if col in sample_rows[0] else col.lower()
+            for row in sample_rows:
+                lines.append(f"  {row.get(key)!r}")
+        return "\n".join(lines)
 
     def _format_column_stats(self, column_stats: Dict[str, dict]) -> str:
         """Formats DeterministicProfilerAgent's column_stats for the prompt —
         the querying itself now happens once, upstream in profiler_agent.py,
-        reused for both this text and deterministic candidate generation."""
+        reused for both this text and deterministic candidate generation.
+
+        tail_values (least-frequent, when present) are shown alongside
+        top_values because they surface the outliers real rules should catch
+        — typos, legacy codes, deprecated statuses that top_values alone
+        would never reveal on a skewed distribution.
+        """
         if not column_stats:
             return "  (stats unavailable)"
         lines = []
         for name, stat in column_stats.items():
             top_values = ", ".join(f"{tv['value']!r}({tv['count']})" for tv in stat.get("top_values", []))
+            tail = stat.get("tail_values") or []
+            tail_str = ""
+            if tail:
+                # Only show tail when it differs from top — a tiny closed set
+                # already fits in top_values, and repeating it just wastes tokens.
+                top_val_set = {repr(tv["value"]) for tv in stat.get("top_values", [])}
+                tail_extra = [tv for tv in tail if repr(tv["value"]) not in top_val_set]
+                if tail_extra:
+                    tail_formatted = ", ".join(f"{tv['value']!r}({tv['count']})" for tv in tail_extra)
+                    tail_str = f" tail_values=[{tail_formatted}]"
             lines.append(
                 f"  {name:<25} null%={stat['null_pct']:<6} distinct={stat['distinct']:<8} "
-                f"top_values=[{top_values}]"
+                f"top_values=[{top_values}]{tail_str}"
             )
         return "\n".join(lines)
 
@@ -1353,13 +1800,24 @@ class RuleIntelligenceAgent:
             return "  (library is empty)"
         lines = []
         for d in definitions:
+            # Deliberately omit an "approved N times" counter here: the stored
+            # APPROVAL_COUNT column is monotonic (audit finding #8) so showing
+            # it to Claude just skews toward historically-heavy definitions
+            # regardless of current usefulness.
             lines.append(
-                f"  id={d.id} [{d.category}] {d.name} (approved {d.approval_count}x)"
+                f"  id={d.id} [{d.category}] {d.name}"
                 f"\n    {d.description[:120]}"
             )
         return "\n".join(lines)
 
     def _format_existing_instances(self, instances: List[Any], definitions: List[Any]) -> str:
+        """Format each existing instance with its instance_id (the key
+        instances_evaluated must use) + its target + any threshold config.
+        Threshold matters: two `accepted_values` instances of the same
+        definition on different columns are independent decisions, and
+        their accepted-value lists are what Claude must sanity-check against
+        the actual column data (e.g. reject `accepted_values: ['A','B','C']`
+        on a numeric column)."""
         if not instances:
             return "  (none — this table has no active/pending checks yet)"
         by_id = {d.id: d for d in definitions}
@@ -1367,27 +1825,43 @@ class RuleIntelligenceAgent:
         for inst in instances:
             d = by_id.get(inst.definition_id)
             name = d.name if d else inst.definition_id
-            target = inst.target_config.get("column") if inst.target_config else None
-            target_str = f"column={target}" if target else "table-level"
-            lines.append(f"  definition_id={inst.definition_id} \"{name}\" [{inst.status}] {target_str}")
+            tc = inst.target_config or {}
+            if tc.get("column"):
+                target_str = f"column={tc['column']}"
+            elif tc.get("columns"):
+                target_str = f"columns={tc['columns']}"
+            else:
+                target_str = "table-level"
+            threshold = inst.threshold_config or {}
+            threshold_str = f" threshold={threshold}" if threshold else ""
+            lines.append(
+                f'  instance_id={inst.id} "{name}" [{inst.status}] {target_str}{threshold_str}'
+            )
         return "\n".join(lines)
 
     def _call_model(self, prompt: str, table_asset: Any) -> tuple:
         """
-        Returns (text, thinking, tool_calls).
+        Returns (text, tool_calls, used_fallback).
 
-        Primary path: agentic loop with adaptive thinking + get_sample_rows tool.
-        Bedrock redacts thinking block content even when adaptive thinking is
-        enabled, so we make a second call after the main one to reconstruct the
-        reasoning explicitly — see _generate_thinking().
-        Falls back to ask_claude (no tools) if the agentic call fails.
+        Agentic loop with adaptive thinking + get_sample_rows tool. Reasoning
+        is emitted as a `reasoning` field in the JSON response (see
+        USER_PROMPT_TEMPLATE) — no separate reconstruction call, since Bedrock
+        redacts the actual thinking block content anyway.
+
+        Falls back to ask_claude (no tools) if the agentic call fails. The
+        fallback uses SYSTEM_PROMPT_NO_TOOLS so Claude isn't told "you have a
+        tool" when it doesn't (audit finding #13), and `used_fallback` is
+        surfaced so the intelligence log can record that the run reasoned with
+        reduced affordances — otherwise a degraded run is indistinguishable
+        from a normal one.
         """
         def tool_executor(name: str, inputs: dict) -> str:
             if name == "get_sample_rows":
                 return self._execute_sample_tool(table_asset, inputs)
             return f"Unknown tool: {name}"
 
-        tool_calls = []
+        tool_calls: list = []
+        used_fallback = False
         try:
             result = ask_claude_agentic(
                 prompt,
@@ -1401,67 +1875,15 @@ class RuleIntelligenceAgent:
             text = result["text"]
             tool_calls = result["tool_calls"]
         except Exception as e:
-            logger.warning(f"[RuleIntelligence] Agentic call failed ({e}), falling back to standard Bedrock")
+            logger.warning(f"[RuleIntelligence] Agentic call failed ({e}), falling back to standard Bedrock (no tools)")
+            used_fallback = True
             try:
-                text = ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=32000)
+                text = ask_claude(prompt, system=SYSTEM_PROMPT_NO_TOOLS, max_tokens=32000)
             except Exception as e2:
                 logger.error(f"[RuleIntelligence] Bedrock fallback also failed: {e2}")
                 raise
 
-        thinking = self._generate_thinking(prompt, text)
-        return text, thinking, tool_calls
-
-    _THINKING_SYSTEM = (
-        "You are a senior data quality architect. You have just completed a "
-        "rule intelligence analysis for a Snowflake table. Write out your full "
-        "reasoning process in depth — not a summary or bullet points, but your "
-        "actual chain of thought in continuous prose: what signals you examined "
-        "and what each told you, the trade-offs you weighed, why each rule "
-        "proposal is justified by the specific data characteristics, what you "
-        "considered but ruled out and why, and any caveats or uncertainties. "
-        "Write entirely in first person. Be deeply specific to the actual "
-        "statistics and signals in the analysis — avoid generic advice."
-    )
-
-    def _generate_thinking(self, original_prompt: str, model_output: str) -> str:
-        """
-        Ask Claude to write out its full reasoning chain for the analysis it
-        just completed. Bedrock doesn't expose thinking block content, so we
-        reconstruct it from the prompt + output as a second call.
-        Returns "" on any failure so the pipeline is never blocked.
-        """
-        thinking_prompt = (
-            f"You were given this data quality analysis task:\n\n"
-            f"---\n{original_prompt}\n---\n\n"
-            f"You produced this output:\n\n"
-            f"---\n{model_output}\n---\n\n"
-            f"Now write your complete, detailed reasoning process for how you "
-            f"arrived at that output. You must cover every significant decision:\n"
-            f"- How you classified the table type, which signals drove that "
-            f"conclusion, and what alternative classifications you considered\n"
-            f"- For each definition you evaluated: why it was or wasn't relevant "
-            f"to this table's specific business purpose and data characteristics\n"
-            f"- Which column statistics stood out and exactly how they shaped "
-            f"your proposals (reference actual numbers from the stats)\n"
-            f"- For every proposed rule instance: the precise reasoning — why "
-            f"this column, why this threshold, why this severity, what failure "
-            f"mode it guards against, and whether current data already violates it\n"
-            f"- What you considered proposing but decided against, and why those "
-            f"were weaker than what you kept\n"
-            f"Write as continuous prose — no headers, no bullet points. "
-            f"Be specific to this table, not generic."
-        )
-        try:
-            thinking = ask_claude(
-                thinking_prompt,
-                system=self._THINKING_SYSTEM,
-                max_tokens=4000,
-            )
-            logger.info(f"[RuleIntelligence] Generated thinking ({len(thinking)} chars)")
-            return thinking
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] Thinking generation failed ({e}) — continuing without")
-            return ""
+        return text, tool_calls, used_fallback
 
     @staticmethod
     def _extract_json(text: str) -> dict:

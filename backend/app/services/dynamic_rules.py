@@ -203,18 +203,31 @@ def _ensure_rule(
     severity: str,
     applies_to: List[str],
 ) -> Any:
-    """Return the global instance for the python_handler definition keyed by
-    `code` (used as HANDLER_KEY, lowercased), auto-creating the definition +
-    its global instance if missing. Callers use the returned instance like
-    the old Rule object (.severity, .code via .handler_key)."""
+    """Return a rule-shape object for the python_handler definition keyed by
+    `code` (used as HANDLER_KEY, lowercased). Auto-creates the definition if
+    missing. Callers use the returned object like the old Rule object
+    (.severity, .code via .handler_key, .definition).
+
+    NOTE 2026-07-15: this used to also create a DATABASE_NAME='*' global
+    instance and return it. Globals are gone — a metadata handler now runs on
+    a table only when RuleIntelligence proposed it (with human review) as a
+    per-table instance. FindingsAgent gates run_dynamic_checks by
+    allowed_rule_codes = {handler_keys of approved per-table instances}, so a
+    dynamic check whose definition isn't proposed simply doesn't fire. The
+    returned object is a lightweight shell used only for the finding's
+    severity/code fields; no instance row is required to build a finding
+    dict (create_findings_bulk fills instance_id from the FindingsAgent side
+    when it wires the finding back to its approved instance).
+    """
+    from types import SimpleNamespace
     handler_key = code.lower()
     definition = storage.ensure_definition(handler_key, name, description, category, severity, applies_to)
-    instance = storage.get_instance_by_fingerprint(_hash(definition.id))
-    if instance is None:
-        instance = storage.ensure_global_instance(definition)
-    instance.code = code
-    instance.definition = definition
-    return instance
+    return SimpleNamespace(
+        code=code,
+        handler_key=handler_key,
+        severity=severity,
+        definition=definition,
+    )
 
 
 def _hash(definition_id: str) -> str:
@@ -231,10 +244,14 @@ def _finding(
     context: Dict[str, Any],
     evidence: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """Build a finding dict from a rule-shape object. instance_id is left as
+    None here — the caller (run_dynamic_checks) fills it from the
+    handler_key → approved-instance-id map so the finding wires back to a
+    per-table approved instance, not to a (no-longer-existing) global one."""
     return {
         "asset_id": asset_id,
         "scan_id": scan_id,
-        "instance_id": rule.id,
+        "instance_id": getattr(rule, "id", None),
         "title": title,
         "description": description,
         "severity": rule.severity,
@@ -767,24 +784,24 @@ def check_boolean_stored_as_varchar(
 # Public entry point called by RuleEngine
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Mapping of dynamic check function → rule code it produces
-# Used to skip checks the classifier decided not to run
+# Mapping of dynamic check function → rule code it produces.
+# Trimmed 2026-07-15: only the 5 kept metadata handlers dispatch here. The
+# other check_* functions further down in this file (check_missing_created_at,
+# check_too_many_columns, check_inconsistent_naming, check_generic_column_name,
+# check_column_type_mismatch, check_fk_without_constraint,
+# check_missing_updated_at) are intentionally NOT wired up — their definitions
+# are gone from the library, so allowed_rule_codes would never include them.
+# Kept as dead code rather than deleted to preserve blame history; revive by
+# adding back to these dicts and re-seeding the definition.
 _TABLE_CHECK_CODES = {
     check_no_primary_key:       "NO_PRIMARY_KEY_HINT",
-    check_missing_created_at:   "MISSING_CREATED_AT",
-    check_missing_updated_at:   "MISSING_UPDATED_AT",
-    check_too_many_columns:     "TOO_MANY_COLUMNS",
-    check_inconsistent_naming:  "INCONSISTENT_COLUMN_NAMING",
 }
 
 _COLUMN_CHECK_CODES = {
-    check_pii_column:              "PII_COLUMN_NO_MASKING",
-    check_generic_column_name:     "GENERIC_COLUMN_NAME",
-    check_column_type_mismatch:    "COLUMN_TYPE_MISMATCH",   # covers all subtypes
-    check_nullable_id_column:      "NULLABLE_ID_COLUMN",
-    check_date_stored_as_varchar:  "DATE_STORED_AS_VARCHAR",
+    check_pii_column:                "PII_COLUMN_NO_MASKING",
+    check_nullable_id_column:        "NULLABLE_ID_COLUMN",
+    check_date_stored_as_varchar:    "DATE_STORED_AS_VARCHAR",
     check_boolean_stored_as_varchar: "BOOLEAN_STORED_AS_VARCHAR",
-    check_fk_without_constraint:   "FK_COLUMN_NO_CONSTRAINT",
 }
 
 # Every python_handler HANDLER_KEY actually served by this module (lower-cased,
@@ -797,10 +814,7 @@ _COLUMN_CHECK_CODES = {
 # ever covers 3 keys — these are executed via run_dynamic_checks() instead.
 DYNAMIC_RULE_HANDLER_KEYS = frozenset(
     code.lower() for code in {**_TABLE_CHECK_CODES, **_COLUMN_CHECK_CODES}.values()
-) | frozenset({
-    "column_id_wrong_type", "column_date_wrong_type", "column_timestamp_wrong_type",
-    "column_flag_wrong_type", "column_amount_wrong_type",
-})
+)
 
 
 def run_dynamic_checks(
@@ -808,14 +822,24 @@ def run_dynamic_checks(
     column_assets: List[Any],
     scan_id: str,
     allowed_rule_codes=None,  # Optional[Set[str]] — from RuleClassifierAgent
+    instance_id_by_handler_key: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Run dynamic checks for a table and its columns.
     If allowed_rule_codes is given, only runs checks whose rule code is in that set.
     Returns finding dicts (not yet persisted) and commits any newly registered Rule rows.
+
+    instance_id_by_handler_key: {handler_key_lower: instance_id} for the
+    per-table approved instances of these dynamic checks. Findings emitted
+    here are stamped with the matching instance_id so they wire up to the
+    approved instance in RULE_INSTANCES (and thus into RULE_EXECUTIONS via
+    FindingsAgent._log_executions). Without this map, findings would have
+    instance_id=None and the execution log wouldn't tie them back to the
+    approved instance. See FindingsAgent for how the map is built.
     """
     findings: List[Dict[str, Any]] = []
     col_names = [a.column_name for a in column_assets if a.column_name]
+    instance_id_by_handler_key = instance_id_by_handler_key or {}
 
     # Live INFORMATION_SCHEMA.COLUMNS read for this table — ONE query, reused
     # by every type/nullability-dependent check below, instead of trusting
@@ -861,6 +885,31 @@ def run_dynamic_checks(
                 result = fn(col_asset, scan_id)
             if result:
                 findings.append(result)
+
+    # Wire each finding to its approved per-table instance. context.rule_code
+    # holds the upper-cased HANDLER_KEY (see _base_ctx callers), which we
+    # lower-case to look up in the caller-supplied map. Findings whose
+    # handler has no approved instance for this table are dropped — globals
+    # are gone, so a dynamic finding without a matching approved instance is
+    # orphaned and would show up with instance_id=None (unjoinable to any
+    # rule) if we let it through.
+    #
+    # Runs unconditionally now (not gated on `if instance_id_by_handler_key`):
+    # if no handlers were approved, the map is empty and every finding gets
+    # dropped, which is correct. The old gate skipped this pass entirely on
+    # an empty map, letting orphan findings survive.
+    for f in findings:
+        ctx = f.get("context") or {}
+        handler_key = (ctx.get("rule_code") or "").lower()
+        iid = instance_id_by_handler_key.get(handler_key)
+        if iid:
+            f["instance_id"] = iid
+        elif not f.get("instance_id"):
+            logger.debug(
+                f"[DynamicRules] Finding for handler_key={handler_key!r} has no matching "
+                "approved instance — dropping (not in allowed_instance_ids)."
+            )
+    findings = [f for f in findings if f.get("instance_id")]
 
     logger.info(
         f"[DynamicRules] {table_asset.fqn}: {len(findings)} dynamic findings"

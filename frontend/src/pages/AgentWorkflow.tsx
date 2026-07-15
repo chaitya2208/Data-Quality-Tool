@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { assetsApi, agentRunsApi, findingsApi } from '../api/client'
@@ -352,6 +352,21 @@ export default function AgentWorkflow() {
   // Local editable copy of instance review state — initialized from server on pause
   const [reviewActive,  setReviewActive]  = useState<RuleReviewEntry[]>([])
   const [reviewSkipped, setReviewSkipped] = useState<RuleReviewEntry[]>([])
+  // Library definitions with no instance on this table (neither existing nor
+  // newly proposed). Surfaced so the reviewer can discover applicable checks
+  // that Claude ignored. Activation is stubbed for now — clicking prompts a
+  // toast; the target/threshold modal + real create-instance wiring lands in
+  // the next round.
+  type UnusedLibraryEntry = {
+    definition_id: string
+    name: string
+    description: string
+    category?: string
+    template_shape?: string | null
+    check_kind?: string | null
+    default_severity?: string
+  }
+  const [reviewUnusedLibrary, setReviewUnusedLibrary] = useState<UnusedLibraryEntry[]>([])
   const [editingRule,   setEditingRule]   = useState<string | null>(null) // instance_id being edited
   const [editForm,      setEditForm]      = useState<Partial<RuleReviewEntry>>({})
   const [selectedActiveIds,  setSelectedActiveIds]  = useState<Set<string>>(new Set())
@@ -507,6 +522,7 @@ export default function AgentWorkflow() {
   if (isReviewing && serverReviewState && !reviewInitialized) {
     setReviewActive(serverReviewState.active || [])
     setReviewSkipped(serverReviewState.skipped || [])
+    setReviewUnusedLibrary(serverReviewState.unused_library || [])
     setReviewInitialized(true)
   }
   if (!isReviewing && reviewInitialized) {
@@ -519,6 +535,25 @@ export default function AgentWorkflow() {
   // state so the reviewer isn't misled by a clean-looking "0 proposals".
   const signalsMissed = serverReviewState?.signals_missed ?? []
   const parseFailed   = serverReviewState?.parse_failed ?? false
+
+  // Group active instances by definition so the reviewer sees one card per
+  // library concept ("Not-Null Constraint Violation") with its target columns
+  // listed inside, instead of a flat list of 27 rows where the same concept
+  // repeats. Preserves the order of first appearance so the display stays
+  // stable across renders even when a user reorders things client-side.
+  const groupedActive = useMemo(() => {
+    const groups: Record<string, { definition_id: string; header: RuleReviewEntry; instances: RuleReviewEntry[] }> = {}
+    const order: string[] = []
+    for (const rule of reviewActive) {
+      const key = rule.definition_id || `_no_def_${rule.instance_id}`
+      if (!groups[key]) {
+        groups[key] = { definition_id: key, header: rule, instances: [] }
+        order.push(key)
+      }
+      groups[key].instances.push(rule)
+    }
+    return order.map(k => groups[k])
+  }, [reviewActive])
 
   // Move an instance from active → skipped
   const rejectRule = (instanceId: string) => {
@@ -897,9 +932,20 @@ export default function AgentWorkflow() {
                 </div>
                 <div className="text-center">
                   <p className="text-2xl font-bold text-purple-600 flex items-center justify-center gap-1">
-                    <Sparkles className="w-5 h-5" />{activeRun.ai_rules_count}
+                    <Sparkles className="w-5 h-5" />
+                    {activeRun.ai_rules_count}
+                    {activeRun.ai_rules_proposed > activeRun.ai_rules_count && (
+                      <span className="text-sm font-normal text-gray-400 dark:text-gray-500">
+                        /{activeRun.ai_rules_proposed}
+                      </span>
+                    )}
                   </p>
-                  <p className="text-xs text-gray-500 dark:text-gray-300">AI rules generated</p>
+                  <p className="text-xs text-gray-500 dark:text-gray-300">
+                    AI rules approved
+                    {activeRun.ai_rules_proposed > activeRun.ai_rules_count && (
+                      <span className="text-gray-400 dark:text-gray-600"> of {activeRun.ai_rules_proposed} proposed</span>
+                    )}
+                  </p>
                 </div>
                 <div className="text-center">
                   {liveResolved !== null ? (
@@ -1054,7 +1100,7 @@ export default function AgentWorkflow() {
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
                   <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
-                  Active Rules ({reviewActive.length})
+                  Active Rules ({groupedActive.length} {groupedActive.length === 1 ? 'definition' : 'definitions'} · {reviewActive.length} {reviewActive.length === 1 ? 'instance' : 'instances'})
                 </h3>
               </div>
               {selectedActiveIds.size > 0 && (
@@ -1074,8 +1120,28 @@ export default function AgentWorkflow() {
                   </button>
                 </div>
               )}
-              <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
-                {reviewActive.map(rule => (
+              <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+                {groupedActive.map(group => (
+                  <div key={group.definition_id} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40 overflow-hidden">
+                    {/* Group header — definition-level info */}
+                    <div className="px-3 py-2 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-semibold text-gray-800 dark:text-gray-100 truncate">
+                          {group.header.name}
+                        </p>
+                        {group.header.description && (
+                          <p className="text-[11px] text-gray-500 dark:text-gray-400 truncate">
+                            {group.header.description}
+                          </p>
+                        )}
+                      </div>
+                      <span className="text-[11px] text-gray-500 dark:text-gray-400 flex-shrink-0">
+                        {group.instances.length} {group.instances.length === 1 ? 'instance' : 'instances'}
+                      </span>
+                    </div>
+                    {/* Instance rows within this group */}
+                    <div className="p-2 space-y-2">
+                {group.instances.map(rule => (
                   <div key={rule.instance_id} className="rounded-lg border p-3 text-sm border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
                     {editingRule === rule.instance_id ? (
                       <div className="space-y-2">
@@ -1198,7 +1264,10 @@ export default function AgentWorkflow() {
                     )}
                   </div>
                 ))}
-                {reviewActive.length === 0 && (
+                    </div>
+                  </div>
+                ))}
+                {groupedActive.length === 0 && (
                   <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No active rules — activate some from the Skipped column.</p>
                 )}
               </div>
@@ -1273,6 +1342,75 @@ export default function AgentWorkflow() {
               </div>
             </div>
           </div>
+
+          {/* ── Available in Library ─────────────────────────────────────────
+              Library definitions with NO instance on this table. Reviewer can
+              activate one to add a new check without going back to the Rule
+              Library page. Activation is stubbed for now — the target/threshold
+              modal + create-instance wiring lands next round. */}
+          {reviewUnusedLibrary.length > 0 && (
+            <div className="border-t border-gray-100 dark:border-gray-700 p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-blue-400 inline-block" />
+                  Available in Library ({reviewUnusedLibrary.length})
+                </h3>
+                <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                  Definitions Claude didn't apply to this table — activate any you want to run.
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-80 overflow-y-auto pr-1">
+                {reviewUnusedLibrary.map((d) => (
+                  <div
+                    key={d.definition_id}
+                    className="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 text-sm flex flex-col gap-1"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-semibold text-gray-800 dark:text-gray-100 truncate" title={d.name}>
+                          {d.name}
+                        </p>
+                        <div className="flex flex-wrap items-center gap-1 mt-0.5">
+                          {d.template_shape && (
+                            <span className="text-[10px] bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 px-1.5 py-0.5 rounded">
+                              {d.template_shape}
+                            </span>
+                          )}
+                          {d.category && (
+                            <span className="text-[10px] bg-indigo-50 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 px-1.5 py-0.5 rounded">
+                              {d.category}
+                            </span>
+                          )}
+                          {d.default_severity && (
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                              d.default_severity === 'critical' ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300' :
+                              d.default_severity === 'high'     ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300' :
+                              d.default_severity === 'medium'   ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300' :
+                                                                  'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+                            }`}>{d.default_severity}</span>
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => window.alert(
+                          `Activation UI is coming in the next update.\n\n"${d.name}"\n\nFor now, activate this definition on this table from the Rule Library page.`
+                        )}
+                        className="flex-shrink-0 text-xs px-2 py-1 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/40 rounded hover:bg-blue-50 dark:hover:bg-blue-900/40"
+                        title="Coming soon"
+                      >
+                        Activate
+                      </button>
+                    </div>
+                    {d.description && (
+                      <p className="text-[11px] text-gray-500 dark:text-gray-400 line-clamp-2" title={d.description}>
+                        {d.description}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

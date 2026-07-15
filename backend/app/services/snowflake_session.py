@@ -29,6 +29,13 @@ ssl._create_default_https_context = ssl._create_unverified_context  # stdlib pat
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Also silence the warning from Snowflake's bundled copy of urllib3
+try:
+    import snowflake.connector.vendored.urllib3 as _sf_urllib3
+    _sf_urllib3.disable_warnings(_sf_urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
 # Patch Snowflake's vendored pyopenssl — the S3 result-batch downloader uses
 # this path and it bypasses the stdlib ssl._create_default_https_context hook.
 try:

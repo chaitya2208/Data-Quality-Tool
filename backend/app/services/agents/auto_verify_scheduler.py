@@ -74,6 +74,10 @@ def _fire(run_id: str) -> None:
         from app.services.agents.verification_agent import VerificationAgent
         result = VerificationAgent().run(run, task)
 
+        # Always mark the task completed with the latest result. The UI
+        # (AgentWorkflow) derives an amber "Partial" state from
+        # output.remaining > 0 — so a completed task with remaining findings
+        # renders as partial, not green.
         storage.update_agent_task(
             task.id, status="completed", completed_at=datetime.utcnow(),
             output={**result, "auto_verified": True},
@@ -87,7 +91,6 @@ def _fire(run_id: str) -> None:
                 f"[AutoVerify] Run {run_id}: {result['resolved']}/{result['total_findings']} resolved, "
                 f"{result['remaining']} remaining — rescheduling"
             )
-            # Re-schedule for next cycle
             schedule(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
 
     except Exception as e:

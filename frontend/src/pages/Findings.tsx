@@ -2,8 +2,174 @@ import { useState, useMemo, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { findingsApi, rulesApi } from '../api/client'
-import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck } from 'lucide-react'
+import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck, ChevronDown, ChevronRight, BrainCircuit, TableIcon } from 'lucide-react'
 import { useConnection } from '../ConnectionContext'
+
+// ── Finding card ──────────────────────────────────────────────────────────────
+
+function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter, ruleFilter, rulesData, sevColor, stColor }: any) {
+  const [showSamples, setShowSamples] = useState(false)
+
+  const ai = finding.evidence?.ai_explanation
+  const sampleRows: Record<string, string>[] = finding.evidence?.sample_rows ?? []
+  const sampleHeaders = sampleRows.length > 0 ? Object.keys(sampleRows[0]) : []
+
+  const confidenceColor = (c: string) => ({
+    high:   'text-green-700 bg-green-50 border-green-200',
+    medium: 'text-yellow-700 bg-yellow-50 border-yellow-200',
+    low:    'text-red-700 bg-red-50 border-red-200',
+  }[c] ?? 'text-gray-600 bg-gray-50 border-gray-200')
+
+  return (
+    <div className="p-6 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 pt-1">
+          <input type="checkbox"
+            checked={selected}
+            onChange={onSelect}
+            className="w-5 h-5 text-primary-600 border-gray-300 dark:border-gray-600 rounded focus:ring-primary-500 cursor-pointer" />
+        </div>
+
+        <div className="flex-1 min-w-0">
+          {/* Badges row */}
+          <div className="flex flex-wrap items-center gap-2 mb-2">
+            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${sevColor(finding.severity)}`}>
+              {finding.severity.toUpperCase()}
+            </span>
+            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${stColor(finding.status)}`}>
+              {finding.status}
+            </span>
+            {finding.context?.rule_code && (
+              <button
+                onClick={() => onRuleFilter(finding.context.rule_code)}
+                className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border transition-colors ${
+                  ruleFilter === finding.context.rule_code
+                    ? 'bg-purple-200 text-purple-900 border-purple-300'
+                    : 'bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100'
+                }`}
+                title="Filter by this rule"
+              >
+                <ShieldCheck className="w-3 h-3" />
+                {rulesData?.rules.find((r: any) => r.code === finding.context.rule_code)?.name ?? finding.context.rule_code}
+              </button>
+            )}
+            {ai && (
+              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border ${confidenceColor(ai.confidence)}`}>
+                <BrainCircuit className="w-3 h-3" />
+                AI · {ai.confidence}
+              </span>
+            )}
+          </div>
+
+          {/* Table badge */}
+          {finding.context?.table_name && (
+            <div className="mb-2">
+              <button
+                onClick={() => onTableFilter(
+                  `${finding.context.database_name}.${finding.context.schema_name}.${finding.context.table_name}`
+                )}
+                className="inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-300 dark:border-gray-600 hover:bg-gray-200 transition-colors"
+                title="Filter by this table"
+              >
+                <Database className="w-3 h-3 mr-1" />
+                {finding.context.table_name}
+              </button>
+            </div>
+          )}
+
+          <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-1">{finding.title}</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">{finding.description}</p>
+
+          {/* AI Explanation */}
+          {ai && (
+            <div className="mb-3 rounded-lg border border-purple-100 dark:border-purple-800/40 bg-purple-50/50 dark:bg-purple-950/20 p-3 space-y-1.5">
+              <div className="flex items-center gap-1.5 mb-1">
+                <BrainCircuit className="w-3.5 h-3.5 text-purple-600" />
+                <span className="text-xs font-semibold text-purple-800 dark:text-purple-300">AI Analysis</span>
+              </div>
+              {ai.root_cause && (
+                <div>
+                  <span className="text-xs font-medium text-purple-700 dark:text-purple-400">Root cause: </span>
+                  <span className="text-xs text-gray-700 dark:text-gray-300">{ai.root_cause}</span>
+                </div>
+              )}
+              {ai.affected_scope && (
+                <div>
+                  <span className="text-xs font-medium text-purple-700 dark:text-purple-400">Scope: </span>
+                  <span className="text-xs text-gray-700 dark:text-gray-300">{ai.affected_scope}</span>
+                </div>
+              )}
+              {ai.fix_action && (
+                <div>
+                  <span className="text-xs font-medium text-purple-700 dark:text-purple-400">Fix: </span>
+                  <span className="text-xs text-gray-700 dark:text-gray-300">{ai.fix_action}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Sample failed rows — collapsible */}
+          {sampleRows.length > 0 && (
+            <div className="mb-3">
+              <button
+                onClick={() => setShowSamples(s => !s)}
+                className="flex items-center gap-1.5 text-xs font-medium text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-gray-100 mb-1.5"
+              >
+                {showSamples
+                  ? <ChevronDown className="w-3.5 h-3.5" />
+                  : <ChevronRight className="w-3.5 h-3.5" />
+                }
+                <TableIcon className="w-3.5 h-3.5" />
+                {sampleRows.length} sample failing row{sampleRows.length !== 1 ? 's' : ''}
+              </button>
+              {showSamples && (
+                <div className="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-700">
+                  <table className="text-xs w-full">
+                    <thead className="bg-gray-100 dark:bg-gray-800">
+                      <tr>
+                        {sampleHeaders.map(h => (
+                          <th key={h} className="px-3 py-1.5 text-left font-semibold text-gray-600 dark:text-gray-300 whitespace-nowrap">
+                            {h}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100 dark:divide-gray-700 bg-white dark:bg-gray-900">
+                      {sampleRows.map((row, i) => (
+                        <tr key={i} className="hover:bg-red-50/50 dark:hover:bg-red-950/20">
+                          {sampleHeaders.map(h => (
+                            <td key={h} className="px-3 py-1.5 font-mono text-gray-700 dark:text-gray-300 whitespace-nowrap max-w-[200px] truncate"
+                                title={row[h]}>
+                              {row[h] ?? <span className="text-gray-400 italic">null</span>}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500 dark:text-gray-300">
+            {finding.context?.fqn && (
+              <span className="font-mono bg-gray-50 dark:bg-gray-900 px-2 py-1 rounded border border-gray-200 dark:border-gray-700">
+                {finding.context.fqn}
+              </span>
+            )}
+            <span className="flex items-center">
+              <span className="text-gray-400 dark:text-gray-400 mr-1">Detected:</span>
+              {new Date(finding.detected_at).toLocaleString()}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Findings() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -399,75 +565,18 @@ export default function Findings() {
         ) : (
           <div className="divide-y divide-gray-200 dark:divide-gray-700">
             {pagedFindings.map(finding => (
-              <div key={finding.id} className="p-6 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
-                <div className="flex items-start gap-4">
-                  <div className="flex-shrink-0 pt-1">
-                    <input type="checkbox"
-                      checked={selectedFindings.includes(finding.id)}
-                      onChange={() => handleSelectFinding(finding.id)}
-                      className="w-5 h-5 text-primary-600 border-gray-300 dark:border-gray-600 rounded focus:ring-primary-500 cursor-pointer" />
-                  </div>
-
-                  <div className="flex-1 min-w-0">
-                    {/* Badges row */}
-                    <div className="flex flex-wrap items-center gap-2 mb-2">
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${sevColor(finding.severity)}`}>
-                        {finding.severity.toUpperCase()}
-                      </span>
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${stColor(finding.status)}`}>
-                        {finding.status}
-                      </span>
-                      {/* Rule code chip — clickable to filter */}
-                      {finding.context?.rule_code && (
-                        <button
-                          onClick={() => setRuleFilter(finding.context.rule_code)}
-                          className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border transition-colors ${
-                            ruleFilter === finding.context.rule_code
-                              ? 'bg-purple-200 text-purple-900 border-purple-300'
-                              : 'bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100'
-                          }`}
-                          title="Filter by this rule"
-                        >
-                          <ShieldCheck className="w-3 h-3" />
-                          {rulesData?.rules.find(r => r.code === finding.context.rule_code)?.name ?? finding.context.rule_code}
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Table badge */}
-                    {finding.context?.table_name && (
-                      <div className="mb-2">
-                        <button
-                          onClick={() => setTableFilter(
-                            `${finding.context.database_name}.${finding.context.schema_name}.${finding.context.table_name}`
-                          )}
-                          className="inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-300 dark:border-gray-600 hover:bg-gray-200 transition-colors"
-                          title="Filter by this table"
-                        >
-                          <Database className="w-3 h-3 mr-1" />
-                          {finding.context.table_name}
-                        </button>
-                      </div>
-                    )}
-
-                    <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-1">{finding.title}</h3>
-                    <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">{finding.description}</p>
-
-                    <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500 dark:text-gray-300">
-                      {finding.context?.fqn && (
-                        <span className="font-mono bg-gray-50 dark:bg-gray-900 px-2 py-1 rounded border border-gray-200 dark:border-gray-700">
-                          {finding.context.fqn}
-                        </span>
-                      )}
-                      <span className="flex items-center">
-                        <span className="text-gray-400 dark:text-gray-400 mr-1">Detected:</span>
-                        {new Date(finding.detected_at).toLocaleString()}
-                      </span>
-                    </div>
-                  </div>
-
-                </div>
-              </div>
+              <FindingCard
+                key={finding.id}
+                finding={finding}
+                selected={selectedFindings.includes(finding.id)}
+                onSelect={() => handleSelectFinding(finding.id)}
+                onRuleFilter={setRuleFilter}
+                onTableFilter={setTableFilter}
+                ruleFilter={ruleFilter}
+                rulesData={rulesData}
+                sevColor={sevColor}
+                stColor={stColor}
+              />
             ))}
           </div>
         )}

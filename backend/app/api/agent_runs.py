@@ -52,6 +52,8 @@ def _build_run_response(run) -> AgentRunResponse:
         completed_at=run.completed_at,
         findings_count=run.findings_count,
         ai_rules_count=getattr(run, "ai_rules_count", 0) or 0,
+        ai_rules_proposed=(getattr(run, "instance_review_state", None) or {}).get("ai_rules_proposed")
+            or getattr(run, "ai_rules_count", 0) or 0,
         instance_review_state=getattr(run, "instance_review_state", None),
         error_message=run.error_message,
         created_at=run.created_at,
@@ -319,13 +321,14 @@ def trigger_verification(run_id: str, background_tasks: BackgroundTasks):
             from app.services.agents.verification_agent import VerificationAgent
             result = VerificationAgent().run(run2, task2)
 
-            storage.update_agent_task(task2.id, status="completed", completed_at=datetime.utcnow(), output=result)
-
-            # Auto-complete when fully resolved; otherwise stay awaiting fixes
-            if result.get("fully_resolved"):
+            # Mark task completed only when fully resolved — otherwise reset
+            # to pending so the verify node doesn't show a green tick while
+            # findings are still open.
+            if result and result.get("fully_resolved"):
+                storage.update_agent_task(task2.id, status="completed", completed_at=datetime.utcnow(), output=result)
                 storage.update_agent_run(run_id, status="completed", completed_at=datetime.utcnow())
-                # No need to re-schedule — workflow is done
             else:
+                storage.update_agent_task(task2.id, status="pending", output=result)
                 storage.update_agent_run(run_id, status="awaiting_fixes")
                 # Reschedule auto-verify for next cycle
                 schedule_auto_verify(run_id)

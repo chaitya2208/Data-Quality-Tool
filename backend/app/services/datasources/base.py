@@ -72,6 +72,19 @@ class DataSource(ABC):
                    limit: int = 5) -> List[Dict[str, Any]]:
         """[{value, count}] most-frequent non-null values."""
 
+    def bottom_values(self, database: str, schema: str, table: str, column: str,
+                      limit: int = 5) -> List[Dict[str, Any]]:
+        """[{value, count}] LEAST-frequent non-null values (asc by count).
+
+        Not @abstractmethod — adapters that don't override fall back to
+        top_values with a large limit and take the last N in Python. This is
+        wasteful on high-cardinality columns, so callers should only invoke it
+        when the column is known-low-cardinality (distinct ≤ ~200) or the
+        adapter overrides with a native ORDER BY count ASC query.
+        """
+        rows = self.top_values(database, schema, table, column, limit=1000)
+        return list(reversed(rows))[:limit]
+
     @abstractmethod
     def duplicate_count(self, database: str, schema: str, table: str, column: str) -> Optional[int]:
         """Rows sharing a non-null value on this column (candidate-key dup check)."""

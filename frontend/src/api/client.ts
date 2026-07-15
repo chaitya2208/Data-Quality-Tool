@@ -462,12 +462,20 @@ export const connectionsApi = {
   status: (id: string) => api.get<ConnectionTestResult>(`/connections/${id}/status`),
 };
 
+export interface SourceTypeResult {
+  source_type: string;
+  connection_name: string | null;
+  connection_user: string | null;
+}
+
 export const aiApi = {
   getContext: () => api.get<SnowflakeContext>('/ai/context'),
   getWarehouses: () => api.get<WarehouseInfo[]>('/ai/warehouses'),
   getRoles: () => api.get<RoleInfo[]>('/ai/roles'),
   getRecommendations: (findingIds: string[]) =>
     api.post<AIRecommendation[]>('/ai/recommendations', findingIds),
+  getSourceType: (findingIds: string[]) =>
+    api.post<SourceTypeResult>('/ai/source-type', findingIds),
   executeSQL: (findingId: string, sqlQuery: string, warehouse?: string, role?: string) =>
     api.post('/ai/execute', { finding_id: findingId, sql_query: sqlQuery, warehouse, role }),
 };
@@ -519,10 +527,26 @@ export interface AgentRun {
   started_at: string | null;
   completed_at: string | null;
   findings_count: number;
-  ai_rules_count: number;
+  ai_rules_count: number;       // approved after user review
+  ai_rules_proposed: number;    // proposed by AI before review
   instance_review_state: {
     active: RuleReviewEntry[];
     skipped: RuleReviewEntry[];
+    // Library definitions Claude knew about but that ended up with NO instance
+    // on this table — neither existing nor newly proposed. Surfaced so the
+    // reviewer can discover applicable checks that the agent didn't apply.
+    // Activation currently stubbed (see AgentWorkflow.tsx "Available in Library"
+    // section) — the target/threshold prompt + create-instance wiring is next
+    // round.
+    unused_library?: Array<{
+      definition_id: string;
+      name: string;
+      description: string;
+      category?: string;
+      template_shape?: string | null;
+      check_kind?: string | null;
+      default_severity?: string;
+    }>;
     // Deterministic profiler signals the model never addressed. Freshness has
     // no deterministic backstop, so an omitted freshness signal here means no
     // check was proposed for it — surfaced so the reviewer sees the gap.
@@ -530,6 +554,7 @@ export interface AgentRun {
     // True when the model's JSON was unparseable even after a retry: "0
     // proposals" should be treated as suspect, not as full coverage.
     parse_failed?: boolean;
+    ai_rules_proposed?: number;
   } | null;
   error_message: string | null;
   created_at: string;
@@ -567,6 +592,63 @@ export interface WorkflowTemplate {
   origin_schema: string | null;
   origin_table: string | null;
 }
+
+export type ScheduleCadence = 'daily' | 'weekly' | 'monthly' | 'yearly' | 'custom';
+
+export interface Schedule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  connection_id: string | null;
+  scope: WorkflowScope;
+  database: string | null;
+  schema_name: string | null;
+  table: string | null;
+  workflow_template_id: string | null;
+  cadence: ScheduleCadence;
+  time_of_day: string | null;
+  day_of_week: number | null;
+  day_of_month: number | null;
+  month_of_year: number | null;
+  interval_value: number | null;
+  interval_unit: string | null;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_batch_id: string | null;
+  last_status: string | null;
+  last_error: string | null;
+  created_at: string | null;
+  created_by: string | null;
+}
+
+export interface ScheduleCreatePayload {
+  name: string;
+  enabled?: boolean;
+  connection_id?: string | null;
+  scope: WorkflowScope;
+  database: string;
+  schema_name?: string | null;
+  table?: string | null;
+  workflow_template_id?: string | null;
+  cadence: ScheduleCadence;
+  time_of_day?: string | null;
+  day_of_week?: number | null;
+  day_of_month?: number | null;
+  month_of_year?: number | null;
+  interval_value?: number | null;
+  interval_unit?: string | null;
+  created_by?: string | null;
+}
+
+export const schedulesApi = {
+  list: () => api.get<Schedule[]>('/schedules'),
+  get: (id: string) => api.get<Schedule>(`/schedules/${id}`),
+  create: (data: ScheduleCreatePayload) => api.post<Schedule>('/schedules', data),
+  update: (id: string, data: Partial<ScheduleCreatePayload>) => api.put<Schedule>(`/schedules/${id}`, data),
+  delete: (id: string) => api.delete(`/schedules/${id}`),
+  toggle: (id: string) => api.post<Schedule>(`/schedules/${id}/toggle`),
+  runNow: (id: string) => api.post<{ message: string; batch_id: string; total: number }>(`/schedules/${id}/run-now`),
+};
 
 export const workflowsApi = {
   list: () => api.get<WorkflowTemplate[]>('/agent/workflows'),
@@ -613,64 +695,4 @@ export const agentRunsApi = {
     api.post(`/agent/runs/${id}/verify`),
   saveAsWorkflow: (id: string, data: { label: string; description?: string; created_by?: string }) =>
     api.post<WorkflowTemplate>(`/agent/runs/${id}/save-as-workflow`, data),
-};
-
-// ── Schedules ───────────────────────────────────────────────────────────────
-
-export type ScheduleCadence = 'daily' | 'weekly' | 'monthly' | 'yearly' | 'custom';
-
-export interface Schedule {
-  id: string;
-  name: string;
-  enabled: boolean;
-  connection_id: string | null;
-  scope: WorkflowScope;
-  database: string | null;
-  schema_name: string | null;
-  table: string | null;
-  workflow_template_id: string | null;
-  cadence: ScheduleCadence;
-  time_of_day: string | null;
-  day_of_week: number | null;
-  day_of_month: number | null;
-  month_of_year: number | null;
-  interval_value: number | null;
-  interval_unit: string | null;
-  next_run_at: string | null;
-  last_run_at: string | null;
-  last_batch_id: string | null;
-  last_status: string | null;
-  last_error: string | null;
-  created_at: string | null;
-  created_by: string | null;
-}
-
-export interface ScheduleCreatePayload {
-  name: string;
-  enabled?: boolean;
-  connection_id?: string | null;
-  scope: WorkflowScope;
-  database: string;
-  schema_name?: string;
-  table?: string;
-  workflow_template_id?: string | null;
-  cadence: ScheduleCadence;
-  time_of_day?: string;
-  day_of_week?: number;
-  day_of_month?: number;
-  month_of_year?: number;
-  interval_value?: number;
-  interval_unit?: string;
-  created_by?: string;
-}
-
-export const schedulesApi = {
-  list: () => api.get<Schedule[]>('/schedules'),
-  get: (id: string) => api.get<Schedule>(`/schedules/${id}`),
-  create: (data: ScheduleCreatePayload) => api.post<Schedule>('/schedules', data),
-  update: (id: string, data: Partial<ScheduleCreatePayload>) =>
-    api.put<Schedule>(`/schedules/${id}`, data),
-  delete: (id: string) => api.delete(`/schedules/${id}`),
-  toggle: (id: string) => api.post<Schedule>(`/schedules/${id}/toggle`),
-  runNow: (id: string) => api.post(`/schedules/${id}/run-now`),
 };

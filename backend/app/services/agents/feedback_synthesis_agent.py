@@ -27,7 +27,7 @@ import logging
 import re
 from typing import Optional
 
-from app.services.claude_client import ask_claude
+from app.services.claude_client import ask_claude, ask_claude_json
 from app.services import storage
 
 logger = logging.getLogger(__name__)
@@ -83,16 +83,16 @@ class FeedbackSynthesisAgent:
         rejected = [l for l in lessons if l["verdict"] == "rejected"]
 
         prompt = self._build_prompt(bare_table, table_type, approved, rejected)
-        try:
-            raw = ask_claude(prompt, system=_SYSTEM, max_tokens=4000)
-            memo = self._parse_memo(raw)
-        except Exception as e:
-            logger.warning(f"[FeedbackSynthesis] Claude call failed: {e}")
-            return None
-
+        memo = ask_claude_json(prompt, system=_SYSTEM, max_tokens=4000, label="feedback_synthesis")
         if not memo:
             logger.warning(f"[FeedbackSynthesis] Could not parse memo for {bare_table}/{table_type}")
             return None
+        # Normalise — ensure expected keys exist
+        memo.setdefault("always_approve", [])
+        memo.setdefault("always_reject", [])
+        memo.setdefault("column_advice", {})
+        memo.setdefault("table_type_notes", "")
+        memo.setdefault("confidence", 50)
 
         try:
             storage.upsert_feedback_memo(
@@ -148,29 +148,3 @@ class FeedbackSynthesisAgent:
             "}"
         )
 
-    # ── Response parser ───────────────────────────────────────────────────
-
-    def _parse_memo(self, raw: str) -> Optional[dict]:
-        raw = raw.strip()
-        raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\n?```$", "", raw).strip()
-        try:
-            memo = json.loads(raw)
-            if not isinstance(memo, dict):
-                return None
-            # Normalise — ensure expected keys exist
-            memo.setdefault("always_approve", [])
-            memo.setdefault("always_reject", [])
-            memo.setdefault("column_advice", {})
-            memo.setdefault("table_type_notes", "")
-            memo.setdefault("confidence", 50)
-            return memo
-        except Exception:
-            # Try extracting a JSON object
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except Exception:
-                    pass
-        return None
