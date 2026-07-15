@@ -31,7 +31,7 @@ from typing import List, Optional, Dict, Any, Set
 from app.services import storage
 from app.services.fingerprint import compute_fingerprint
 from app.services.snowflake_session import session as sf_session
-from app.services.claude_client import ask_claude, ask_claude_agentic
+from app.services.claude_client import ask_claude, ask_claude_agentic, ask_claude_json, _strip_fences
 from app.services.sql_validation import validate_sql
 from app.services.rule_sql_templates import TEMPLATE_SHAPES, render_template
 from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
@@ -178,6 +178,23 @@ any value you list that wasn't actually observed will be silently removed
 before the check can run, so there is no benefit to padding the list from
 assumed/world knowledge."""
 
+# Fallback system prompt — same instructions but bullet 6 (get_sample_rows) is
+# rewritten to state that no tool is available in this call, so Claude doesn't
+# waste reasoning on a nonexistent affordance and doesn't complain the tool is
+# missing when the fallback path (no-tools ask_claude) is used.
+SYSTEM_PROMPT_NO_TOOLS = SYSTEM_PROMPT.replace(
+    "6. You have access to a tool: get_sample_rows. Call it when the column\n"
+    "   statistics alone are not enough to be confident — for example: a column\n"
+    "   whose top_values are all NULL and you want to know if non-null values\n"
+    "   follow a pattern; a suspected multi-column constraint you want to verify\n"
+    "   with a filtered sample; or a column you want to see before proposing an\n"
+    "   accepted_values or regex check. Do NOT call it for columns you already\n"
+    "   have enough evidence for. You may call it up to 5 times total.\n\n",
+    "6. No sample-row tool is available in this call — decide from the column\n"
+    "   statistics and signals alone. If the evidence isn't enough for a\n"
+    "   confident proposal, prefer to skip it rather than guess.\n\n",
+)
+
 USER_PROMPT_TEMPLATE = """Table: {fqn}
 Row count: {row_count}
 Owner: {owner}
@@ -286,6 +303,16 @@ class RuleIntelligenceAgent:
     def __init__(self):
         self._severity_backup: Dict[str, str] = {}
         self._closed_set_columns: Dict[str, dict] = {}
+        # Data source used for source-side queries (rule-SQL execution at
+        # proposal time, get_sample_rows tool). None → fall back to the app's
+        # shared Snowflake session; kept as instance state to avoid threading
+        # `source` through every internal helper signature (audit finding #4).
+        self._source: Any = None
+        # Per-channel status for past-context reads (audit finding #6):
+        # "ok" | "empty" | "error:<ExcType>". Written by _format_past_context,
+        # read into signals_used so the intelligence log shows which past
+        # signals actually reached Claude.
+        self._past_context_health: Dict[str, str] = {}
 
     def run(
         self,
@@ -295,6 +322,7 @@ class RuleIntelligenceAgent:
         run_id: str,
         profiler_result: Optional[Dict[str, Any]] = None,
         relationship_catalog: Optional[List[Any]] = None,
+        source: Any = None,
     ) -> Dict[str, Any]:
         """
         Returns a result dict with:
@@ -328,6 +356,7 @@ class RuleIntelligenceAgent:
         profiler_result = profiler_result or {}
         relationship_catalog = relationship_catalog or []
         self._closed_set_columns = profiler_result.get("closed_set_columns") or {}
+        self._source = source
 
         existing_instances = self._existing_instances_for_table(table_asset)
         rejected_instances = self._rejected_instances_for_table(table_asset)
@@ -393,7 +422,7 @@ class RuleIntelligenceAgent:
             past_context=past_context_text,
         )
 
-        raw, tool_calls = self._call_model(prompt, table_asset)
+        raw, tool_calls, used_fallback = self._call_model(prompt, table_asset)
         parsed = self._extract_json(raw)
 
         # A parse failure (malformed/truncated response) is NOT the same as a
@@ -417,7 +446,10 @@ class RuleIntelligenceAgent:
                 "Respond again with ONLY a single valid JSON object matching the "
                 "schema above — no markdown fences, no prose before or after."
             )
-            raw, _retry_tools = self._call_model(repair_prompt, table_asset)
+            raw, _retry_tools, _retry_fallback = self._call_model(repair_prompt, table_asset)
+            # Fold retry's fallback state — if either call fell back, the run
+            # was degraded.
+            used_fallback = used_fallback or _retry_fallback
             parsed = self._extract_json(raw)
 
         if not parsed:
@@ -463,6 +495,15 @@ class RuleIntelligenceAgent:
                     {"reason": (tc.get("input") or {}).get("reason", ""), "where": (tc.get("input") or {}).get("where_clause", "")}
                     for tc in tool_calls
                 ],
+                # True when the agentic call failed and we fell back to a
+                # no-tools ask_claude. Distinguishes a degraded run from a
+                # normal one in the intelligence log (audit finding #13).
+                "used_fallback": used_fallback,
+                # Per-channel past-context health from _format_past_context —
+                # "ok" | "empty" | "error:<ExcType>". Surfaces silent read
+                # failures that would otherwise look like "no history yet"
+                # (audit finding #6).
+                "past_context_health": dict(self._past_context_health),
             }
             log = storage.create_intelligence_log(
                 run_id=run_id,
@@ -802,10 +843,9 @@ class RuleIntelligenceAgent:
                 f"Return only the corrected SQL."
             )
             try:
-                fixed_sql = ask_claude(repair_prompt, system=repair_system, max_tokens=2000).strip()
-                # Strip any accidental markdown fences the model added
-                fixed_sql = re.sub(r"^```[a-z]*\n?", "", fixed_sql, flags=re.IGNORECASE)
-                fixed_sql = re.sub(r"\n?```$", "", fixed_sql).strip()
+                fixed_sql = _strip_fences(
+                    ask_claude(repair_prompt, system=repair_system, max_tokens=2000)
+                )
                 check = validate_sql(fixed_sql, allowed_tables=allowed_tables)
                 if check.is_valid:
                     logger.info(f"[RuleIntelligence] SQL repair succeeded on attempt {attempt + 1}")
@@ -824,19 +864,29 @@ class RuleIntelligenceAgent:
         caught by static validation). Only ever called with SELECT-only,
         single-statement, table-scoped SQL that already passed validate_sql().
 
-        Bounded by a server-side statement timeout: validate_sql() proves the
-        SQL is SELECT-only and table-scoped, but NOT that it's cheap — an
-        AI-authored draft_sql with an accidental cartesian join passes
-        validation yet could scan billions of rows. The timeout caps that
-        blast radius; a query that exceeds it is cancelled and the candidate
-        discarded (execution returned None) rather than proposed."""
+        Runs against the run's own DataSource (Snowflake or Postgres/RDS) when
+        one is available — otherwise falls back to the shared Snowflake
+        session so legacy call sites still work.
+
+        Bounded by a server-side statement timeout on Snowflake: validate_sql()
+        proves the SQL is SELECT-only and table-scoped, but NOT that it's
+        cheap — an AI-authored draft_sql with an accidental cartesian join
+        passes validation yet could scan billions of rows. The timeout caps
+        that blast radius on Snowflake; for other sources the query runs to
+        completion, so validate_sql's static checks are the only guard.
+        DataSource.query returns UPPERCASE keys on Snowflake and lowercase on
+        Postgres — read both.
+        """
         try:
-            rows = sf_session.query(rule_sql, timeout=_CHECK_SQL_TIMEOUT_SECONDS)
+            if self._source is not None:
+                rows = self._source.query(rule_sql)
+            else:
+                rows = sf_session.query(rule_sql, timeout=_CHECK_SQL_TIMEOUT_SECONDS)
             if not rows:
                 return None
             row = rows[0]
-            failed = row.get("FAILED_COUNT")
-            total = row.get("TOTAL_COUNT")
+            failed = row.get("FAILED_COUNT", row.get("failed_count"))
+            total = row.get("TOTAL_COUNT", row.get("total_count"))
             if failed is None or total is None:
                 logger.warning(f"[RuleIntelligence] Check SQL did not return FAILED_COUNT/TOTAL_COUNT: {row}")
                 return None
@@ -933,16 +983,44 @@ class RuleIntelligenceAgent:
                 # explicit new_definition — but rationale exists. Synthesize a
                 # new_definition from the rationale so the reviewer sees a
                 # named concept instead of us silently discarding the proposal.
-                # Similarity-match first: rationale often paraphrases an
-                # existing definition and we don't want library bloat.
+                #
+                # Two library-bloat defences here (audit finding #9):
+                #  1. Name is derived deterministically from template_shape +
+                #     column_name / scope when possible — so a re-run whose
+                #     rationale wording drifted still produces the same name
+                #     and matches by name-similarity next round. Only when
+                #     nothing structural is available do we fall back to
+                #     rationale-prose truncation.
+                #  2. Similarity match runs against ALL definitions (proposed
+                #     + active + disabled), not just active — a previously
+                #     synthesized-but-not-yet-approved definition would
+                #     otherwise be invisible and duplicated every scan. And
+                #     because rationale prose is fuzzier than a real name,
+                #     we use a lower threshold (0.5) here than the deliberate
+                #     new_definition path above (0.7).
                 rationale_text = candidate.get("rationale", "").strip()
+                stable_name = self._stable_synthesized_name(
+                    template_shape=candidate.get("template_shape"),
+                    scope=scope,
+                    column_name=column_name,
+                    rationale=rationale_text,
+                )
                 synthesized = {
-                    "name": rationale_text[:60].rstrip(".,;:") or "AI-proposed check",
+                    "name": stable_name,
                     "description": rationale_text[:500],
                     "category": "data_quality",
                 }
-                matched = self._find_similar_definition(synthesized, existing_definitions)
+                try:
+                    all_defs = storage.list_all_definitions()
+                except Exception as e:
+                    logger.warning(f"[RuleIntelligence] list_all_definitions failed, falling back to active: {e}")
+                    all_defs = existing_definitions
+                matched = self._find_similar_definition(synthesized, all_defs, threshold=0.5)
                 if matched:
+                    logger.info(
+                        f"[RuleIntelligence] Synthesis matched existing definition "
+                        f"'{matched.name}' (status={matched.status}) — reusing"
+                    )
                     definition = matched
                 else:
                     new_definition_data = synthesized
@@ -1058,7 +1136,16 @@ class RuleIntelligenceAgent:
             "source_run_id": run_id,
         }
 
-    def _find_similar_definition(self, new_def: dict, existing_definitions: List[Any]) -> Optional[Any]:
+    def _find_similar_definition(
+        self,
+        new_def: dict,
+        existing_definitions: List[Any],
+        threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    ) -> Optional[Any]:
+        """Best-match by word overlap on name+description. `threshold` defaults
+        to the codebase-wide default (0.7); the synthesis path passes a lower
+        value (0.5) because rationale prose wording drifts more than deliberate
+        `new_definition` names do."""
         name = new_def.get("name", "")
         desc = new_def.get("description", "")
         combined = f"{name} {desc}"
@@ -1067,7 +1154,25 @@ class RuleIntelligenceAgent:
             score = word_overlap_score(combined, f"{d.name} {d.description or ''}")
             if score > best_score:
                 best_score, best = score, d
-        return best if best_score >= DEFAULT_SIMILARITY_THRESHOLD else None
+        return best if best_score >= threshold else None
+
+    @staticmethod
+    def _stable_synthesized_name(
+        template_shape: Optional[str],
+        scope: str,
+        column_name: Optional[str],
+        rationale: str,
+    ) -> str:
+        """Deterministic name for a synthesized definition — same inputs across
+        runs produce the same name so similarity match hits on re-run, closing
+        the library-bloat loop that rationale-prose slugs left open."""
+        if template_shape:
+            target = column_name or scope or "table"
+            return f"AI: {template_shape} on {target}"[:100]
+        if column_name:
+            return f"AI check on {column_name}"[:100]
+        # Nothing structural to hook to — fall back to rationale prefix.
+        return (rationale[:60].rstrip(".,;:") or "AI-proposed check")
 
     # ── Classification decision helpers (consumed by coordinator) ────────
 
@@ -1136,16 +1241,16 @@ class RuleIntelligenceAgent:
             '{"scores": [{"index": 0, "evidence": <1-5>, "impact": <1-5>, "approval": <1-5>, '
             '"drop_reason": null or "one sentence why this is weak"}, ...]}'
         )
-        try:
-            raw = ask_claude(critique_prompt, system=self._CRITIQUE_SYSTEM, max_tokens=4000)
-            raw = raw.strip()
-            raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"\n?```$", "", raw).strip()
-            critique = json.loads(raw)
-            scores_by_index = {s["index"]: s for s in critique.get("scores", [])}
-        except Exception as e:
-            logger.warning(f"[RuleIntelligence] Self-critique parse failed ({e}) — keeping all proposals")
+        critique = ask_claude_json(
+            critique_prompt,
+            system=self._CRITIQUE_SYSTEM,
+            max_tokens=4000,
+            label="self_critique",
+        )
+        if critique is None:
+            logger.warning("[RuleIntelligence] Self-critique returned no parseable JSON — keeping all proposals")
             return proposals
+        scores_by_index = {s["index"]: s for s in critique.get("scores", [])}
 
         kept = []
         for i, proposal in enumerate(proposals):
@@ -1200,12 +1305,27 @@ class RuleIntelligenceAgent:
           4. Past thinking blobs from similar tables.
         """
         parts = []
+        # Track which past-context channels returned data vs empty vs errored.
+        # Empty is fine (nothing to learn from yet), errored means the query
+        # itself failed — the difference matters for debugging why Claude
+        # keeps missing obvious cross-run patterns (audit finding #6). Storage
+        # already logs the actual exception; this dict just records "did it
+        # answer" so the intelligence log can carry the health flags.
+        health = {
+            "same_table_logs": "empty",
+            "feedback_memo": "empty",
+            "review_lessons": "empty",
+            "similar_intelligence": "empty",
+        }
 
         # ── Same-table history (highest signal — your own past decisions) ─
         try:
             same_table_logs = storage.get_intelligence_logs_for_table(table_asset.fqn, limit=3)
-        except Exception:
+            health["same_table_logs"] = "ok" if same_table_logs else "empty"
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] same-table history fetch failed: {e}")
             same_table_logs = []
+            health["same_table_logs"] = f"error:{type(e).__name__}"
 
         if same_table_logs:
             latest = same_table_logs[0]
@@ -1224,19 +1344,22 @@ class RuleIntelligenceAgent:
             parts.append("\n".join(lines))
 
         # ── Synthesised feedback memo (highest signal) ───────────────────
+        memo = None
         try:
             bare_table = table_asset.fqn.upper().split(".")[-1]
             # We don't know table_type yet (that's Claude's output), so we try
             # common types; the memo for the right type will have higher
             # confidence and the others will be absent.
-            memo = None
             for ttype in ["fact", "dimension", "staging", "audit", "reference", "config", "unknown"]:
                 m = storage.get_feedback_memo(bare_table, ttype)
                 if m and m.get("confidence", 0) >= 40:
                     memo = m
                     break
-        except Exception:
+            health["feedback_memo"] = "ok" if memo else "empty"
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] feedback memo fetch failed: {e}")
             memo = None
+            health["feedback_memo"] = f"error:{type(e).__name__}"
 
         if memo:
             memo_lines = [f"  SYNTHESISED FEEDBACK MEMO (confidence={memo.get('confidence', '?')}%, based on {memo.get('_lesson_count', '?')} past reviews):"]
@@ -1253,8 +1376,11 @@ class RuleIntelligenceAgent:
         # ── Raw review lessons ───────────────────────────────────────────
         try:
             lessons = storage.get_review_lessons_for_table(table_asset.fqn, limit=20)
-        except Exception:
+            health["review_lessons"] = "ok" if lessons else "empty"
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] review lessons fetch failed: {e}")
             lessons = []
+            health["review_lessons"] = f"error:{type(e).__name__}"
 
         if lessons:
             approved = [l for l in lessons if l["verdict"] == "approved"]
@@ -1275,8 +1401,15 @@ class RuleIntelligenceAgent:
         # ── Past thinking blobs from similar tables ──────────────────────
         try:
             past_logs = storage.search_similar_intelligence(table_asset.fqn, limit=3)
-        except Exception:
+            health["similar_intelligence"] = "ok" if past_logs else "empty"
+        except Exception as e:
+            logger.warning(f"[RuleIntelligence] similar intelligence fetch failed: {e}")
             past_logs = []
+            health["similar_intelligence"] = f"error:{type(e).__name__}"
+
+        # Stash health on the instance so `signals_used` can pick it up when
+        # the intelligence log is written.
+        self._past_context_health = health
 
         for log in past_logs:
             outcome = f"approved={log.approved_count}, rejected={log.rejected_count}"
@@ -1325,7 +1458,10 @@ class RuleIntelligenceAgent:
         sql += f" LIMIT {limit}"
 
         try:
-            rows = sf_session.query(sql)
+            # Run against the analysed table's OWN source (Snowflake or
+            # Postgres/RDS) — falls back to the shared Snowflake session only
+            # for legacy call sites where no source was plumbed through.
+            rows = self._source.query(sql) if self._source is not None else sf_session.query(sql)
             if not rows:
                 return "(no rows matched)"
             headers = list(rows[0].keys())[:_SAMPLE_DEFAULT_COLS]
@@ -1424,8 +1560,12 @@ class RuleIntelligenceAgent:
             return "  (library is empty)"
         lines = []
         for d in definitions:
+            # Deliberately omit an "approved N times" counter here: the stored
+            # APPROVAL_COUNT column is monotonic (audit finding #8) so showing
+            # it to Claude just skews toward historically-heavy definitions
+            # regardless of current usefulness.
             lines.append(
-                f"  id={d.id} [{d.category}] {d.name} (approved {d.approval_count}x)"
+                f"  id={d.id} [{d.category}] {d.name}"
                 f"\n    {d.description[:120]}"
             )
         return "\n".join(lines)
@@ -1445,20 +1585,27 @@ class RuleIntelligenceAgent:
 
     def _call_model(self, prompt: str, table_asset: Any) -> tuple:
         """
-        Returns (text, tool_calls).
+        Returns (text, tool_calls, used_fallback).
 
         Agentic loop with adaptive thinking + get_sample_rows tool. Reasoning
         is emitted as a `reasoning` field in the JSON response (see
         USER_PROMPT_TEMPLATE) — no separate reconstruction call, since Bedrock
         redacts the actual thinking block content anyway.
-        Falls back to ask_claude (no tools) if the agentic call fails.
+
+        Falls back to ask_claude (no tools) if the agentic call fails. The
+        fallback uses SYSTEM_PROMPT_NO_TOOLS so Claude isn't told "you have a
+        tool" when it doesn't (audit finding #13), and `used_fallback` is
+        surfaced so the intelligence log can record that the run reasoned with
+        reduced affordances — otherwise a degraded run is indistinguishable
+        from a normal one.
         """
         def tool_executor(name: str, inputs: dict) -> str:
             if name == "get_sample_rows":
                 return self._execute_sample_tool(table_asset, inputs)
             return f"Unknown tool: {name}"
 
-        tool_calls = []
+        tool_calls: list = []
+        used_fallback = False
         try:
             result = ask_claude_agentic(
                 prompt,
@@ -1472,14 +1619,15 @@ class RuleIntelligenceAgent:
             text = result["text"]
             tool_calls = result["tool_calls"]
         except Exception as e:
-            logger.warning(f"[RuleIntelligence] Agentic call failed ({e}), falling back to standard Bedrock")
+            logger.warning(f"[RuleIntelligence] Agentic call failed ({e}), falling back to standard Bedrock (no tools)")
+            used_fallback = True
             try:
-                text = ask_claude(prompt, system=SYSTEM_PROMPT, max_tokens=32000)
+                text = ask_claude(prompt, system=SYSTEM_PROMPT_NO_TOOLS, max_tokens=32000)
             except Exception as e2:
                 logger.error(f"[RuleIntelligence] Bedrock fallback also failed: {e2}")
                 raise
 
-        return text, tool_calls
+        return text, tool_calls, used_fallback
 
     @staticmethod
     def _extract_json(text: str) -> dict:

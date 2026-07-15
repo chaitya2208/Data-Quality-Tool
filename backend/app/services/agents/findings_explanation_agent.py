@@ -21,7 +21,7 @@ from typing import Any, List, Optional
 
 from app.services import storage
 from app.services.snowflake_session import session as sf_session
-from app.services.claude_client import ask_claude
+from app.services.claude_client import ask_claude, ask_claude_json
 
 logger = logging.getLogger(__name__)
 
@@ -136,13 +136,11 @@ class FindingsExplanationAgent:
             '}'
         )
 
-        try:
-            raw = ask_claude(prompt, system=_EXPLAIN_SYSTEM, max_tokens=1000).strip()
-            raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"\n?```$", "", raw).strip()
-            explanation = json.loads(raw)
-        except Exception as e:
-            logger.debug(f"[FindingsExplanation] Parse failed for {instance_id}: {e}")
+        explanation = ask_claude_json(
+            prompt, system=_EXPLAIN_SYSTEM, max_tokens=1000, label="findings_explanation",
+        )
+        if explanation is None:
+            logger.debug(f"[FindingsExplanation] No parseable explanation for {instance_id}")
             return
 
         # Parse sample_text into structured rows for the UI

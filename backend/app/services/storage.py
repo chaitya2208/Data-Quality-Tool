@@ -688,11 +688,26 @@ def get_definition_by_template_shape(template_shape: str) -> Optional[SimpleName
     name/description similarity or creating a brand-new definition, so every
     table/column proposing the same shape reuses one definition via its own
     TARGET_CONFIG/THRESHOLD_CONFIG/SEVERITY/RATIONALE instead of spawning a
-    duplicate. Prefers the highest-approval-count match if more than one
-    exists (e.g. a pre-canonicalization duplicate that's still active)."""
+    duplicate. When more than one active definition exists for the shape,
+    prefer the one with the most LIVE active instances — computed from
+    RULE_INSTANCES, not the monotonic RULE_DEFINITIONS.APPROVAL_COUNT column,
+    which never decrements on rejection/disable and so points at the most
+    historically-approved definition rather than the most currently useful
+    one (audit finding #8)."""
     rows = sf_session.query(
-        "SELECT * FROM RULE_DEFINITIONS WHERE TEMPLATE_SHAPE = %(shape)s AND STATUS != 'disabled' "
-        "ORDER BY APPROVAL_COUNT DESC, CREATED_AT ASC LIMIT 1",
+        """
+        SELECT d.*, COALESCE(i.ACTIVE_COUNT, 0) AS ACTIVE_COUNT
+        FROM RULE_DEFINITIONS d
+        LEFT JOIN (
+            SELECT DEFINITION_ID, COUNT(*) AS ACTIVE_COUNT
+            FROM RULE_INSTANCES
+            WHERE STATUS = 'active'
+            GROUP BY DEFINITION_ID
+        ) i ON i.DEFINITION_ID = d.ID
+        WHERE d.TEMPLATE_SHAPE = %(shape)s AND d.STATUS != 'disabled'
+        ORDER BY ACTIVE_COUNT DESC, d.CREATED_AT ASC
+        LIMIT 1
+        """,
         {"shape": template_shape},
     )
     return _definition_from_row(rows[0]) if rows else None
@@ -705,25 +720,41 @@ def list_definitions(
     skip: int = 0,
     limit: int = 500,
 ) -> tuple[int, list[SimpleNamespace]]:
-    where, params = [], {}
+    where, where_prefixed, params = [], [], {}
     if source:
         where.append("SOURCE = %(source)s")
+        where_prefixed.append("d.SOURCE = %(source)s")
         params["source"] = source
     if status:
         where.append("STATUS = %(status)s")
+        where_prefixed.append("d.STATUS = %(status)s")
         params["status"] = status
     if category:
         where.append("CATEGORY = %(category)s")
+        where_prefixed.append("d.CATEGORY = %(category)s")
         params["category"] = category
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    where_sql_prefixed = f"WHERE {' AND '.join(where_prefixed)}" if where_prefixed else ""
 
     total_rows = sf_session.query(f"SELECT COUNT(*) AS CNT FROM RULE_DEFINITIONS {where_sql}", params)
     total = total_rows[0]["CNT"] if total_rows else 0
 
+    # Rank by live active-instance count instead of the monotonic
+    # APPROVAL_COUNT column (audit finding #8) so the Rules Library shows the
+    # definitions actually used today at the top, not the ones with the most
+    # historical approvals (which never decrements on rejection/disable).
     rows = sf_session.query(
         f"""
-        SELECT * FROM RULE_DEFINITIONS {where_sql}
-        ORDER BY APPROVAL_COUNT DESC, CREATED_AT DESC
+        SELECT d.*, COALESCE(i.ACTIVE_COUNT, 0) AS ACTIVE_COUNT
+        FROM RULE_DEFINITIONS d
+        LEFT JOIN (
+            SELECT DEFINITION_ID, COUNT(*) AS ACTIVE_COUNT
+            FROM RULE_INSTANCES
+            WHERE STATUS = 'active'
+            GROUP BY DEFINITION_ID
+        ) i ON i.DEFINITION_ID = d.ID
+        {where_sql_prefixed}
+        ORDER BY ACTIVE_COUNT DESC, d.CREATED_AT DESC
         LIMIT %(limit)s OFFSET %(skip)s
         """,
         {**params, "limit": limit, "skip": skip},
@@ -733,6 +764,15 @@ def list_definitions(
 
 def list_all_definitions() -> list[SimpleNamespace]:
     rows = sf_session.query("SELECT * FROM RULE_DEFINITIONS")
+    return [_definition_from_row(r) for r in rows]
+
+
+def list_active_definitions() -> list[SimpleNamespace]:
+    """Single-query fetch of all active definitions — no COUNT, no JOIN.
+    Used by RulesFetchAgent where only the definition objects are needed."""
+    rows = sf_session.query(
+        "SELECT * FROM RULE_DEFINITIONS WHERE STATUS = 'active' ORDER BY CREATED_AT DESC"
+    )
     return [_definition_from_row(r) for r in rows]
 
 
@@ -1461,6 +1501,15 @@ def create_agent_tasks(run_id: str, agent_names: list[str]) -> None:
         )
 
 
+def create_agent_task(run_id: str, agent_name: str) -> SimpleNamespace:
+    """Insert one AGENT_TASKS row and return it. Used by the coordinator's
+    self-heal path when AGENT_ORDER gains a new agent but pre-existing runs
+    have no row for it — creating on demand keeps state transitions visible
+    instead of silently no-op'ing (audit finding #3)."""
+    create_agent_tasks(run_id, [agent_name])
+    return get_agent_task(run_id, agent_name)
+
+
 def get_agent_run(run_id: str, with_tasks: bool = True) -> Optional[SimpleNamespace]:
     rows = sf_session.query("SELECT * FROM AGENT_RUNS WHERE ID = %(id)s", {"id": run_id})
     if not rows:
@@ -1476,7 +1525,7 @@ def list_agent_runs(limit: int = 20) -> list[SimpleNamespace]:
     result = []
     for r in rows:
         try:
-            result.append(_agent_run_from_row(r, tasks=list_agent_tasks(r["ID"])))
+            result.append(_agent_run_from_row(r, tasks=[]))
         except Exception as e:
             logger.warning(f"[storage] Skipping malformed run {r.get('ID')}: {e}")
     return result
@@ -2181,7 +2230,12 @@ def get_intelligence_logs_for_table(table_fqn: str, limit: int = 3) -> list:
             {"fqn": table_fqn, "limit": limit},
         )
         return [_intelligence_log_from_row(r) for r in rows]
-    except Exception:
+    except Exception as e:
+        # A past-context read that dies silently was audit finding #6 — every
+        # scan pretended "no history yet" whether that was true or a broken
+        # query. Log the type + message so the log at least says "this
+        # channel is broken", without breaking the caller.
+        logger.warning(f"[storage] get_intelligence_logs_for_table failed: {type(e).__name__}: {e}")
         return []
 
 
@@ -2258,7 +2312,8 @@ def get_review_lessons_for_table(table_fqn: str, limit: int = 20) -> list:
             }
             for r in rows
         ]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[storage] get_review_lessons_for_table failed: {type(e).__name__}: {e}")
         return []
 
 
@@ -2356,7 +2411,8 @@ def search_similar_intelligence(table_fqn: str, limit: int = 5) -> list[SimpleNa
             },
         )
         return [_intelligence_log_from_row(r) for r in rows]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[storage] search_similar_intelligence failed: {type(e).__name__}: {e}")
         return []
 
 
@@ -2386,7 +2442,8 @@ def get_feedback_memo(bare_table_name: str, table_type: str) -> Optional[dict]:
         memo["_lesson_count"] = rows[0].get("LESSON_COUNT", 0)
         memo["_updated_at"] = str(rows[0].get("UPDATED_AT", ""))
         return memo
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[storage] get_feedback_memo failed: {type(e).__name__}: {e}")
         return None
 
 
@@ -2468,5 +2525,6 @@ def get_lessons_for_synthesis(
             }
             for r in rows
         ]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[storage] get_lessons_for_synthesis failed: {type(e).__name__}: {e}")
         return []

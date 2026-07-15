@@ -63,8 +63,16 @@ class VerificationAgent:
         storage.update_agent_task(task.id, output={"progress": "Re-running quality rules against fresh schema..."})
 
         # ── Step 2: Re-run all rules — collect still-firing violations ────────
+        # Key on instance_id — a stable primary key — instead of (rule_code,
+        # asset_fqn). Definition names are mutable display strings (a rename
+        # via the Rules Library would previously break the compare and
+        # auto-resolve every finding for that instance), and rule_engine +
+        # verification resolve asset_fqn on independent paths whose fallbacks
+        # can diverge (audit findings #2 and #10). Legacy findings whose
+        # instance_id is null fall back to the old string key below.
         rule_engine = RuleEngine()
-        still_firing: Set[Tuple[str, str]] = set()  # (rule_code, asset_fqn)
+        still_firing_instance_ids: Set[str] = set()
+        still_firing_legacy: Set[Tuple[str, str]] = set()  # (rule_code, asset_fqn) for pre-instance findings
 
         # Active sql_template instances for this table — without this,
         # Claude-authored checks would silently stop being re-verified after
@@ -96,14 +104,22 @@ class VerificationAgent:
                 source=source,
             )
             for fd in findings_data:
+                inst_id = fd.get("instance_id")
+                if inst_id:
+                    still_firing_instance_ids.add(inst_id)
+                    continue
+                # Only reached if a finding somehow lacks an instance_id — the
+                # legacy tuple key is our last-resort backstop.
                 ctx = fd.get("context") or {}
                 rule_code = ctx.get("rule_code", "")
                 asset_fqn = ctx.get("fqn", "")
                 if rule_code and asset_fqn:
-                    still_firing.add((rule_code, asset_fqn))
+                    still_firing_legacy.add((rule_code, asset_fqn))
 
+            still_firing_total = len(still_firing_instance_ids) + len(still_firing_legacy)
             logger.info(
-                f"[VerificationAgent] {len(still_firing)} violations still present "
+                f"[VerificationAgent] {still_firing_total} violations still present "
+                f"({len(still_firing_instance_ids)} by instance_id, {len(still_firing_legacy)} legacy) "
                 f"out of original findings"
             )
         except Exception as e:
@@ -127,11 +143,17 @@ class VerificationAgent:
 
             ctx = finding.context or {}
             rule_code = ctx.get("rule_code", "")
-            # Get the asset's FQN
+            # Get the asset's FQN (only used for logging + the legacy fallback
+            # key — the primary compare below is by instance_id, immune to any
+            # asset_fqn resolution asymmetry between rule_engine and here).
             asset = storage.get_asset(finding.asset_id)
             asset_fqn = asset.fqn if asset else ctx.get("fqn", "")
 
-            still_firing_now = (rule_code, asset_fqn) in still_firing
+            if finding.instance_id:
+                still_firing_now = finding.instance_id in still_firing_instance_ids
+            else:
+                # Legacy finding with no instance_id — use the old string key.
+                still_firing_now = (rule_code, asset_fqn) in still_firing_legacy
 
             # Log one RULE_EXECUTIONS row per instance re-checked this pass
             # (skip duplicates if multiple findings share the same instance).

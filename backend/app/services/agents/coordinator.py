@@ -55,8 +55,20 @@ class WorkflowCoordinator:
         try:
             self._execute()
         except Exception as e:
-            logger.error(f"[Coordinator] Unhandled error in run {self.run_id}: {e}")
-            self._mark_run_failed(str(e))
+            # Structured error handlers inside _execute already own state
+            # transitions for every anticipated failure — a bare fail() here is
+            # for the truly unexpected (bug in the coordinator itself). Log the
+            # full traceback so it's actually debuggable, and only mark failed
+            # if the run isn't already in a terminal state, else this
+            # double-invokes _advance_batch and can skip the next table.
+            import traceback
+            logger.error(
+                f"[Coordinator] Unhandled error in run {self.run_id}: "
+                f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            )
+            run = storage.get_agent_run(self.run_id)
+            if run and run.status not in ("completed", "failed", "awaiting_fixes", "awaiting_rule_review"):
+                self._mark_run_failed(f"Unhandled coordinator error: {type(e).__name__}: {e}")
 
     def _execute(self) -> None:
         run = storage.get_agent_run(self.run_id)
@@ -107,8 +119,7 @@ class WorkflowCoordinator:
         self._start_task(meta_task)
         self._start_task(rules_task)
         self._start_task(reldisc_task)
-        if profile_task:
-            self._start_task(profile_task)
+        self._start_task(profile_task)
 
         meta_result    = {"scan_id": None, "table_asset_id": None, "column_ids": None, "error": None}
         rules_result   = {"rule_codes": None, "error": None}
@@ -176,8 +187,6 @@ class WorkflowCoordinator:
             # freshness_signals / closed_set_columns). Runs in parallel — the
             # facts are derived from (db, schema, table, connection_id), so this
             # no longer waits for column metadata to be persisted.
-            if not profile_task:
-                return
             try:
                 from app.services.agents.profiling_agent import ProfilingAgent
                 prof = ProfilingAgent(None).run(run.database, run.schema_name, run.table, run.connection_id)
@@ -248,10 +257,20 @@ class WorkflowCoordinator:
         intel_result = None
         try:
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
+            from app.services.datasources import get_source
+            # Pass the run's own source so proposal-time SQL execution and the
+            # get_sample_rows tool run against the analysed database, not the
+            # app's shared Snowflake session (audit finding #4).
+            source = None
+            try:
+                source = get_source(run.connection_id)
+            except Exception as _src_err:
+                logger.warning(f"[Coordinator] Could not resolve source for rule_intelligence: {_src_err}")
             agent = RuleIntelligenceAgent()
             intel_result = agent.run(
                 table_asset, column_assets, existing_definitions, run.id,
                 profiler_result=profiler_result, relationship_catalog=relationship_catalog,
+                source=source,
             )
 
             classification       = intel_result["classification"]
@@ -484,12 +503,13 @@ class WorkflowCoordinator:
 
         # Back-fill outcome counts on the intelligence log so the vector store
         # reflects whether Claude's proposals were accepted or rejected.
-        # Also persist structured review lessons so future runs on similar
-        # tables learn what kinds of proposals humans accept or reject here.
+        # Each best-effort step below has its own try/except so a failure in
+        # one doesn't get logged as a failure of another (audit finding #15).
+        new_instances_rejected = sum(
+            1 for e in skipped_entries if e.get("is_new_instance")
+        )
+
         try:
-            new_instances_rejected = sum(
-                1 for e in skipped_entries if e.get("is_new_instance")
-            )
             log = storage.get_intelligence_log_for_run(self.run_id)
             if log:
                 storage.update_intelligence_log_outcomes(
@@ -497,8 +517,12 @@ class WorkflowCoordinator:
                     approved_count=new_instances_approved,
                     rejected_count=new_instances_rejected,
                 )
+        except Exception as e:
+            logger.warning(f"[Coordinator] Could not update intelligence log outcomes: {e}")
 
-            # Build structured lessons from this review round
+        # Persist structured review lessons so future runs on similar tables
+        # learn what humans accept or reject here.
+        try:
             run_obj = storage.get_agent_run(self.run_id)
             review_state = (run_obj.instance_review_state or {}) if run_obj else {}
             lessons = self._build_review_lessons(
@@ -511,9 +535,12 @@ class WorkflowCoordinator:
                     table_fqn=f"{run.database}.{run.schema_name}.{run.table}",
                     lessons=lessons,
                 )
+        except Exception as e:
+            logger.warning(f"[Coordinator] Could not append review lessons: {e}")
 
-            # Synthesise accumulated lessons into a reusable memo — best-effort,
-            # background thread so it never blocks the findings pipeline.
+        # Synthesise accumulated lessons into a reusable memo — best-effort,
+        # background thread so it never blocks the findings pipeline.
+        try:
             table_type = (
                 (storage.get_intelligence_log_for_run(self.run_id) or SimpleNamespace(table_type="unknown"))
                 .table_type or "unknown"
@@ -525,7 +552,7 @@ class WorkflowCoordinator:
                 daemon=True,
             ).start()
         except Exception as e:
-            logger.warning(f"[Coordinator] Could not update intelligence log outcomes: {e}")
+            logger.warning(f"[Coordinator] Could not kick feedback synthesis: {e}")
 
         # ── Re-fetch assets ───────────────────────────────────────────────────
         scan = storage.get_scan(run.scan_id)
@@ -704,11 +731,10 @@ class WorkflowCoordinator:
             return
 
         # Skip unused pipeline stages gracefully
-        for skipped in ["rules_fetch_agent", "relationship_discovery_agent",
-                        "profiling_agent", "rule_intelligence_agent"]:
-            t = self._get_task(skipped)
-            if t:
-                self._skip_task(t)
+        self._skip_tasks([
+            "rules_fetch_agent", "relationship_discovery_agent",
+            "profiling_agent", "rule_intelligence_agent",
+        ])
 
         existing_column_names = {c.column_name.upper() for c in column_assets if c.column_name}
 
@@ -823,9 +849,7 @@ class WorkflowCoordinator:
             })
         except Exception as e:
             self._fail_task(findings_task, str(e))
-            t = self._get_task("verification_agent")
-            if t:
-                self._skip_task(t)
+            self._skip_tasks(["verification_agent"])
             self._mark_run_failed(str(e), advance=False)
             return
 
@@ -887,29 +911,35 @@ class WorkflowCoordinator:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get_task(self, name: str) -> Any:
-        return storage.get_agent_task(self.run_id, name)
+        """Return the AGENT_TASKS row for this agent, or self-heal one into
+        existence if AGENT_ORDER has drifted since this run was seeded.
+        Missing rows used to silently no-op every subsequent transition (audit
+        finding #3) — a whole agent could execute invisibly. Loud is better."""
+        task = storage.get_agent_task(self.run_id, name)
+        if task is None:
+            logger.warning(
+                f"[Coordinator] AGENT_TASKS row missing for run={self.run_id} agent={name} — "
+                "self-healing (AGENT_ORDER drift?)"
+            )
+            task = storage.create_agent_task(self.run_id, name)
+        return task
 
     def _start_task(self, task: Any) -> None:
-        if not task: return
         storage.update_agent_task(task.id, status="running", started_at=datetime.utcnow())
 
     def _complete_task(self, task: Any, output: dict = None) -> None:
-        if not task: return
         storage.update_agent_task(task.id, status="completed", completed_at=datetime.utcnow(), output=output or {})
 
     def _fail_task(self, task: Any, error: str) -> None:
-        if not task: return
         storage.update_agent_task(task.id, status="failed", completed_at=datetime.utcnow(), error_message=error[:1024])
 
     def _skip_task(self, task: Any) -> None:
-        if not task: return
         storage.update_agent_task(task.id, status="skipped")
 
     def _skip_tasks(self, names: List[str]) -> None:
         for name in names:
             t = self._get_task(name)
-            if t:
-                self._skip_task(t)
+            self._skip_task(t)
 
     def _mark_run_failed(self, error: str, advance: bool = True) -> None:
         run = storage.get_agent_run(self.run_id)

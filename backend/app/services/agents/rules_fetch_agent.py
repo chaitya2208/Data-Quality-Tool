@@ -20,6 +20,6 @@ class RulesFetchAgent:
     def run(self) -> List[Any]:
         """Returns the ACTIVE definition library — the concepts Claude should
         reason about, not per-table instances."""
-        _, definitions = storage.list_definitions(status="active", limit=1000)
+        definitions = storage.list_active_definitions()
         logger.info(f"[RulesFetchAgent] Loaded {len(definitions)} active definitions")
         return definitions
