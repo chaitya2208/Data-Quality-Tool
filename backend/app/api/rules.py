@@ -11,6 +11,7 @@ from app.schemas.rule import (
     RuleExecutionResponse, RuleExecutionListResponse,
 )
 from app.services.rule_engine import initialize_default_rules
+from app.services.snowflake_session import session as sf_session
 from app.services.claude_client import ask_claude
 from app.services.text_similarity import word_overlap_score, DEFAULT_SIMILARITY_THRESHOLD
 from pydantic import BaseModel
@@ -169,13 +170,19 @@ def create_rule(rule_data: RuleCreate):
         raise HTTPException(status_code=400,
                             detail=f"Rule with code '{rule_data.code}' already exists")
 
+    # RuleCategory/RuleSeverity are (str, Enum); the Snowflake connector rejects
+    # binding the enum member itself ("Binding data in type (rulecategory) is not
+    # supported"), so coerce to the plain string value before it reaches storage.
+    category_value = rule_data.category.value if hasattr(rule_data.category, "value") else str(rule_data.category)
+    severity_value = rule_data.severity.value if hasattr(rule_data.severity, "value") else str(rule_data.severity)
+
     definition = storage.create_definition(
         name=rule_data.name,
-        category=rule_data.category,
+        category=category_value,
         description=rule_data.description,
         check_kind="python_handler",
         handler_key=rule_data.code.lower(),
-        default_severity=rule_data.severity,
+        default_severity=severity_value,
         allowed_scopes=rule_data.applies_to,
         source="user",
         status="proposed",
@@ -189,7 +196,7 @@ def create_rule(rule_data: RuleCreate):
         scope=scope,
         database_name="*",
         fingerprint=fingerprint,
-        severity=rule_data.severity,
+        severity=severity_value,
         target_config={},
         status="pending",
         is_active=False,
@@ -262,7 +269,8 @@ def approve_rule(rule_id: str):
         raise HTTPException(status_code=400,
                             detail=f"Only PENDING rules can be approved (current: {instance.status})")
 
-    storage.approve_instance(rule_id)
+    approved_by = (sf_session.get_cached_context() or {}).get("user")
+    storage.approve_instance(rule_id, approved_by=approved_by)
     definition = storage.get_definition(instance.definition_id)
     if definition and definition.status == "proposed":
         storage.update_definition(definition.id, status="active")
@@ -284,7 +292,8 @@ def reject_rule(rule_id: str, body: RejectRequest):
         raise HTTPException(status_code=400,
                             detail=f"Only PENDING rules can be rejected (current: {instance.status})")
 
-    storage.reject_instance(rule_id, body.reason)
+    rejected_by = (sf_session.get_cached_context() or {}).get("user")
+    storage.reject_instance(rule_id, body.reason, rejected_by=rejected_by)
     return storage.get_rule_view(rule_id)
 
 

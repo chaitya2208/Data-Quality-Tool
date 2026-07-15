@@ -20,6 +20,18 @@ const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: 'failed',               label: 'Failed'          },
 ]
 
+// Human-readable node names for the failed-node indicator.
+const AGENT_LABELS: Record<string, string> = {
+  coordinator: 'Coordinator',
+  metadata_agent: 'Metadata',
+  rules_fetch_agent: 'Rules Fetch',
+  relationship_discovery_agent: 'Relationship Discovery',
+  profiling_agent: 'Profiling',
+  rule_intelligence_agent: 'Rule Intelligence',
+  findings_agent: 'Findings',
+  verification_agent: 'Verification',
+}
+
 function statusBadge(status: string) {
   switch (status) {
     case 'completed':
@@ -222,6 +234,10 @@ export default function RunHistory() {
             </div>
 
             {filtered.map(run => {
+              // Nodes that failed during this run — surfaced even when the run
+              // itself isn't 'failed' (e.g. a soft node failure the pipeline
+              // continued past), so a partial failure is never invisible.
+              const failedTasks = (run.tasks ?? []).filter(t => t.status === 'failed')
               return (
                 <div
                   key={run.id}
@@ -299,6 +315,37 @@ export default function RunHistory() {
                     <p className="mt-2 text-xs text-red-600 dark:text-red-400 font-mono bg-red-50 dark:bg-red-950/30 px-3 py-1.5 rounded truncate" title={run.error_message}>
                       {run.error_message}
                     </p>
+                  )}
+
+                  {/* Per-node failures — which node failed, when, and why. Shown
+                      even if the run status isn't 'failed' (soft node failures). */}
+                  {failedTasks.length > 0 && (
+                    <div className="mt-2 flex flex-col gap-1">
+                      {failedTasks.map(t => (
+                        <div
+                          key={t.id}
+                          className="flex items-start gap-2 text-xs bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/50 px-3 py-1.5 rounded"
+                          title={t.error_message ?? undefined}
+                        >
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                          <span className="min-w-0">
+                            <span className="font-medium text-amber-800 dark:text-amber-200">
+                              {AGENT_LABELS[t.agent_name] ?? t.agent_name} failed
+                            </span>
+                            {t.completed_at && (
+                              <span className="text-amber-600 dark:text-amber-400/80">
+                                {' · '}{new Date(t.completed_at).toLocaleString()}
+                              </span>
+                            )}
+                            {t.error_message && (
+                              <span className="block text-amber-700 dark:text-amber-300/90 font-mono truncate">
+                                {t.error_message}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
               )

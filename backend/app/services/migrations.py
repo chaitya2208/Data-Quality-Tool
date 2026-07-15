@@ -21,6 +21,16 @@ _MIGRATIONS = [
         "ALTER TABLE AGENT_RUNS ADD COLUMN IF NOT EXISTS SCHEDULE_ID VARCHAR(36)",
     ),
     (
+        # Who approved/rejected a rule instance (Snowflake session user) so the
+        # Rule Library review queue can show the approver, not just a timestamp.
+        "add_approved_by_to_rule_instances",
+        "ALTER TABLE RULE_INSTANCES ADD COLUMN IF NOT EXISTS APPROVED_BY VARCHAR(255)",
+    ),
+    (
+        "add_rejected_by_to_rule_instances",
+        "ALTER TABLE RULE_INSTANCES ADD COLUMN IF NOT EXISTS REJECTED_BY VARCHAR(255)",
+    ),
+    (
         "create_workflow_templates",
         """
         CREATE TABLE IF NOT EXISTS WORKFLOW_TEMPLATES (

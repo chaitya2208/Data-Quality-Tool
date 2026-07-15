@@ -913,6 +913,8 @@ def _instance_from_row(row: dict) -> SimpleNamespace:
         updated_at=row["UPDATED_AT"],
         approved_at=row["APPROVED_AT"],
         rejected_at=row["REJECTED_AT"],
+        approved_by=row.get("APPROVED_BY"),
+        rejected_by=row.get("REJECTED_BY"),
     )
 
 
@@ -1025,6 +1027,9 @@ def _instance_as_rule_view(instance: SimpleNamespace, definition: SimpleNamespac
         updated_at=instance.updated_at,
         approved_at=instance.approved_at,
         rejected_at=instance.rejected_at,
+        approved_by=getattr(instance, "approved_by", None),
+        rejected_by=getattr(instance, "rejected_by", None),
+        source=definition.source,
     )
 
 
@@ -1183,19 +1188,21 @@ def update_instance(instance_id: str, **fields: Any) -> SimpleNamespace:
     return get_instance(instance_id)
 
 
-def approve_instance(instance_id: str) -> SimpleNamespace:
-    instance = update_instance(
-        instance_id, status="active", is_active=True, approved_at=datetime.datetime.utcnow(),
-    )
+def approve_instance(instance_id: str, approved_by: Optional[str] = None) -> SimpleNamespace:
+    fields = dict(status="active", is_active=True, approved_at=datetime.datetime.utcnow())
+    if approved_by:
+        fields["approved_by"] = approved_by
+    instance = update_instance(instance_id, **fields)
     increment_definition_approval_count(instance.definition_id)
     return instance
 
 
-def reject_instance(instance_id: str, reason: str) -> SimpleNamespace:
-    return update_instance(
-        instance_id, status="rejected", is_active=False,
-        rejection_reason=reason, rejected_at=datetime.datetime.utcnow(),
-    )
+def reject_instance(instance_id: str, reason: str, rejected_by: Optional[str] = None) -> SimpleNamespace:
+    fields = dict(status="rejected", is_active=False,
+                  rejection_reason=reason, rejected_at=datetime.datetime.utcnow())
+    if rejected_by:
+        fields["rejected_by"] = rejected_by
+    return update_instance(instance_id, **fields)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1309,6 +1316,59 @@ def upsert_relationship(
         )
     rows = sf_session.query("SELECT * FROM RELATIONSHIP_CATALOG WHERE ID = %(id)s", {"id": relationship_id})
     return _relationship_from_row(rows[0])
+
+
+def replace_relationships(
+    database_name: str,
+    schema_name: str,
+    rows: list[dict],
+) -> list[SimpleNamespace]:
+    """Replace the ENTIRE relationship catalog for one (database, schema) with a
+    fresh set, in 2 round-trips (one DELETE + one multi-row INSERT) instead of
+    3 per candidate. A discovery run always recomputes the full candidate set,
+    so delete-all-for-schema + insert-all is correct and far cheaper than
+    per-row upsert-diffing. Each row dict may carry: from_table, from_column,
+    to_table, to_column, status, confidence, orphan_rate, sample_total,
+    sample_orphans. Returns the freshly-stored rows."""
+    sf_session.execute(
+        "DELETE FROM RELATIONSHIP_CATALOG WHERE DATABASE_NAME = %(database_name)s AND SCHEMA_NAME = %(schema_name)s",
+        {"database_name": database_name, "schema_name": schema_name},
+    )
+    if not rows:
+        return []
+
+    # One multi-row INSERT ... SELECT ... UNION ALL. Snowflake rejects function
+    # calls (CURRENT_TIMESTAMP()) inside a multi-row VALUES clause, so we use the
+    # SELECT form — same reason the single-row upsert above uses INSERT ... SELECT.
+    select_clauses = []
+    params: Dict[str, Any] = {"database_name": database_name, "schema_name": schema_name}
+    for i, r in enumerate(rows):
+        select_clauses.append(
+            f"SELECT %(id{i})s, %(database_name)s, %(schema_name)s, %(ft{i})s, %(fc{i})s, "
+            f"%(tt{i})s, %(tc{i})s, %(st{i})s, %(cf{i})s, %(orr{i})s, %(stot{i})s, %(sorp{i})s, "
+            f"CURRENT_TIMESTAMP()"
+        )
+        params[f"id{i}"]   = _new_id()
+        params[f"ft{i}"]   = r.get("from_table")
+        params[f"fc{i}"]   = r.get("from_column")
+        params[f"tt{i}"]   = r.get("to_table")
+        params[f"tc{i}"]   = r.get("to_column")
+        params[f"st{i}"]   = r.get("status", "confirmed")
+        params[f"cf{i}"]   = r.get("confidence", "name_match")
+        params[f"orr{i}"]  = r.get("orphan_rate")
+        params[f"stot{i}"] = r.get("sample_total")
+        params[f"sorp{i}"] = r.get("sample_orphans")
+
+    sf_session.execute(
+        f"""
+        INSERT INTO RELATIONSHIP_CATALOG
+            (ID, DATABASE_NAME, SCHEMA_NAME, FROM_TABLE, FROM_COLUMN, TO_TABLE, TO_COLUMN,
+             STATUS, CONFIDENCE, ORPHAN_RATE, SAMPLE_TOTAL, SAMPLE_ORPHANS, LAST_VERIFIED_AT)
+        {' UNION ALL '.join(select_clauses)}
+        """,
+        params,
+    )
+    return list_relationships(database_name, schema_name)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
