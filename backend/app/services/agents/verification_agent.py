@@ -67,6 +67,15 @@ class VerificationAgent:
         )
         active_instance_ids = {i.id for i in active_instances}
 
+        # Only instances whose definition is also active were actually re-run.
+        # Findings for disabled definitions must not be auto-resolved — the rule
+        # was simply skipped, not passed.
+        checked_instance_ids: Set[str] = set()
+        for inst in active_instances:
+            defn = storage.get_definition(inst.definition_id)
+            if defn and defn.status == "active":
+                checked_instance_ids.add(inst.id)
+
         try:
             # Use a sentinel scan_id so we don't create new Finding rows
             findings_data = rule_engine.execute_all_rules(
@@ -122,8 +131,13 @@ class VerificationAgent:
                 )
                 logged_instance_ids.add(finding.instance_id)
 
-            if not still_firing_now:
-                # Rule no longer fires → issue is resolved
+            # Only auto-resolve if the rule was actually re-run (definition active).
+            # If the definition is disabled the rule was skipped, not passed.
+            rule_was_checked = (
+                finding.instance_id is None or finding.instance_id in checked_instance_ids
+            )
+
+            if not still_firing_now and rule_was_checked:
                 storage.update_finding(
                     finding.id,
                     status="resolved",
@@ -135,6 +149,12 @@ class VerificationAgent:
                     f"[VerificationAgent] Auto-resolved: {finding.title} "
                     f"({rule_code} on {asset_fqn})"
                 )
+            elif not still_firing_now and not rule_was_checked:
+                logger.info(
+                    f"[VerificationAgent] Skipped (rule disabled): {finding.title} "
+                    f"({rule_code} on {asset_fqn})"
+                )
+                still_open += 1
             else:
                 still_open += 1
 
