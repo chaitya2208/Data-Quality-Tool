@@ -21,7 +21,7 @@ from app.services import storage
 from app.services.agents.coordinator import WorkflowCoordinator, DB_AGENT_ORDER
 
 
-TARGET = ("PLAYGROUND_DB", "TEST_DQ", "ORDERS")
+TARGET = ("PLAYGROUND_DB", "TEST_DQ", "SUBSCRIPTIONS")
 CONNECTION_ID = "02237403-7382-4901-ac94-87735b9d8cff"
 
 

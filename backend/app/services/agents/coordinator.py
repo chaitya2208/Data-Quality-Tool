@@ -251,6 +251,31 @@ class WorkflowCoordinator:
             logger.warning(f"[Coordinator] Profiling failed: {profile_result['error']}, continuing with no deterministic facts")
         profiler_result = profile_result["facts"] or {}
 
+        # ── Sweep stale pending proposals from prior runs ─────────────────────
+        # A pending instance from an earlier run that was never approved
+        # clutters this scan's review UI and confuses Claude (he sees the
+        # same target proposed again as "already pending" but hasn't seen the
+        # user reject it). Reject them with a clear reason so fingerprint
+        # dedup still catches a genuine re-proposal, but they no longer appear
+        # in the new review as unaddressed backlog.
+        stale_pending = storage.list_stale_pending_instances(
+            database_name=run.database,
+            schema_name=run.schema_name,
+            table_name=run.table,
+            except_run_id=run.id,
+        )
+        for inst in stale_pending:
+            storage.update_instance(
+                inst.id,
+                status="rejected",
+                rejection_reason="Superseded by a new scan before the prior review was completed.",
+            )
+        if stale_pending:
+            logger.info(
+                f"[Coordinator] Swept {len(stale_pending)} stale pending proposal(s) "
+                f"from prior runs on {run.database}.{run.schema_name}.{run.table}"
+            )
+
         # ── Rule Intelligence Agent ───────────────────────────────────────────
         intel_task = self._get_task("rule_intelligence_agent")
         self._start_task(intel_task)
@@ -318,9 +343,18 @@ class WorkflowCoordinator:
         active_entries = []
         skipped_entries = []
 
-        # Existing instances — keep_running decision only, never re-approved
+        # Existing instances — keep_running decision only, never re-approved.
+        # Decisions are keyed per-instance (instances_evaluated) so two
+        # instances of the same definition (e.g. accepted_values on STATUS
+        # AND on CURRENCY_CODE) get INDEPENDENT keep_running verdicts.
+        # Falls back to the legacy definition-level key if the model still
+        # returned that shape.
+        instances_evaluated = classification.get("instances_evaluated") or {}
+        legacy_defs_evaluated = classification.get("definitions_evaluated") or {}
         for inst in existing_instances:
-            decision = classification.get("definitions_evaluated", {}).get(inst.definition_id, {})
+            decision = instances_evaluated.get(inst.id)
+            if decision is None:
+                decision = legacy_defs_evaluated.get(inst.definition_id, {})
             definition = storage.get_definition(inst.definition_id)
             entry = {
                 "instance_id":       inst.id,

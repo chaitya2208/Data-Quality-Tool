@@ -152,9 +152,22 @@ Given a table schema, real column statistics computed from the live data,
 and the library of check DEFINITIONS this system already knows about (plus
 what is already running or pending on this exact table), you will:
 1. Classify the table type (fact/dimension/staging/config/audit/reference)
-2. For each existing definition that is already active or pending on THIS
-   table, decide whether it should keep running (rarely — only if clearly
-   irrelevant to this table's business purpose)
+2. Actively review each EXISTING instance already active or pending on THIS
+   table (listed below with its instance_id, target column, and any
+   threshold config). For every one, decide keep_running=true or false —
+   this is not a rubber stamp. Flip to false when:
+     - the target column no longer exists, has changed type, or its
+       observed stats make the check nonsensical (e.g. accepted_values
+       list on a numeric column, freshness threshold on a non-date column,
+       regex pattern that no non-null value could possibly match)
+     - the check duplicates work another active instance already covers
+       with a stricter or better-targeted variant
+     - the table's business purpose (per your classification) makes the
+       check semantically wrong (e.g. a freshness check on a static
+       reference table)
+   Default is keep_running=true — but only after you've weighed the
+   instance against the current stats. Silent defaults on obviously-broken
+   instances waste reviewer time.
 3. Propose NEW instances. When an existing definition genuinely fits (same
    concept + threshold shape), reuse it. But when this table has a
    domain-specific check no existing definition covers, propose a
@@ -284,11 +297,11 @@ Respond with this JSON:
   "table_type_confidence": <0-100>,
   "table_type_reason": "one sentence",
   "reasoning": "your full first-person deliberation for this analysis — what signals you examined and what each told you, why each proposal is justified by the specific stats/signals, what you considered but ruled out and why, and any caveats. Continuous prose, no headers/bullets. Every sentence must cite a specific column/stat/signal — no preamble, no restating fields already in this JSON, no closing summary. Keep it dense; skip filler.",
-  "definitions_evaluated": {{
-    "<definition_id>": {{
+  "instances_evaluated": {{
+    "<instance_id>": {{
       "keep_running": true/false,
       "severity_override": null or "critical|high|medium|low",
-      "reason": "one sentence"
+      "reason": "one sentence — cite the specific column/stat/definition-mismatch that motivated your decision, especially when flipping to false"
     }}
   }},
   "signals_evaluated": {{
@@ -301,9 +314,9 @@ Respond with this JSON:
     {{
       "definition_id": "<existing definition id>" or null,
       "new_definition": null or {{
-        "name": "Short descriptive name",
+        "name": "Short GENERIC concept name — a definition is a reusable concept in the library and will be applied to OTHER tables/columns later, so avoid table- or column-specific words. GOOD: 'Numeric Range Violation', 'Negative Value in Numeric Measure', 'Cross-Column Timestamp Ordering'. BAD: 'Non-negative Order Amount', 'Positive Price Check', 'ORDER_ID uniqueness' — those don't generalize when reused on HOURS_WORKED or another _AMOUNT column.",
         "category": "data_quality|schema|naming|security|ownership",
-        "description": "What this checks and why it matters"
+        "description": "What this concept checks and why it matters, written to make sense on any table it might be applied to. The specific column/threshold/table on THIS instance goes in the rationale field, not here."
       }},
       "scope": "table" or "column" or "multi_column" or "cross_table",
       "column_name": "COLUMN_NAME_IF_COLUMN_SCOPE or null",
@@ -321,9 +334,11 @@ Respond with this JSON:
 }}
 
 IMPORTANT REQUIREMENTS:
-- Every definitions_evaluated entry MUST cover every definition listed as
-  "ALREADY ACTIVE OR PENDING ON THIS TABLE" above — decide keep_running for
-  each one.
+- Every instances_evaluated entry MUST cover every instance_id listed as
+  "ALREADY ACTIVE OR PENDING ON THIS TABLE" above — decide keep_running
+  per-instance. Two instances of the same definition (e.g. two accepted_values
+  checks on different columns) get INDEPENDENT decisions — keep the sensible
+  one and skip the nonsensical one; they are not linked.
 - Every signals_evaluated entry MUST cover every signal_id listed under
   DETERMINISTIC SIGNALS above — decide propose_instance for each one.
 - new_instances entries with definition_id set reuse an existing definition
@@ -532,6 +547,12 @@ class RuleIntelligenceAgent:
             "table_type":            parsed.get("table_type", "unknown"),
             "table_type_confidence": parsed.get("table_type_confidence", 50),
             "table_type_reason":     parsed.get("table_type_reason", ""),
+            # Preferred new shape (keyed by instance_id). Preserved for the
+            # coordinator's per-instance keep_running lookup.
+            "instances_evaluated":   parsed.get("instances_evaluated", {}),
+            # Backward-compat: earlier prompts asked for definitions_evaluated
+            # (keyed by definition_id). Some tests/logs may still send it.
+            # Coordinator falls through to this if instances_evaluated is empty.
             "definitions_evaluated": parsed.get("definitions_evaluated", {}),
             "signals_evaluated":     parsed.get("signals_evaluated", {}),
         }
@@ -576,11 +597,12 @@ class RuleIntelligenceAgent:
             import traceback
             logger.warning(f"[RuleIntelligence] Could not save intelligence log: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
-        # Normalize: fill missing decisions with default (keep_running=True)
+        # Normalize: fill missing decisions with default (keep_running=True).
+        # New shape is per-instance; legacy per-definition fallback kept for
+        # runs replayed against older model responses.
         for inst in existing_instances:
-            def_id = inst.definition_id
-            if def_id not in classification["definitions_evaluated"]:
-                classification["definitions_evaluated"][def_id] = {
+            if inst.id not in classification["instances_evaluated"] and inst.definition_id not in classification["definitions_evaluated"]:
+                classification["instances_evaluated"][inst.id] = {
                     "keep_running": True, "severity_override": None,
                     "reason": "Default — not explicitly re-evaluated",
                 }
@@ -1789,6 +1811,13 @@ class RuleIntelligenceAgent:
         return "\n".join(lines)
 
     def _format_existing_instances(self, instances: List[Any], definitions: List[Any]) -> str:
+        """Format each existing instance with its instance_id (the key
+        instances_evaluated must use) + its target + any threshold config.
+        Threshold matters: two `accepted_values` instances of the same
+        definition on different columns are independent decisions, and
+        their accepted-value lists are what Claude must sanity-check against
+        the actual column data (e.g. reject `accepted_values: ['A','B','C']`
+        on a numeric column)."""
         if not instances:
             return "  (none — this table has no active/pending checks yet)"
         by_id = {d.id: d for d in definitions}
@@ -1796,9 +1825,18 @@ class RuleIntelligenceAgent:
         for inst in instances:
             d = by_id.get(inst.definition_id)
             name = d.name if d else inst.definition_id
-            target = inst.target_config.get("column") if inst.target_config else None
-            target_str = f"column={target}" if target else "table-level"
-            lines.append(f"  definition_id={inst.definition_id} \"{name}\" [{inst.status}] {target_str}")
+            tc = inst.target_config or {}
+            if tc.get("column"):
+                target_str = f"column={tc['column']}"
+            elif tc.get("columns"):
+                target_str = f"columns={tc['columns']}"
+            else:
+                target_str = "table-level"
+            threshold = inst.threshold_config or {}
+            threshold_str = f" threshold={threshold}" if threshold else ""
+            lines.append(
+                f'  instance_id={inst.id} "{name}" [{inst.status}] {target_str}{threshold_str}'
+            )
         return "\n".join(lines)
 
     def _call_model(self, prompt: str, table_asset: Any) -> tuple:

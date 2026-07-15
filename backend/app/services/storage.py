@@ -1222,6 +1222,31 @@ def ensure_global_instance(definition: SimpleNamespace) -> SimpleNamespace:
     )
 
 
+def list_stale_pending_instances(
+    database_name: str,
+    schema_name: str,
+    table_name: str,
+    except_run_id: str,
+) -> list[SimpleNamespace]:
+    """Pending RULE_INSTANCES on this table from ANY source_run_id other than
+    `except_run_id`. Used by the coordinator to sweep leftover proposals from
+    prior runs that were never approved — without this, each new scan on a
+    table accumulates review-panel clutter that Claude also sees as "already
+    pending" and won't re-propose."""
+    rows = sf_session.query(
+        """
+        SELECT * FROM RULE_INSTANCES
+        WHERE UPPER(DATABASE_NAME) = UPPER(%(db)s)
+          AND UPPER(SCHEMA_NAME)   = UPPER(%(sc)s)
+          AND UPPER(TABLE_NAME)    = UPPER(%(tb)s)
+          AND STATUS = 'pending'
+          AND (SOURCE_RUN_ID IS NULL OR SOURCE_RUN_ID != %(run_id)s)
+        """,
+        {"db": database_name, "sc": schema_name, "tb": table_name, "run_id": except_run_id},
+    )
+    return [_instance_from_row(r) for r in rows]
+
+
 def update_instance(instance_id: str, **fields: Any) -> SimpleNamespace:
     """Partial update. JSON fields (target_config, threshold_config) are
     auto-detected."""

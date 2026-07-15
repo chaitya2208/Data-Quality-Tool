@@ -34,10 +34,47 @@ from app.services.profiling_service import profile_table
 
 logger = logging.getLogger(__name__)
 
-# Same PK-shape pattern dynamic_rules.py uses (check_no_primary_key /
-# check_nullable_id_column) — reused so "looks like a key" means the same thing
-# everywhere in this codebase.
+# PK-shape patterns split by confidence:
+#
+#   STRONG (this table's own primary key): ^ID$, ^PK_..., ..._PK$, ..._KEY$,
+#     ..._SEQ$, ..._SURROGATE, and the-table-name + _ID (e.g. ORDER_ID on
+#     table ORDERS). These names almost always mean "this row's identifier"
+#     and merit a deterministic uniqueness proposal.
+#
+#   WEAK (looks like a key but usually a foreign key): anything else ending
+#     in _ID (CUSTOMER_ID on ORDERS, MANAGER_ID on EMPLOYEE_ATTENDANCE).
+#     Duplicates on these are normal — one customer places many orders, one
+#     manager supervises many employees — so a deterministic uniqueness
+#     proposal here is a semantically wrong default. Claude is still shown
+#     these as signals and may propose uniqueness manually when appropriate.
+#
+# The old single-pattern regex (kept below for other callers that use the
+# generic "looks like a key" test) fired uniqueness on every _ID column,
+# generating false-positive proposals for FK columns. See EMPLOYEE_ATTENDANCE
+# scan 2026-07-15 for the concrete incident.
+_PK_SHAPE_STRONG_RE = re.compile(r"(^ID$|^PK_|_PK$|_KEY$|_SEQ$|_SURROGATE)", re.I)
 _PK_SHAPE_RE = re.compile(r"(^ID$|_ID$|^PK_|_PK$|_KEY$|_SEQ$|_SURROGATE)", re.I)
+
+
+def _is_strong_pk_shape(column_name: str, table_name: str) -> bool:
+    """True if the column name strongly suggests it's THIS table's PK
+    (not merely a FK). Only the unambiguous patterns qualify:
+    - ^ID$ (a column literally named ID)
+    - ^PK_..., ..._PK$ (explicit PK prefix/suffix)
+    - ..._KEY$ (business key suffix)
+    - ..._SEQ$ (sequence)
+    - ..._SURROGATE
+
+    Deliberately EXCLUDES the bare _ID suffix (CUSTOMER_ID, MANAGER_ID,
+    EMPLOYEE_ID) — those are typically foreign keys that legitimately
+    repeat. If Claude thinks a specific _ID column IS this table's PK, he
+    can propose uniqueness himself via the LLM path with full column-stat
+    context. `table_name` accepted for future use (e.g. exact ORDERS+ORDER_ID
+    matching) but not consulted today to avoid false positives on
+    EMPLOYEE_ATTENDANCE's EMPLOYEE_ID (looks matched but is really a FK)."""
+    if not column_name:
+        return False
+    return bool(_PK_SHAPE_STRONG_RE.search(column_name.upper()))
 
 # Same date/timestamp-shaped type groups dynamic_rules.py's NAME_TYPE_RULES uses.
 _DATE_TYPES = {"DATE"}
@@ -144,9 +181,13 @@ class ProfilingAgent:
                 "tail_values": tail_values,
             }
 
-            # PK-shaped uniqueness signal — only when the column NAME looks like a
-            # key and live distinct/non-null counts reveal duplicates.
-            if _PK_SHAPE_RE.search(str(name).upper()):
+            # PK-shaped uniqueness signal — only fire when the column NAME
+            # strongly suggests THIS table's own primary key. Any _ID column
+            # (CUSTOMER_ID on ORDERS, MANAGER_ID on ATTENDANCE) is far more
+            # often a foreign key that legitimately repeats — deterministic
+            # uniqueness there is a wrong default that generates guaranteed
+            # false-positive proposals Claude has no way to retract.
+            if _is_strong_pk_shape(str(name), table):
                 is_unique = (distinct >= non_null_total) if non_null_total else True
                 pk_shaped_candidates.append({
                     "column": name,
