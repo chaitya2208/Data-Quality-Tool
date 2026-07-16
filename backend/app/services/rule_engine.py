@@ -416,4 +416,51 @@ def initialize_default_rules() -> None:
     for code, name, description, category, severity, applies_to in default_rules:
         storage.ensure_definition(code.lower(), name, description, category, severity, applies_to)
 
-    logger.info(f"Default rules initialized — {len(default_rules)} metadata-audit definitions")
+    # ── SQL-template shapes ────────────────────────────────────────────────
+    # These are the 8 canonical data-level check shapes RuleIntelligence picks
+    # by name. Seeding them here means they survive any full DB wipe and are
+    # always present for get_definition_by_template_shape lookups — RuleIntelligence
+    # creates instances of these, never new definitions for them.
+    template_rules = [
+        ("not_null",             "Not Null",
+         "A column that should never be empty has null values. Catches missing required "
+         "fields — primary keys, foreign keys, mandatory attributes.",
+         "data_quality", "high"),
+        ("uniqueness",           "Column Uniqueness",
+         "A column that should hold unique values per row has duplicates. Catches "
+         "duplicate keys, emails, or other business alternate keys.",
+         "data_quality", "high"),
+        ("accepted_values",      "Accepted Values",
+         "A column contains values outside the expected closed set. Catches typos, "
+         "free-text drift, or undocumented code values in categorical columns.",
+         "data_quality", "medium"),
+        ("range",                "Numeric Range",
+         "A numeric column has values outside the expected minimum/maximum bounds. "
+         "Catches data entry errors, unit mismatches, and pipeline truncation.",
+         "data_quality", "medium"),
+        ("regex_match",          "Format / Regex Match",
+         "A string column contains values that do not match the expected format pattern. "
+         "Catches malformed emails, phone numbers, codes, or identifiers.",
+         "data_quality", "medium"),
+        ("freshness",            "Stale Timestamp / Data Freshness",
+         "The most recent value in a record-creation or update timestamp column is older "
+         "than an acceptable age, indicating the pipeline feeding the table has stopped "
+         "delivering new rows.",
+         "freshness", "high"),
+        ("duplicate_key",        "Duplicate Composite Key",
+         "A combination of columns that should be unique across rows has duplicates. "
+         "Catches compound-key violations where no single column alone is the key.",
+         "data_quality", "high"),
+        ("referential_integrity","Referential Integrity",
+         "A foreign key column references values that do not exist in the referenced "
+         "table. Catches orphaned rows, stale references, and broken joins.",
+         "data_quality", "high"),
+    ]
+
+    for shape, name, description, category, severity in template_rules:
+        storage.ensure_template_definition(shape, name, description, category, severity)
+
+    logger.info(
+        f"Default rules initialized — {len(default_rules)} metadata-audit + "
+        f"{len(template_rules)} sql-template definitions"
+    )

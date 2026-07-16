@@ -149,7 +149,15 @@ class SnowflakeSource(DataSource):
             if prefix in self._MIN_MAX_PREFIXES:
                 p += [f"MIN({col}) AS C{idx}_MIN", f"MAX({col}) AS C{idx}_MAX"]
             if prefix in self.numeric_type_prefixes:
-                p += [f"AVG({col}) AS C{idx}_AVG", f"STDDEV({col}) AS C{idx}_STDDEV"]
+                # STDDEV on a NUMBER column computes its running sum-of-squares
+                # in fixed-point NUMBER(38,0) — on a large enough table this
+                # overflows ("Number out of representable range") even when
+                # the column's actual values are unremarkable (observed on a
+                # 15M-row NUMBER(18,6) column). Casting to DOUBLE first routes
+                # the computation through floating point, which has no such
+                # fixed-point ceiling. AVG doesn't need this — it doesn't
+                # overflow in practice — but staying consistent costs nothing.
+                p += [f"AVG({col}::DOUBLE) AS C{idx}_AVG", f"STDDEV({col}::DOUBLE) AS C{idx}_STDDEV"]
             return p
 
         def _unpack(row, idx, prefix):

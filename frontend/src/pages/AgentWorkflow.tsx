@@ -933,19 +933,14 @@ export default function AgentWorkflow() {
                 <div className="text-center">
                   <p className="text-2xl font-bold text-purple-600 flex items-center justify-center gap-1">
                     <Sparkles className="w-5 h-5" />
-                    {activeRun.ai_rules_count}
-                    {activeRun.ai_rules_proposed > activeRun.ai_rules_count && (
+                    {activeRun.ai_rules_proposed}
+                    {activeRun.findings_count > 0 && activeRun.ai_rules_count !== activeRun.ai_rules_proposed && (
                       <span className="text-sm font-normal text-gray-400 dark:text-gray-500">
-                        /{activeRun.ai_rules_proposed}
+                        ({activeRun.ai_rules_count} approved)
                       </span>
                     )}
                   </p>
-                  <p className="text-xs text-gray-500 dark:text-gray-300">
-                    AI rules approved
-                    {activeRun.ai_rules_proposed > activeRun.ai_rules_count && (
-                      <span className="text-gray-400 dark:text-gray-600"> of {activeRun.ai_rules_proposed} proposed</span>
-                    )}
-                  </p>
+                  <p className="text-xs text-gray-500 dark:text-gray-300">AI rules proposed</p>
                 </div>
                 <div className="text-center">
                   {liveResolved !== null ? (
@@ -1479,7 +1474,7 @@ export default function AgentWorkflow() {
               <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Findings Report</h2>
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">
-              {findingsOutput.rules_executed} rules executed ·{' '}
+              {findingsOutput.rules_executed} instances executed ·{' '}
               <span className="text-orange-700 dark:text-orange-300 font-medium">{findingsOutput.rules_used_count} fired</span> ·{' '}
               <span className="text-green-700 dark:text-green-400 font-medium">{findingsOutput.rules_unused_count} clean</span>
               {findingsOutput.findings_count != null && <> · {findingsOutput.findings_count} findings</>}
@@ -1491,14 +1486,13 @@ export default function AgentWorkflow() {
             <div className="p-5">
               <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-orange-500 inline-block" />
-                Rules Used ({findingsOutput.rules_used_count})
+                Instances Fired ({findingsOutput.rules_used_count})
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
                 {findingsOutput.rules_used.map((r: any, i: number) => (
                   <div key={r.instance_id ?? r.code ?? i} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
                     <div className="min-w-0">
-                      <span className="font-mono text-xs font-bold text-gray-700 dark:text-gray-200">{r.code}</span>
-                      <p className="text-xs text-gray-600 dark:text-gray-300 truncate">{r.name}</p>
+                      <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 truncate">{r.name}</p>
                     </div>
                     {activeRun?.scan_id && (
                       <button
@@ -1521,13 +1515,12 @@ export default function AgentWorkflow() {
             <div className="p-5">
               <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
-                Rules Clean ({findingsOutput.rules_unused_count})
+                Instances Clean ({findingsOutput.rules_unused_count})
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
                 {(findingsOutput.rules_unused || []).map((r: any, i: number) => (
-                  <div key={r.instance_id ?? r.code ?? i} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm">
-                    <span className="font-mono text-xs font-bold text-gray-500 dark:text-gray-300">{r.code}</span>
-                    <p className="text-xs text-gray-500 dark:text-gray-300 truncate">{r.name}</p>
+                  <div key={r.instance_id ?? i} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm">
+                    <p className="text-xs font-semibold text-gray-500 dark:text-gray-300 truncate">{r.name}</p>
                   </div>
                 ))}
                 {findingsOutput.rules_unused_count === 0 && (

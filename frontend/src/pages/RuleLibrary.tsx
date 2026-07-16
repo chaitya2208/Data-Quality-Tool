@@ -607,6 +607,14 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
     createMutation.mutate({ ...form, code: codeClean })
   }
 
+  // Categories actually present in the library, not the full fixed enum —
+  // an unused category (e.g. no "ownership" rules exist yet) shouldn't
+  // clutter the filter with an option that always returns zero results.
+  const availableCategories = useMemo(() => {
+    const present = new Set((data?.definitions ?? []).map(d => d.category).filter(Boolean))
+    return Array.from(present).sort()
+  }, [data])
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     return (data?.definitions ?? []).filter(d => {
@@ -681,7 +689,7 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
           <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
             className="px-3 py-2 border border-gray-200 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:border-primary-500">
             <option value="">All Categories</option>
-            {CATEGORIES.map(c => <option key={c} value={c}>{cap(c)}</option>)}
+            {availableCategories.map(c => <option key={c} value={c}>{cap(c)}</option>)}
           </select>
 
           <select value={sourceFilter} onChange={e => setSourceFilter(e.target.value)}

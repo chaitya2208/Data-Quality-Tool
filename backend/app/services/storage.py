@@ -871,6 +871,36 @@ def ensure_definition(
     return existing
 
 
+def ensure_template_definition(
+    template_shape: str,
+    name: str,
+    description: str,
+    category: str,
+    severity: str,
+) -> SimpleNamespace:
+    """Return the canonical sql_template definition for `template_shape`,
+    auto-creating it (as system/active) if missing. Mirrors ensure_definition
+    but for the 8 sql_template shapes — called by initialize_default_rules so
+    they survive any full DB wipe and are always available for RuleIntelligence
+    to find via get_definition_by_template_shape."""
+    existing = get_definition_by_template_shape(template_shape)
+    if not existing:
+        existing = create_definition(
+            name=name,
+            category=category,
+            description=description,
+            check_kind="sql_template",
+            template_shape=template_shape,
+            default_severity=severity,
+            allowed_scopes=["column"],
+            source="system",
+            status="active",
+            owner="data-governance-team",
+            created_by="system",
+        )
+    return existing
+
+
 def update_definition(definition_id: str, **fields: Any) -> SimpleNamespace:
     """Partial update. JSON fields (parameters_schema, default_threshold_config,
     allowed_scopes) are auto-detected."""
