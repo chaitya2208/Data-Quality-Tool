@@ -18,7 +18,6 @@ from types import SimpleNamespace
 from typing import List, Any, Dict
 
 from app.services import storage
-from app.services.snowflake_session import session as sf_session
 
 logger = logging.getLogger(__name__)
 
@@ -322,18 +321,20 @@ class WorkflowCoordinator:
                 ],
             })
         except Exception as e:
+            # Rule Intelligence is a core node — if it throws, the run has no
+            # rules to review and must NOT quietly proceed to awaiting_fixes with
+            # zero proposals (that reads as a clean run in Run History). Fail the
+            # whole run with this node's error + time, skip the remaining stages,
+            # and let the batch advance to the next table.
             import traceback
             logger.error(
                 f"[Coordinator] RuleIntelligenceAgent failed: {type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}"
             )
             self._fail_task(intel_task, str(e))
-            intel_result = {
-                "classification": {"table_type": "unknown", "definitions_evaluated": {}},
-                "existing_instances": [],
-                "proposed_instances": [],
-                "suppressed": [],
-            }
+            self._skip_tasks(["findings_agent", "verification_agent"])
+            self._mark_run_failed(f"Rule Intelligence failed: {e}")
+            return
 
         # ── PAUSE: persist proposals as PENDING, build instance_review_state ────
         classification      = intel_result["classification"]

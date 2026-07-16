@@ -57,6 +57,7 @@ def _build_run_response(run) -> AgentRunResponse:
         instance_review_state=getattr(run, "instance_review_state", None),
         error_message=run.error_message,
         created_at=run.created_at,
+        schedule_id=getattr(run, "schedule_id", None),
         tasks=[_build_task_response(t) for t in run.tasks],
     )
 
@@ -346,67 +347,6 @@ def trigger_verification(run_id: str, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_run_verification)
     return {"message": "Verification started", "run_id": run_id}
-
-
-# ── Save run as workflow ──────────────────────────────────────────────────────
-
-@router.post("/runs/{run_id}/save-as-workflow", status_code=201)
-def save_run_as_workflow(run_id: str, request: dict):
-    """
-    Save a workflow from a run's currently-active rule set. Works for ANY run
-    type — AI pipeline, saved-workflow template, or scheduled — because it reads
-    the active RULE_INSTANCES on the run's target table rather than relying on
-    instance_review_state (which only exists for runs that paused for review).
-    """
-    run = storage.get_agent_run(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Agent run not found")
-
-    label = (request.get("label") or "").strip()
-    if not label:
-        raise HTTPException(status_code=400, detail="label is required")
-
-    _, instances = storage.list_instances(
-        database_name=run.database,
-        schema_name=run.schema_name,
-        table_name=run.table,
-        status="active",
-        is_active=True,
-        limit=1000,
-    )
-
-    patterns = []
-    for inst in instances:
-        definition = storage.get_definition(inst.definition_id)
-        patterns.append({
-            "definition_id":   inst.definition_id,
-            "definition_name": definition.name if definition else inst.definition_id,
-            "scope":           inst.scope,
-            "target_config":   inst.target_config or {},
-            "threshold_config": inst.threshold_config or {},
-            "severity":        inst.severity,
-            "template_shape":  (definition.template_shape if definition else None),
-            "rationale":       inst.rationale or "",
-        })
-
-    if not patterns:
-        raise HTTPException(
-            status_code=400,
-            detail="No active rules found for this run's table to save as a workflow.",
-        )
-
-    w = storage.create_workflow(
-        label=label,
-        description=(request.get("description") or ""),
-        rule_patterns=patterns,
-        created_by=(request.get("created_by") or ""),
-        origin_scope="table",
-        origin_database=run.database,
-        origin_schema=run.schema_name,
-        origin_table=run.table,
-    )
-    logger.info(f"[API] Saved workflow '{label}' from run {run_id} — {len(patterns)} patterns")
-    return _workflow_response(w)
 
 
 # ── Workflow Templates ────────────────────────────────────────────────────────

@@ -9,7 +9,6 @@ Falls back to Claude/Bedrock if Cortex is unavailable or errors.
 """
 import json
 import logging
-from typing import Optional
 
 from app.services.snowflake_session import session as sf_session
 from app.services.claude_client import ask_claude

@@ -36,22 +36,41 @@ def _build(conn) -> DataSource:
     raise ValueError(f"Unsupported connection type: {conn.type}")
 
 
-def get_source(connection_id: Optional[str], db=None) -> DataSource:
+def get_source(connection_id: Optional[str], db=None, strict: bool = False) -> DataSource:
     """
     Resolve a connection_id to a DataSource. If connection_id is None, fall back
     to the first Snowflake connection (backward compat with single-source callers).
 
+    `strict=True` disables the fallback: a run whose connection is null or whose
+    connection record no longer exists must FAIL LOUDLY rather than silently
+    running against some other datasource. Used by schedule-originated runs,
+    which store their own connection_id and must never misroute (a schedule
+    saved with no connection, or whose connection was later deleted, should
+    error clearly instead of scanning the wrong source).
+
     `db` is accepted and ignored — kept so existing call sites that pass a
     session don't break during the ORM→storage migration.
     """
-    conn = None
-    if connection_id:
+    if strict:
+        if not connection_id:
+            raise ValueError(
+                "This run has no connection configured — set a data source on the schedule."
+            )
         conn = storage.get_connection_record(connection_id)
-    if conn is None:
-        # Fallback: first connection (prefer Snowflake for legacy behavior)
-        conn = storage.get_first_connection(prefer_type=ConnectionType.SNOWFLAKE.value)
-    if conn is None:
-        raise ValueError("No connections configured")
+        if conn is None:
+            raise ValueError(
+                f"Connection {connection_id} no longer exists — it may have been deleted. "
+                "Edit the schedule to pick a valid data source."
+            )
+    else:
+        conn = None
+        if connection_id:
+            conn = storage.get_connection_record(connection_id)
+        if conn is None:
+            # Fallback: first connection (prefer Snowflake for legacy behavior)
+            conn = storage.get_first_connection(prefer_type=ConnectionType.SNOWFLAKE.value)
+        if conn is None:
+            raise ValueError("No connections configured")
 
     with _lock:
         cached = _cache.get(conn.id)

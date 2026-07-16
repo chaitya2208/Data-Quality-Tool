@@ -62,6 +62,7 @@ class AgentRunResponse(BaseModel):
     instance_review_state: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
     created_at: datetime
+    schedule_id: Optional[str] = None  # set when the run was fired by a schedule
     tasks: List[AgentTaskResponse] = []
 
     class Config:

@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { ruleLibraryApi, rulesApi } from '../api/client'
-import type { RuleDefinition, RuleInstance, RuleCreatePayload, GeneratedRule } from '../api/client'
+import type { RuleDefinition, RuleInstance, RuleCreatePayload, GeneratedRule, Rule } from '../api/client'
 import {
   ShieldCheck, FileText, Database, Tag, Filter, Search, X,
   ArrowLeft, ChevronDown, ChevronRight, Code2, Sparkles, Layers,
@@ -111,12 +111,36 @@ function StatCard({ title, value, icon: Icon, color }: { title: string; value: n
 function InstanceRow({ instance }: { instance: RuleInstance }) {
   const [expanded, setExpanded] = useState(false)
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
 
   const { data: executionsData } = useQuery({
     queryKey: ['rule-instance-executions', instance.id],
     queryFn: () => ruleLibraryApi.listExecutions(instance.id).then(r => r.data),
     enabled: expanded,
   })
+
+  // A newly-added rule lands as a PENDING instance (proposed definition). These
+  // approve/reject the instance via the existing endpoints — approve also flips
+  // the proposed definition to active server-side (POST /rules/{id}/approve).
+  const isPending = instance.status === 'pending'
+  const refetchAfterReview = () => {
+    queryClient.invalidateQueries({ queryKey: ['rule-definition-instances', instance.definition_id] })
+    queryClient.invalidateQueries({ queryKey: ['rule-definitions'] })
+    queryClient.invalidateQueries({ queryKey: ['rules-stats'] })
+  }
+  const approveMutation = useMutation({
+    mutationFn: () => rulesApi.approve(instance.id),
+    onSuccess: refetchAfterReview,
+  })
+  const rejectMutation = useMutation({
+    mutationFn: (reason: string) => rulesApi.reject(instance.id, reason),
+    onSuccess: refetchAfterReview,
+  })
+  const handleReject = () => {
+    const reason = window.prompt('Reason for rejecting this rule?')
+    if (reason && reason.trim()) rejectMutation.mutate(reason.trim())
+  }
+  const reviewing = approveMutation.isPending || rejectMutation.isPending
 
   const statusStyle = STATUS_STYLES[instance.status] ?? STATUS_STYLES.active
 
@@ -139,9 +163,16 @@ function InstanceRow({ instance }: { instance: RuleInstance }) {
           {instance.rationale && (
             <p className="text-sm text-gray-600 dark:text-gray-300">{instance.rationale}</p>
           )}
+          {/* Review provenance — who approved/rejected and when */}
+          {instance.status === 'active' && instance.approved_by && (
+            <p className="text-xs text-green-700 dark:text-green-300 mt-1">
+              ✓ Approved by <span className="font-medium">{instance.approved_by}</span>
+              {instance.approved_at ? ` · ${new Date(instance.approved_at).toLocaleString()}` : ''}
+            </p>
+          )}
           {instance.rejection_reason && (
             <p className="text-xs text-red-600 dark:text-red-300 bg-red-50 dark:bg-red-950/40 px-2 py-1 rounded mt-1 inline-block">
-              ✗ Rejected: {instance.rejection_reason}
+              ✗ Rejected{instance.rejected_by ? ` by ${instance.rejected_by}` : ''}: {instance.rejection_reason}
             </p>
           )}
         </div>
@@ -156,6 +187,31 @@ function InstanceRow({ instance }: { instance: RuleInstance }) {
           >
             <ExternalLink className="w-3 h-3" /> Findings
           </button>
+          {isPending && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={e => { e.stopPropagation(); approveMutation.mutate() }}
+                disabled={reviewing}
+                className="flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-50"
+                title="Approve — activate this rule"
+              >
+                {approveMutation.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />} Approve
+              </button>
+              <button
+                onClick={e => { e.stopPropagation(); handleReject() }}
+                disabled={reviewing}
+                className="flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg border border-red-300 dark:border-red-500/40 text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50"
+                title="Reject this rule with a reason"
+              >
+                {rejectMutation.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <XCircle className="w-3 h-3" />} Reject
+              </button>
+            </div>
+          )}
+          {(approveMutation.isError || rejectMutation.isError) && (
+            <span className="text-[10px] text-red-600 dark:text-red-400">
+              {((approveMutation.error || rejectMutation.error) as any)?.response?.data?.detail || 'Action failed'}
+            </span>
+          )}
         </div>
       </div>
 
@@ -371,6 +427,102 @@ function InstancesView({ definition, onBack }: { definition: RuleDefinition; onB
   )
 }
 
+// ── Pending Review section ────────────────────────────────────────────────────
+// Surfaces every PENDING rule instance at the top of the library with inline
+// Approve/Reject, so proposed rules never have to be hunted for inside each
+// definition's detail view. Driven by the flat rule-view (rulesApi.list), which
+// carries the instance id that /approve and /reject act on.
+
+function PendingReviewRow({ rule, onReviewed }: { rule: Rule; onReviewed: () => void }) {
+  const approveMutation = useMutation({
+    mutationFn: () => rulesApi.approve(rule.id),
+    onSuccess: onReviewed,
+  })
+  const rejectMutation = useMutation({
+    mutationFn: (reason: string) => rulesApi.reject(rule.id, reason),
+    onSuccess: onReviewed,
+  })
+  const reviewing = approveMutation.isPending || rejectMutation.isPending
+  const handleReject = () => {
+    const reason = window.prompt(`Reason for rejecting "${rule.name}"?`)
+    if (reason && reason.trim()) rejectMutation.mutate(reason.trim())
+  }
+
+  return (
+    <div className="flex items-center gap-3 px-4 py-3">
+      <span className={`text-xs font-semibold px-2 py-0.5 rounded border ${SEVERITY_COLORS[rule.severity] ?? ''}`}>
+        {rule.severity.toUpperCase()}
+      </span>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{rule.name}</p>
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-300">{rule.code}</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300">{cap(rule.category)}</span>
+        </div>
+        {rule.description && (
+          <p className="text-xs text-gray-500 dark:text-gray-400 truncate mt-0.5">{rule.description}</p>
+        )}
+        <p className="text-[11px] text-gray-400 dark:text-gray-500 mt-0.5">
+          Owner: <span className="text-gray-600 dark:text-gray-300">{rule.owner || '—'}</span>
+          {rule.created_by ? <> · Added by: <span className="text-gray-600 dark:text-gray-300">{rule.created_by}</span></> : null}
+          {rule.created_at ? <> · {new Date(rule.created_at).toLocaleString()}</> : null}
+          {rule.applies_to?.length ? <> · Applies to: {rule.applies_to.join(', ')}</> : null}
+        </p>
+      </div>
+      <div className="flex items-center gap-2 flex-shrink-0">
+        <button
+          onClick={() => approveMutation.mutate()}
+          disabled={reviewing}
+          className="flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-50"
+        >
+          {approveMutation.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />} Approve
+        </button>
+        <button
+          onClick={handleReject}
+          disabled={reviewing}
+          className="flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-500/40 text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50"
+        >
+          {rejectMutation.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <XCircle className="w-3 h-3" />} Reject
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function PendingReviewSection() {
+  const queryClient = useQueryClient()
+  const { data } = useQuery({
+    queryKey: ['rules-pending'],
+    queryFn: () => rulesApi.list({ status: 'pending' }).then(r => r.data),
+    staleTime: 15_000,
+  })
+  // Only rules created via "Add Rule" (definition source='user') — NOT AI/workflow
+  // proposals, which are reviewed in the workflow rule-review flow instead.
+  const pending = (data?.rules ?? []).filter(r => r.source === 'user')
+  const onReviewed = () => {
+    queryClient.invalidateQueries({ queryKey: ['rules-pending'] })
+    queryClient.invalidateQueries({ queryKey: ['rule-definitions'] })
+    queryClient.invalidateQueries({ queryKey: ['rules-stats'] })
+  }
+  if (pending.length === 0) return null
+
+  return (
+    <div className="bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/50 rounded-xl overflow-hidden">
+      <div className="px-4 py-3 border-b border-amber-200 dark:border-amber-800/50 flex items-center gap-2">
+        <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400" />
+        <span className="text-sm font-semibold text-amber-800 dark:text-amber-200">
+          {pending.length} manually-added rule{pending.length !== 1 ? 's' : ''} awaiting review
+        </span>
+      </div>
+      <div className="divide-y divide-amber-200/60 dark:divide-amber-800/40">
+        {pending.map(rule => (
+          <PendingReviewRow key={rule.id} rule={rule} onReviewed={onReviewed} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ── Definitions view ──────────────────────────────────────────────────────────
 
 function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }) {
@@ -503,6 +655,9 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
         <StatCard title="Definitions" value={data?.total ?? 0} icon={Layers} color="bg-blue-500" />
         <StatCard title="Instances" value={totalInstances} icon={Hash} color="bg-primary-500" />
       </div>
+
+      {/* Pending review — surfaced up top so proposed rules are one click to approve/reject */}
+      <PendingReviewSection />
 
       {/* Search + Filters */}
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3">

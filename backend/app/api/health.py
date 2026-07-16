@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from app.services.snowflake_session import session as sf_session
 
 router = APIRouter()

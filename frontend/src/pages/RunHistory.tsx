@@ -1,14 +1,15 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { agentRunsApi } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import {
   History, Loader2, CheckCircle2, AlertTriangle, BrainCircuit,
-  Wrench, Database, Search, Filter, ExternalLink,
+  Wrench, Database, Search, Filter, ExternalLink, Clock,
 } from 'lucide-react'
 
 type StatusFilter = 'all' | 'completed' | 'failed' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes'
+type OriginFilter = 'all' | 'scheduled' | 'manual'
 
 const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: 'all',                  label: 'All'             },
@@ -18,6 +19,18 @@ const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: 'awaiting_fixes',       label: 'Awaiting Fixes'  },
   { value: 'failed',               label: 'Failed'          },
 ]
+
+// Human-readable node names for the failed-node indicator.
+const AGENT_LABELS: Record<string, string> = {
+  coordinator: 'Coordinator',
+  metadata_agent: 'Metadata',
+  rules_fetch_agent: 'Rules Fetch',
+  relationship_discovery_agent: 'Relationship Discovery',
+  profiling_agent: 'Profiling',
+  rule_intelligence_agent: 'Rule Intelligence',
+  findings_agent: 'Findings',
+  verification_agent: 'Verification',
+}
 
 function statusBadge(status: string) {
   switch (status) {
@@ -40,6 +53,10 @@ export default function RunHistory() {
   const navigate = useNavigate()
   const [search, setSearch]           = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [originFilter, setOriginFilter] = useState<OriginFilter>('all')
+  const [dbFilter, setDbFilter]         = useState('')
+  const [schemaFilter, setSchemaFilter] = useState('')
+  const [tableFilter, setTableFilter]   = useState('')
   // Run History is scoped to the selected data source. Runs already carry
   // connection_id, so we filter client-side; legacy NULL-connection runs are
   // attributed to Snowflake to match the findings/dashboard scoping rule.
@@ -59,11 +76,37 @@ export default function RunHistory() {
       : run.connection_id === connId || (isSnowflake && !run.connection_id)
   )
 
+  // Cascading DB → schema → table option lists, derived from the (connection-
+  // scoped) runs. Schema options depend on the chosen DB, tables on the schema.
+  const dbOptions = useMemo(
+    () => Array.from(new Set(runs.map(r => r.database).filter(Boolean))).sort(),
+    [runs],
+  )
+  const schemaOptions = useMemo(
+    () => Array.from(new Set(
+      runs.filter(r => !dbFilter || r.database === dbFilter)
+          .map(r => r.schema_name).filter(Boolean),
+    )).sort(),
+    [runs, dbFilter],
+  )
+  const tableOptions = useMemo(
+    () => Array.from(new Set(
+      runs.filter(r => (!dbFilter || r.database === dbFilter) && (!schemaFilter || r.schema_name === schemaFilter))
+          .map(r => r.table).filter(Boolean),
+    )).sort(),
+    [runs, dbFilter, schemaFilter],
+  )
+
   const filtered = runs.filter(run => {
     const matchesStatus = statusFilter === 'all' || run.status === statusFilter
     const fqn = `${run.database}.${run.schema_name}.${run.table}`.toLowerCase()
     const matchesSearch = !search || fqn.includes(search.toLowerCase())
-    return matchesStatus && matchesSearch
+    const matchesDb     = !dbFilter     || run.database    === dbFilter
+    const matchesSchema = !schemaFilter || run.schema_name === schemaFilter
+    const matchesTable  = !tableFilter  || run.table       === tableFilter
+    const matchesOrigin = originFilter === 'all'
+      || (originFilter === 'scheduled' ? !!run.schedule_id : !run.schedule_id)
+    return matchesStatus && matchesSearch && matchesDb && matchesSchema && matchesTable && matchesOrigin
   })
 
   const stats = {
@@ -98,7 +141,7 @@ export default function RunHistory() {
       </div>
 
       {/* Filters */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3">
         <div className="flex flex-col sm:flex-row gap-3">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
@@ -121,6 +164,43 @@ export default function RunHistory() {
               ))}
             </select>
           </div>
+        </div>
+
+        {/* Cascading DB / schema / table + origin filters */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <select
+            value={dbFilter}
+            onChange={e => { setDbFilter(e.target.value); setSchemaFilter(''); setTableFilter('') }}
+            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
+          >
+            <option value="">All Databases</option>
+            {dbOptions.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+          <select
+            value={schemaFilter}
+            onChange={e => { setSchemaFilter(e.target.value); setTableFilter('') }}
+            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
+          >
+            <option value="">All Schemas</option>
+            {schemaOptions.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <select
+            value={tableFilter}
+            onChange={e => setTableFilter(e.target.value)}
+            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
+          >
+            <option value="">All Tables</option>
+            {tableOptions.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+          <select
+            value={originFilter}
+            onChange={e => setOriginFilter(e.target.value as OriginFilter)}
+            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
+          >
+            <option value="all">All Runs</option>
+            <option value="scheduled">Scheduled</option>
+            <option value="manual">Manual</option>
+          </select>
         </div>
       </div>
 
@@ -154,6 +234,10 @@ export default function RunHistory() {
             </div>
 
             {filtered.map(run => {
+              // Nodes that failed during this run — surfaced even when the run
+              // itself isn't 'failed' (e.g. a soft node failure the pipeline
+              // continued past), so a partial failure is never invisible.
+              const failedTasks = (run.tasks ?? []).filter(t => t.status === 'failed')
               return (
                 <div
                   key={run.id}
@@ -168,6 +252,11 @@ export default function RunHistory() {
                         <span className="text-sm font-medium text-gray-900 dark:text-gray-100 font-mono truncate">
                           {run.database}.{run.schema_name}.{run.table}
                         </span>
+                        {run.schedule_id && (
+                          <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/50 dark:text-indigo-300 flex-shrink-0" title="Fired by a schedule">
+                            <Clock className="w-2.5 h-2.5" />Scheduled
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center gap-3 mt-1">
                         <span className="text-xs text-gray-400 dark:text-gray-400">
@@ -226,6 +315,37 @@ export default function RunHistory() {
                     <p className="mt-2 text-xs text-red-600 dark:text-red-400 font-mono bg-red-50 dark:bg-red-950/30 px-3 py-1.5 rounded truncate" title={run.error_message}>
                       {run.error_message}
                     </p>
+                  )}
+
+                  {/* Per-node failures — which node failed, when, and why. Shown
+                      even if the run status isn't 'failed' (soft node failures). */}
+                  {failedTasks.length > 0 && (
+                    <div className="mt-2 flex flex-col gap-1">
+                      {failedTasks.map(t => (
+                        <div
+                          key={t.id}
+                          className="flex items-start gap-2 text-xs bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/50 px-3 py-1.5 rounded"
+                          title={t.error_message ?? undefined}
+                        >
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                          <span className="min-w-0">
+                            <span className="font-medium text-amber-800 dark:text-amber-200">
+                              {AGENT_LABELS[t.agent_name] ?? t.agent_name} failed
+                            </span>
+                            {t.completed_at && (
+                              <span className="text-amber-600 dark:text-amber-400/80">
+                                {' · '}{new Date(t.completed_at).toLocaleString()}
+                              </span>
+                            )}
+                            {t.error_message && (
+                              <span className="block text-amber-700 dark:text-amber-300/90 font-mono truncate">
+                                {t.error_message}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
               )

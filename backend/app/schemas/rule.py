@@ -45,6 +45,9 @@ class RuleResponse(RuleBase):
     updated_at:      datetime
     approved_at:     Optional[datetime] = None
     rejected_at:     Optional[datetime] = None
+    approved_by:     Optional[str] = None
+    rejected_by:     Optional[str] = None
+    source:          Optional[str] = None   # 'user' (Add Rule) | 'claude' | 'deterministic' | 'system'
 
     class Config:
         from_attributes = True
@@ -110,6 +113,8 @@ class RuleInstanceResponse(BaseModel):
     updated_at: datetime
     approved_at: Optional[datetime] = None
     rejected_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    rejected_by: Optional[str] = None
 
     class Config:
         from_attributes = True

@@ -169,6 +169,10 @@ def run_now(schedule_id: str):
             schema_name=s.schema_name,
             table=s.table_name,
             workflow_template_id=s.workflow_template_id,
+            schedule_id=s.id,
+            # Fail loud if the schedule's connection is missing/deleted rather
+            # than silently running against a different datasource.
+            strict_connection=True,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

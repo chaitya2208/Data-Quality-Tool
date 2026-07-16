@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { findingsApi, assetsApi, rulesApi } from '../api/client'
+import { findingsApi, rulesApi } from '../api/client'
 import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck, ChevronDown, ChevronRight, BrainCircuit, TableIcon } from 'lucide-react'
 import { useConnection } from '../ConnectionContext'
 
@@ -174,7 +174,6 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
 export default function Findings() {
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate    = useNavigate()
-  const queryClient = useQueryClient()
   // Findings are scoped to the selected data source. connId in the query key
   // makes a source switch refetch the correct rows.
   const { selectedId: connId } = useConnection()
@@ -251,11 +250,6 @@ export default function Findings() {
     staleTime: 60_000,
   })
 
-  const { data: assetsData } = useQuery({
-    queryKey: ['assets', 'tables'],
-    queryFn: () => assetsApi.list({ asset_type: 'table' }).then(r => r.data),
-  })
-
   const { data: rulesData } = useQuery({
     queryKey: ['rules-all'],
     queryFn: () => rulesApi.list({ is_active: true, limit: 500 } as any).then(r => r.data),
@@ -330,15 +324,6 @@ export default function Findings() {
     }
     return uniqueTables.find(t => t.fqn === tableFilter)?.table_name || tableFilter
   }, [tableFilter, uniqueTables])
-
-  // ── Mutations ──────────────────────────────────────────────────────────────
-  const updateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: any }) => findingsApi.update(id, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['findings'] })
-      queryClient.invalidateQueries({ queryKey: ['findings-stats'] })
-    },
-  })
 
   const handleSelectAll = () =>
     setSelectedFindings(
@@ -571,8 +556,8 @@ export default function Findings() {
               <>
                 <p className="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No quality issues found yet</p>
                 <p className="text-sm text-gray-500 dark:text-gray-300 mb-4">Scan a table to discover data quality issues</p>
-                <button onClick={() => navigate('/scanner')} className="px-4 py-2 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700">
-                  Go to Scanner
+                <button onClick={() => navigate('/workflow')} className="px-4 py-2 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700">
+                  Go to Workflow
                 </button>
               </>
             )}

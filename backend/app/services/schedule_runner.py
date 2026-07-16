@@ -96,6 +96,10 @@ def _process_due() -> None:
                 schema_name=sched.schema_name,
                 table=sched.table_name,
                 workflow_template_id=sched.workflow_template_id,
+                schedule_id=sched.id,
+                # Schedules carry their own connection — never silently fall back
+                # to a default datasource; fail loud so the misroute is visible.
+                strict_connection=True,
             )
             storage.update_schedule(
                 sched.id,

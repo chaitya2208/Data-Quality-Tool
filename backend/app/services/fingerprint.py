@@ -6,7 +6,7 @@ many times they were suggested.
 """
 import hashlib
 import json
-from typing import Any, Optional
+from typing import Optional
 
 
 def _canonical_json(value: Optional[dict]) -> str:

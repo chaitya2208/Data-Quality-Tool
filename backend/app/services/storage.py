@@ -676,11 +676,6 @@ def get_definition_by_handler_key(handler_key: str) -> Optional[SimpleNamespace]
     return _definition_from_row(rows[0]) if rows else None
 
 
-def get_definition_by_name(name: str) -> Optional[SimpleNamespace]:
-    rows = sf_session.query("SELECT * FROM RULE_DEFINITIONS WHERE NAME = %(name)s", {"name": name})
-    return _definition_from_row(rows[0]) if rows else None
-
-
 def get_definition_by_template_shape(template_shape: str) -> Optional[SimpleNamespace]:
     """Exact lookup for the canonical, system-wide definition backing a
     sql_template shape (not_null, uniqueness, ...) — the fix for definition-
@@ -876,37 +871,6 @@ def ensure_definition(
     return existing
 
 
-def ensure_template_definition(
-    template_shape: str,
-    name: str,
-    description: str,
-    category: str,
-    severity: str,
-    allowed_scopes: list[str],
-) -> SimpleNamespace:
-    """Return the canonical sql_template definition for `template_shape`,
-    auto-creating it (as system/active) if missing — the sql_template analog
-    of ensure_definition() above. Unlike ensure_definition, does NOT create a
-    global instance: sql_template checks are always table/column-scoped via
-    their own TARGET_CONFIG, there is no 'runs everywhere' degenerate case."""
-    existing = get_definition_by_template_shape(template_shape)
-    if existing:
-        return existing
-    return create_definition(
-        name=name,
-        category=category,
-        description=description,
-        check_kind="sql_template",
-        template_shape=template_shape,
-        default_severity=severity,
-        allowed_scopes=allowed_scopes,
-        source="system",
-        status="active",
-        owner="data-governance-team",
-        created_by="system",
-    )
-
-
 def update_definition(definition_id: str, **fields: Any) -> SimpleNamespace:
     """Partial update. JSON fields (parameters_schema, default_threshold_config,
     allowed_scopes) are auto-detected."""
@@ -972,6 +936,8 @@ def _instance_from_row(row: dict) -> SimpleNamespace:
         updated_at=row["UPDATED_AT"],
         approved_at=row["APPROVED_AT"],
         rejected_at=row["REJECTED_AT"],
+        approved_by=row.get("APPROVED_BY"),
+        rejected_by=row.get("REJECTED_BY"),
     )
 
 
@@ -1051,11 +1017,6 @@ def list_instances(
     return total, [_instance_from_row(r) for r in rows]
 
 
-def list_all_instances() -> list[SimpleNamespace]:
-    rows = sf_session.query("SELECT * FROM RULE_INSTANCES")
-    return [_instance_from_row(r) for r in rows]
-
-
 def _instance_as_rule_view(instance: SimpleNamespace, definition: SimpleNamespace) -> SimpleNamespace:
     """Joins an instance + its definition into the flat `Rule`-shaped object
     the `rules.py` API / frontend still expects (code/name/description/
@@ -1084,6 +1045,9 @@ def _instance_as_rule_view(instance: SimpleNamespace, definition: SimpleNamespac
         updated_at=instance.updated_at,
         approved_at=instance.approved_at,
         rejected_at=instance.rejected_at,
+        approved_by=getattr(instance, "approved_by", None),
+        rejected_by=getattr(instance, "rejected_by", None),
+        source=definition.source,
     )
 
 
@@ -1267,19 +1231,21 @@ def update_instance(instance_id: str, **fields: Any) -> SimpleNamespace:
     return get_instance(instance_id)
 
 
-def approve_instance(instance_id: str) -> SimpleNamespace:
-    instance = update_instance(
-        instance_id, status="active", is_active=True, approved_at=datetime.datetime.utcnow(),
-    )
+def approve_instance(instance_id: str, approved_by: Optional[str] = None) -> SimpleNamespace:
+    fields = dict(status="active", is_active=True, approved_at=datetime.datetime.utcnow())
+    if approved_by:
+        fields["approved_by"] = approved_by
+    instance = update_instance(instance_id, **fields)
     increment_definition_approval_count(instance.definition_id)
     return instance
 
 
-def reject_instance(instance_id: str, reason: str) -> SimpleNamespace:
-    return update_instance(
-        instance_id, status="rejected", is_active=False,
-        rejection_reason=reason, rejected_at=datetime.datetime.utcnow(),
-    )
+def reject_instance(instance_id: str, reason: str, rejected_by: Optional[str] = None) -> SimpleNamespace:
+    fields = dict(status="rejected", is_active=False,
+                  rejection_reason=reason, rejected_at=datetime.datetime.utcnow())
+    if rejected_by:
+        fields["rejected_by"] = rejected_by
+    return update_instance(instance_id, **fields)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1326,73 +1292,57 @@ def list_relationships(
     return [_relationship_from_row(r) for r in rows]
 
 
-def upsert_relationship(
+def replace_relationships(
     database_name: str,
     schema_name: str,
-    from_table: str,
-    from_column: str,
-    to_table: str,
-    to_column: str,
-    status: str = "confirmed",
-    confidence: str = "name_match",
-    orphan_rate: Optional[float] = None,
-    sample_total: Optional[int] = None,
-    sample_orphans: Optional[int] = None,
-) -> SimpleNamespace:
-    """Insert or refresh one relationship candidate, keyed on
-    (database, schema, from_table, from_column, to_table, to_column). Callers
-    re-discovering a schema simply upsert every candidate again — no need to
-    diff against the previous run's rows first."""
-    existing_rows = sf_session.query(
-        """
-        SELECT ID FROM RELATIONSHIP_CATALOG
-        WHERE DATABASE_NAME = %(database_name)s AND SCHEMA_NAME = %(schema_name)s
-          AND FROM_TABLE = %(from_table)s AND FROM_COLUMN = %(from_column)s
-          AND TO_TABLE = %(to_table)s AND TO_COLUMN = %(to_column)s
-        """,
-        {
-            "database_name": database_name, "schema_name": schema_name,
-            "from_table": from_table, "from_column": from_column,
-            "to_table": to_table, "to_column": to_column,
-        },
+    rows: list[dict],
+) -> list[SimpleNamespace]:
+    """Replace the ENTIRE relationship catalog for one (database, schema) with a
+    fresh set, in 2 round-trips (one DELETE + one multi-row INSERT) instead of
+    3 per candidate. A discovery run always recomputes the full candidate set,
+    so delete-all-for-schema + insert-all is correct and far cheaper than
+    per-row upsert-diffing. Each row dict may carry: from_table, from_column,
+    to_table, to_column, status, confidence, orphan_rate, sample_total,
+    sample_orphans. Returns the freshly-stored rows."""
+    sf_session.execute(
+        "DELETE FROM RELATIONSHIP_CATALOG WHERE DATABASE_NAME = %(database_name)s AND SCHEMA_NAME = %(schema_name)s",
+        {"database_name": database_name, "schema_name": schema_name},
     )
-    params = {
-        "status": status, "confidence": confidence, "orphan_rate": orphan_rate,
-        "sample_total": sample_total, "sample_orphans": sample_orphans,
-    }
-    if existing_rows:
-        relationship_id = existing_rows[0]["ID"]
-        sf_session.execute(
-            """
-            UPDATE RELATIONSHIP_CATALOG
-            SET STATUS = %(status)s, CONFIDENCE = %(confidence)s, ORPHAN_RATE = %(orphan_rate)s,
-                SAMPLE_TOTAL = %(sample_total)s, SAMPLE_ORPHANS = %(sample_orphans)s,
-                LAST_VERIFIED_AT = CURRENT_TIMESTAMP()
-            WHERE ID = %(id)s
-            """,
-            {**params, "id": relationship_id},
+    if not rows:
+        return []
+
+    # One multi-row INSERT ... SELECT ... UNION ALL. Snowflake rejects function
+    # calls (CURRENT_TIMESTAMP()) inside a multi-row VALUES clause, so we use the
+    # SELECT form — same reason the single-row upsert above uses INSERT ... SELECT.
+    select_clauses = []
+    params: Dict[str, Any] = {"database_name": database_name, "schema_name": schema_name}
+    for i, r in enumerate(rows):
+        select_clauses.append(
+            f"SELECT %(id{i})s, %(database_name)s, %(schema_name)s, %(ft{i})s, %(fc{i})s, "
+            f"%(tt{i})s, %(tc{i})s, %(st{i})s, %(cf{i})s, %(orr{i})s, %(stot{i})s, %(sorp{i})s, "
+            f"CURRENT_TIMESTAMP()"
         )
-    else:
-        relationship_id = _new_id()
-        sf_session.execute(
-            """
-            INSERT INTO RELATIONSHIP_CATALOG
-                (ID, DATABASE_NAME, SCHEMA_NAME, FROM_TABLE, FROM_COLUMN, TO_TABLE, TO_COLUMN,
-                 STATUS, CONFIDENCE, ORPHAN_RATE, SAMPLE_TOTAL, SAMPLE_ORPHANS)
-            SELECT
-                %(id)s, %(database_name)s, %(schema_name)s, %(from_table)s, %(from_column)s,
-                %(to_table)s, %(to_column)s, %(status)s, %(confidence)s, %(orphan_rate)s,
-                %(sample_total)s, %(sample_orphans)s
-            """,
-            {
-                **params, "id": relationship_id,
-                "database_name": database_name, "schema_name": schema_name,
-                "from_table": from_table, "from_column": from_column,
-                "to_table": to_table, "to_column": to_column,
-            },
-        )
-    rows = sf_session.query("SELECT * FROM RELATIONSHIP_CATALOG WHERE ID = %(id)s", {"id": relationship_id})
-    return _relationship_from_row(rows[0])
+        params[f"id{i}"]   = _new_id()
+        params[f"ft{i}"]   = r.get("from_table")
+        params[f"fc{i}"]   = r.get("from_column")
+        params[f"tt{i}"]   = r.get("to_table")
+        params[f"tc{i}"]   = r.get("to_column")
+        params[f"st{i}"]   = r.get("status", "confirmed")
+        params[f"cf{i}"]   = r.get("confidence", "name_match")
+        params[f"orr{i}"]  = r.get("orphan_rate")
+        params[f"stot{i}"] = r.get("sample_total")
+        params[f"sorp{i}"] = r.get("sample_orphans")
+
+    sf_session.execute(
+        f"""
+        INSERT INTO RELATIONSHIP_CATALOG
+            (ID, DATABASE_NAME, SCHEMA_NAME, FROM_TABLE, FROM_COLUMN, TO_TABLE, TO_COLUMN,
+             STATUS, CONFIDENCE, ORPHAN_RATE, SAMPLE_TOTAL, SAMPLE_ORPHANS, LAST_VERIFIED_AT)
+        {' UNION ALL '.join(select_clauses)}
+        """,
+        params,
+    )
+    return list_relationships(database_name, schema_name)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1468,6 +1418,7 @@ def _agent_run_from_row(row: dict, tasks: Optional[list] = None) -> SimpleNamesp
         error_message=row["ERROR_MESSAGE"],
         created_at=row["CREATED_AT"],
         workflow_template_id=row.get("WORKFLOW_TEMPLATE_ID"),
+        schedule_id=row.get("SCHEDULE_ID"),
         tasks=tasks if tasks is not None else [],
     )
 
@@ -1496,16 +1447,17 @@ def create_agent_run(
     run_id: Optional[str] = None,
     connection_id: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
+    schedule_id: Optional[str] = None,
 ) -> SimpleNamespace:
     run_id = run_id or _new_id()
     sf_session.execute(
         """
         INSERT INTO AGENT_RUNS
             (ID, CONNECTION_ID, BATCH_ID, BATCH_INDEX, DATABASE_NAME, SCHEMA_NAME,
-             TABLE_NAME, STATUS, WORKFLOW_TEMPLATE_ID)
+             TABLE_NAME, STATUS, WORKFLOW_TEMPLATE_ID, SCHEDULE_ID)
         VALUES
             (%(id)s, %(connection_id)s, %(batch_id)s, %(batch_index)s, %(database)s,
-             %(schema_name)s, %(table)s, %(status)s, %(workflow_template_id)s)
+             %(schema_name)s, %(table)s, %(status)s, %(workflow_template_id)s, %(schedule_id)s)
         """,
         {
             "id": run_id,
@@ -1517,6 +1469,7 @@ def create_agent_run(
             "table": table,
             "status": status,
             "workflow_template_id": workflow_template_id,
+            "schedule_id": schedule_id,
         },
     )
     return get_agent_run(run_id)

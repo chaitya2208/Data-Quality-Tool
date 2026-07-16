@@ -137,16 +137,18 @@ def _discover(database: str, schema_name: str) -> List[Any]:
 
     row_counts = _fetch_row_counts(database, schema_name)
 
-    results: List[Any] = []
+    # Accumulate result dicts, then persist the whole catalog for this schema in
+    # ONE batch (delete-all-for-schema + one multi-row insert) instead of a
+    # 3-round-trip upsert per candidate. See storage.replace_relationships.
+    catalog_rows: List[dict] = []
     verified_count = 0
     for cand in candidates:
         if verified_count >= MAX_LIVE_VERIFICATIONS:
-            results.append(storage.upsert_relationship(
-                database_name=database, schema_name=schema_name,
-                from_table=cand["from_table"], from_column=cand["from_column"],
-                to_table=cand["to_table"], to_column=cand["to_column"],
-                status="confirmed", confidence="name_match_unverified",
-            ))
+            catalog_rows.append({
+                "from_table": cand["from_table"], "from_column": cand["from_column"],
+                "to_table": cand["to_table"], "to_column": cand["to_column"],
+                "status": "confirmed", "confidence": "name_match_unverified",
+            })
             continue
 
         # Type-compatibility gate — BEFORE the live orphan-rate join. A name
@@ -165,12 +167,11 @@ def _discover(database: str, schema_name: str) -> List[Any]:
                 f"{cand['from_table']}.{cand['from_column']} ({from_type}) -> "
                 f"{cand['to_table']}.{cand['to_column']} ({to_type}) — not a real FK"
             )
-            results.append(storage.upsert_relationship(
-                database_name=database, schema_name=schema_name,
-                from_table=cand["from_table"], from_column=cand["from_column"],
-                to_table=cand["to_table"], to_column=cand["to_column"],
-                status="rejected", confidence="type_mismatch",
-            ))
+            catalog_rows.append({
+                "from_table": cand["from_table"], "from_column": cand["from_column"],
+                "to_table": cand["to_table"], "to_column": cand["to_column"],
+                "status": "rejected", "confidence": "type_mismatch",
+            })
             continue
 
         orphan_result = _verify_orphan_rate(
@@ -183,13 +184,12 @@ def _discover(database: str, schema_name: str) -> List[Any]:
 
         orphan_rate, total, orphans = orphan_result
         status = "rejected" if orphan_rate >= ORPHAN_CONFIRM_THRESHOLD else "confirmed"
-        results.append(storage.upsert_relationship(
-            database_name=database, schema_name=schema_name,
-            from_table=cand["from_table"], from_column=cand["from_column"],
-            to_table=cand["to_table"], to_column=cand["to_column"],
-            status=status, confidence="verified",
-            orphan_rate=orphan_rate, sample_total=total, sample_orphans=orphans,
-        ))
+        catalog_rows.append({
+            "from_table": cand["from_table"], "from_column": cand["from_column"],
+            "to_table": cand["to_table"], "to_column": cand["to_column"],
+            "status": status, "confidence": "verified",
+            "orphan_rate": orphan_rate, "sample_total": total, "sample_orphans": orphans,
+        })
 
     if len(candidates) > MAX_LIVE_VERIFICATIONS:
         logger.info(
@@ -197,7 +197,8 @@ def _discover(database: str, schema_name: str) -> List[Any]:
             f"{len(candidates) - MAX_LIVE_VERIFICATIONS} candidates left as name_match_unverified"
         )
 
-    return results
+    # Persist the full recomputed catalog for this schema in one batch.
+    return storage.replace_relationships(database, schema_name, catalog_rows)
 
 
 _MIN_OWNER_RATIO = 0.5  # even the best-ranked table must be at least this unique to count as PK owner at all
@@ -218,21 +219,27 @@ def _resolve_pk_ownership_by_relative_uniqueness(
     ratios: Dict[str, List[tuple]] = {}  # column_name -> [(table, ratio)]
     for table, cols in pk_shaped_by_name.items():
         fqn = f"{database}.{schema_name}.{table}"
-        for col in cols:
-            try:
-                rows = sf_session.query(
-                    f"""
-                    SELECT COUNT(*) AS TOTAL, COUNT(DISTINCT {col}) AS DISTINCT_COUNT
-                    FROM {fqn} WHERE {col} IS NOT NULL
-                    """
-                )
-            except Exception as e:
-                logger.debug(f"[RelationshipDiscovery] Uniqueness check failed for {fqn}.{col}: {e}")
-                continue
-            if not rows:
-                continue
-            total = rows[0].get("TOTAL") or 0
-            distinct = rows[0].get("DISTINCT_COUNT") or 0
+        # One scan per TABLE instead of one per column: COUNT(*) plus a
+        # COUNT(DISTINCT col) for every PK-shaped column in this table, in a
+        # single query. Ratio = distinct / row_count (COUNT(DISTINCT) already
+        # ignores NULLs; row_count vs per-column non-null count preserves the
+        # cross-table ranking used to pick the PK owner).
+        select_terms = ["COUNT(*) AS TOTAL"]
+        col_aliases = []  # (original_col, alias)
+        for idx, col in enumerate(cols):
+            alias = f"D_{idx}"
+            select_terms.append(f"COUNT(DISTINCT {col}) AS {alias}")
+            col_aliases.append((col, alias))
+        try:
+            rows = sf_session.query(f"SELECT {', '.join(select_terms)} FROM {fqn}")
+        except Exception as e:
+            logger.debug(f"[RelationshipDiscovery] Uniqueness check failed for {fqn}: {e}")
+            continue
+        if not rows:
+            continue
+        total = rows[0].get("TOTAL") or 0
+        for col, alias in col_aliases:
+            distinct = rows[0].get(alias) or 0
             ratio = distinct / total if total else 0.0
             ratios.setdefault(col.upper(), []).append((table, ratio))
 

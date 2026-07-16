@@ -69,7 +69,6 @@ export default function AIFix() {
     staleTime: 5 * 60 * 1000, // cache for 5 min — avoid re-calling Claude on re-render
   })
 
-  const isLoading = loadingFindings || loadingRecommendations
 
   // Fast source-type lookup — resolves immediately from scan/connection data,
   // no Claude call. Drives whether to show Snowflake role/warehouse or the

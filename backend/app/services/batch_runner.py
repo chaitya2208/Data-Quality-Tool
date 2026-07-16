@@ -60,6 +60,8 @@ def run_batch(
     schema_name: Optional[str] = None,
     table: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
+    schedule_id: Optional[str] = None,
+    strict_connection: bool = False,
 ) -> Tuple[str, List]:
     """
     Expand the scope, create one pending AgentRun per target sharing a batch_id,
@@ -69,7 +71,7 @@ def run_batch(
     Raises ValueError for invalid scope input and propagates any error from
     scope enumeration (bad connection, unreachable source) to the caller.
     """
-    source = get_source(connection_id)
+    source = get_source(connection_id, strict=strict_connection)
     targets = expand_scope(source, scope, database, schema_name, table)
     if not targets:
         raise ValueError("No tables found for the selected scope")
@@ -86,6 +88,7 @@ def run_batch(
             batch_id=batch_id,
             batch_index=idx,
             workflow_template_id=workflow_template_id,
+            schedule_id=schedule_id,
         )
         storage.create_agent_tasks(run.id, DB_AGENT_ORDER)
         runs.append(storage.get_agent_run(run.id))

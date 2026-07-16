@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { findingsApi, agentRunsApi, rulesApi } from '../api/client'
-import type { DatabaseFindingSummary } from '../api/client'
 import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck } from 'lucide-react'
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip,
@@ -49,11 +48,6 @@ export default function Dashboard() {
     queryKey: ['agent-runs'],
     queryFn: () => agentRunsApi.list().then(r => r.data),
     staleTime: 30_000,  // don't refetch-and-flash 0 on every dashboard revisit
-  })
-
-  const { data: recentFindings } = useQuery({
-    queryKey: ['findings-recent', connId],
-    queryFn: () => findingsApi.list({ limit: 5, connection_id: connId ?? undefined }).then(r => r.data),
   })
 
   // Rules are global (not connection-scoped) — a rule definition applies across
@@ -463,56 +457,6 @@ export default function Dashboard() {
         )}
       </div>
 
-      {/* Recent Findings */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow">
-        <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
-          <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Recent Findings</h2>
-          <button
-            onClick={() => navigate('/findings')}
-            className="text-sm text-primary-600 hover:text-primary-800 font-medium"
-          >
-            View all →
-          </button>
-        </div>
-        <div className="divide-y divide-gray-100 dark:divide-gray-700">
-          {recentFindings?.findings.map(finding => (
-            <div key={finding.id} className="px-6 py-4 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
-              <div className="flex items-start gap-3">
-                <span className={`mt-0.5 inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold flex-shrink-0 ${
-                  finding.severity === 'critical' ? 'bg-red-100 text-red-800' :
-                  finding.severity === 'high'     ? 'bg-orange-100 text-orange-800' :
-                  finding.severity === 'medium'   ? 'bg-yellow-100 text-yellow-800' :
-                                                    'bg-blue-100 text-blue-800'
-                }`}>
-                  {finding.severity.toUpperCase()}
-                </span>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{finding.title}</p>
-                  <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5 font-mono truncate">
-                    {finding.context?.fqn}
-                  </p>
-                </div>
-                <span className="text-xs text-gray-400 dark:text-gray-400 flex-shrink-0">
-                  {new Date(finding.detected_at).toLocaleDateString()}
-                </span>
-              </div>
-            </div>
-          ))}
-          {!recentFindings?.findings.length && (
-            <div className="px-6 py-12 text-center">
-              <Database className="w-12 h-12 text-gray-200 mx-auto mb-3" />
-              <p className="text-gray-900 dark:text-gray-100 font-medium mb-1">No findings yet</p>
-              <p className="text-sm text-gray-400 dark:text-gray-400 mb-4">Scan a table to discover quality issues</p>
-              <button
-                onClick={() => navigate('/scanner')}
-                className="px-4 py-2 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700"
-              >
-                Scan Your First Table
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
     </div>
   )
 }

@@ -76,6 +76,9 @@ export interface Rule {
   updated_at: string;
   approved_at: string | null;
   rejected_at: string | null;
+  approved_by: string | null;
+  rejected_by: string | null;
+  source: string | null;   // 'user' (Add Rule) | 'claude' | 'deterministic' | 'system'
 }
 
 export interface RuleCreatePayload {
@@ -189,6 +192,8 @@ export interface RuleInstance {
   updated_at: string;
   approved_at: string | null;
   rejected_at: string | null;
+  approved_by: string | null;
+  rejected_by: string | null;
 }
 
 export interface RuleExecution {
@@ -553,6 +558,7 @@ export interface AgentRun {
   } | null;
   error_message: string | null;
   created_at: string;
+  schedule_id: string | null;  // set when the run was fired by a schedule
   tasks: AgentTask[];
 }
 
