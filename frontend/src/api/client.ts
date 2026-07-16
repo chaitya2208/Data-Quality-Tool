@@ -24,7 +24,34 @@ export interface Finding {
   evidence: any;
   detected_at: string;
   updated_at: string;
+  // Incident-lifecycle fields — populated by the scan finalizer.
+  first_detected_at?: string | null;
+  last_seen_at?: string | null;
+  last_scan_id?: string | null;
+  reopened_count?: number;
+  current_fail_count?: number | null;
+  current_total_count?: number | null;
+  fail_history?: { scan_id: string; at: string; fail_count: number; total_count: number; event?: string }[];
 }
+
+export interface Mute {
+  id: string;
+  instance_id: string;
+  asset_id: string;
+  muted_until: string;
+  reason: string | null;
+  muted_by: string | null;
+  created_at: string;
+}
+
+export const mutesApi = {
+  list: (params?: { instance_id?: string; asset_id?: string; active_only?: boolean }) =>
+    api.get<Mute[]>('/mutes', { params }),
+  create: (body: { instance_id: string; asset_id: string; duration_hours?: number; muted_until?: string; reason?: string }) =>
+    api.post<Mute>('/mutes', body),
+  remove: (mute_id: string) =>
+    api.delete(`/mutes/${mute_id}`),
+};
 
 export interface Scan {
   id: string;
@@ -338,6 +365,99 @@ export const profilingApi = {
     api.get<{ columns: ColumnMeta[] }>(`/profiling/columns/${database}/${schema}/${table}`, connParam(connectionId)),
   profile: (database: string, schema: string, table: string, connectionId?: string | null) =>
     api.post<TableProfile>(`/profiling/profile/${database}/${schema}/${table}`, null, connParam(connectionId)),
+};
+
+// Table Health API — per-table Data Health view for the Data Explorer tab.
+export type HealthDot = 'green' | 'amber' | 'red' | 'gray';
+
+export interface TableHealthRule {
+  instance_id: string;
+  definition_id: string;
+  name: string;
+  category: string | null;
+  check_kind: string | null;
+  severity: string;
+  columns: string[];
+  owner: string | null;
+  latest_status: string | null;
+  last_executed_at: string | null;
+  pass_count: number;
+  fail_count: number;
+  error_count: number;
+  total_runs: number;
+  pass_rate: number | null;
+  history: { status: string; at: string | null }[];
+  // Lifecycle enrichment — populated from the open finding if any.
+  first_detected_at: string | null;
+  reopened_count: number;
+  current_fail_count: number | null;
+  current_total_count: number | null;
+  open_finding_id: string | null;
+  muted: boolean;
+}
+
+export interface TableHealthHistoryPoint {
+  day: string;
+  passed: number;
+  failed: number;
+  error: number;
+  total: number;
+  pass_rate: number | null;
+}
+
+export interface TableHealthHistory {
+  days: number;
+  series: TableHealthHistoryPoint[];
+}
+
+export interface TableHealth {
+  database: string;
+  schema: string;
+  table: string;
+  asset_id: string | null;
+  health_score: number | null;
+  rules_total: number;
+  rules_failing: number;
+  rules_passing: number;
+  rules_unrun: number;
+  open_findings: number;
+  last_run_at: string | null;
+  column_status: Record<string, HealthDot>;
+  rules: TableHealthRule[];
+}
+
+export interface FleetTableRow {
+  database: string;
+  schema: string;
+  table: string;
+  runs: number;
+  passed: number;
+  failed: number;
+  error: number;
+  pass_rate: number | null;
+  open_findings: number;
+  flapping: number;
+  oldest_open_at: string | null;
+}
+
+export interface FleetOverview {
+  days: number;
+  overall_health_score: number | null;
+  fleet_open_findings: number;
+  fleet_flapping_findings: number;
+  fleet_oldest_open_at: string | null;
+  trend: TableHealthHistoryPoint[];
+  tables: FleetTableRow[];
+  tables_total: number;
+}
+
+export const tableHealthApi = {
+  get: (database: string, schema: string, table: string) =>
+    api.get<TableHealth>(`/table-health/${database}/${schema}/${table}`),
+  history: (database: string, schema: string, table: string, days = 30) =>
+    api.get<TableHealthHistory>(`/table-health/${database}/${schema}/${table}/history`, { params: { days } }),
+  fleet: (params?: { connection_id?: string; days?: number; top_n?: number }) =>
+    api.get<FleetOverview>('/table-health/fleet/overview', { params }),
 };
 
 // AI API

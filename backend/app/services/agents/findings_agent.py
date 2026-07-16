@@ -22,6 +22,7 @@ from typing import List, Dict, Any, Set, Optional
 
 from app.services import storage
 from app.services.rule_engine import RuleEngine
+from app.services.scan_finalizer import finalize_scan
 
 logger = logging.getLogger(__name__)
 
@@ -88,26 +89,33 @@ class FindingsAgent:
         # another run mid-scan. Rewriting the finding dict here avoids both.
         self._apply_severity_overrides(findings_data, severity_overrides)
 
-        # Log RULE_EXECUTIONS for every instance that actually ran
-        self._log_executions(findings_data, allowed_instance_ids, scan.id, run_id)
-
-        # Supersede any still-open findings from PRIOR scans for the same
-        # (asset, instance) targets we're about to re-create — re-running a
-        # workflow on a table otherwise leaves stale 'detected' twins from the
-        # old scan, so one real issue showed up in both Detected and Resolved.
-        storage.supersede_open_findings(
-            table_asset_id=table_asset.id,
-            instance_ids=allowed_instance_ids,
-            except_scan_id=scan.id,
+        # Log RULE_EXECUTIONS for every instance that actually ran (pass or fail).
+        # This is the durable "the check ran" audit trail — separate from
+        # incidents. Trend charts + rule-execution history feed off this.
+        executed_instance_ids = self._log_executions(
+            findings_data, allowed_instance_ids, scan.id, run_id,
         )
 
-        # Persist all findings
-        storage.create_findings_bulk(findings_data)
+        # Incident lifecycle: UPDATE / RESOLVE / REOPEN / CREATE per
+        # (instance, asset). Replaces the old supersede-then-bulk-insert flow.
+        # A finding is a persistent object across scans, not a per-run twin.
+        stats = finalize_scan(
+            scan_id=scan.id,
+            asset_id_for_passed=table_asset.id,
+            findings_data=findings_data,
+            executed_instance_ids=executed_instance_ids,
+        )
+        logger.info(f"[FindingsAgent] Lifecycle: {stats}")
+
+        # findings_count on SCANS reflects "open incidents involving this
+        # scan" — new + reopened + still-failing updates. Auto-resolved don't
+        # count as findings THIS scan created (they were pre-existing).
+        active_findings_count = stats["created"] + stats["reopened"] + stats["updated"]
 
         storage.update_scan(
             scan.id,
             rules_checked=len(allowed_instance_ids),
-            findings_count=len(findings_data),
+            findings_count=active_findings_count,
             status="completed",
             completed_at=datetime.utcnow(),
         )
@@ -164,22 +172,34 @@ class FindingsAgent:
     def _log_executions(
         self, findings_data: List[dict], allowed_instance_ids: Set[str],
         scan_id: str, run_id: Optional[str],
-    ) -> None:
+    ) -> Set[str]:
         """One RULE_EXECUTIONS row per instance that ran (python_handler or
         sql_template): FAILED if it produced at least one finding, PASSED
-        otherwise."""
+        otherwise. Returns the set of instance_ids that actually executed —
+        used by the finalizer to identify the PASS set (executed - failed)."""
         failed_ids = {fd.get("instance_id") for fd in findings_data if fd.get("instance_id")}
+        executed: Set[str] = set()
         for instance_id in allowed_instance_ids:
             instance = storage.get_instance(instance_id)
             if not instance:
                 continue
             definition = storage.get_definition(instance.definition_id)
             if not definition or definition.check_kind not in ("python_handler", "sql_template"):
-                continue  # not actually executed this pass
+                continue
             if definition.check_kind == "python_handler" and not definition.handler_key:
                 continue
             status = "failed" if instance_id in failed_ids else "passed"
+            evidence = None
+            if status == "failed":
+                # Attach the evidence contract so RULE_EXECUTIONS carries
+                # fail_count/total_count for trend charts without needing a
+                # join back to FINDINGS.
+                fd = next((f for f in findings_data if f.get("instance_id") == instance_id), None)
+                if fd:
+                    evidence = fd.get("evidence")
             storage.create_execution(
                 instance_id=instance_id, status=status,
-                scan_id=scan_id, run_id=run_id,
+                scan_id=scan_id, run_id=run_id, evidence=evidence,
             )
+            executed.add(instance_id)
+        return executed

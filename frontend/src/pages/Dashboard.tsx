@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { findingsApi, agentRunsApi } from '../api/client'
-import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table } from 'lucide-react'
+import { findingsApi, agentRunsApi, tableHealthApi } from '../api/client'
+import type { FleetOverview } from '../api/client'
+import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck, RotateCcw, TrendingUp } from 'lucide-react'
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip,
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
+  LineChart, Line,
 } from 'recharts'
 import { useTheme } from '../ThemeContext'
 import { useConnection } from '../ConnectionContext'
@@ -48,6 +50,17 @@ export default function Dashboard() {
     queryKey: ['agent-runs'],
     queryFn: () => agentRunsApi.list().then(r => r.data),
     staleTime: 30_000,  // don't refetch-and-flash 0 on every dashboard revisit
+  })
+
+  // Fleet-wide health aggregation — powers the KPI row + worst-tables list +
+  // 30-day trend line. Scoped to the selected connection just like everything
+  // else on this page.
+  const { data: fleet, isLoading: loadingFleet } = useQuery({
+    queryKey: ['fleet-health', connId, 30],
+    queryFn: () => tableHealthApi.fleet({
+      connection_id: connId || undefined, days: 30, top_n: 8,
+    }).then(r => r.data),
+    staleTime: 60_000,
   })
 
   // Workflow-run count scoped to the selected source. NULL-connection (legacy)
@@ -170,6 +183,43 @@ export default function Dashboard() {
         <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           loading={loadingStats} />
         <StatCard title="Pending Issues"   value={stats?.by_status?.detected ?? 0} icon={Clock}       color="bg-yellow-500" href="/findings?status=detected" loading={loadingStats} />
         <StatCard title="Workflow Runs"    value={scopedRuns.length}               icon={CheckCircle} color="bg-green-500"  href="/run-history"        loading={loadingRuns} />
+      </div>
+
+      {/* ── Fleet Health KPI row ─────────────────────────────────────────
+          Overall pass-rate across every rule execution on every table in
+          the last 30 days; open + flapping incident counts across the
+          fleet; oldest currently-open incident. */}
+      <FleetHealthKpis fleet={fleet} loading={loadingFleet} />
+
+      {/* ── Overall trend + Worst tables ─────────────────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-2 bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <TrendingUp className="w-4 h-4 text-primary-600" />
+            <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet health trend — last 30 days</h2>
+            <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">pass-rate % · failed runs</span>
+          </div>
+          <FleetTrendChart fleet={fleet} axisColor={axisColor} gridColor={gridColor} loading={loadingFleet} />
+        </div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <AlertCircle className="w-4 h-4 text-red-500" />
+            <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Worst tables</h2>
+            <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">click to drill in</span>
+          </div>
+          <WorstTablesList
+            fleet={fleet} loading={loadingFleet}
+            onOpen={(db, sc, tb) => {
+              // Persist the drill-down so DataExplorer opens with the right selection.
+              try {
+                localStorage.setItem('dq_explorer_db', db)
+                localStorage.setItem('dq_explorer_schema', sc)
+                localStorage.setItem('dq_explorer_table', tb)
+              } catch {}
+              navigate('/explorer')
+            }}
+          />
+        </div>
       </div>
 
       {/* ── Database / Table issues chart ── */}
@@ -371,5 +421,157 @@ export default function Dashboard() {
       </div>
 
     </div>
+  )
+}
+
+// ── Fleet Health components ─────────────────────────────────────────────
+
+function healthTone(score: number | null | undefined): string {
+  if (score == null) return 'text-gray-400'
+  if (score >= 0.95) return 'text-green-600'
+  if (score >= 0.8)  return 'text-amber-600'
+  return 'text-red-600'
+}
+
+function fmtDaysAgo(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
+  if (s < 3600)  return 'today'
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`
+  return `${Math.round(s / 86400)}d ago`
+}
+
+function FleetKpiTile({
+  icon: Icon, label, value, tone,
+}: { icon: React.ComponentType<{ className?: string }>; label: string; value: React.ReactNode; tone?: string }) {
+  return (
+    <div className="flex-1 min-w-[10rem] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3">
+      <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-gray-400 dark:text-gray-400">
+        <Icon className="w-3.5 h-3.5" />
+        {label}
+      </div>
+      <div className={`mt-1 text-2xl font-bold tabular-nums ${tone ?? 'text-gray-900 dark:text-gray-100'}`}>{value}</div>
+    </div>
+  )
+}
+
+function FleetHealthKpis({ fleet, loading }: { fleet: FleetOverview | undefined; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="flex flex-wrap gap-3">
+        {[0, 1, 2, 3].map(i => (
+          <div key={i} className="flex-1 min-w-[10rem] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3">
+            <div className="h-3 w-20 rounded bg-gray-100 dark:bg-gray-700 animate-pulse" />
+            <div className="mt-2 h-6 w-24 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+          </div>
+        ))}
+      </div>
+    )
+  }
+  const score = fleet?.overall_health_score ?? null
+  return (
+    <div className="flex flex-wrap gap-3">
+      <FleetKpiTile icon={ShieldCheck} label="Fleet health score"
+        value={score == null ? '—' : `${Math.round(score * 100)}%`}
+        tone={healthTone(score)} />
+      <FleetKpiTile icon={AlertCircle} label="Open incidents"
+        value={(fleet?.fleet_open_findings ?? 0).toLocaleString()}
+        tone={(fleet?.fleet_open_findings ?? 0) > 0 ? 'text-red-600' : 'text-green-600'} />
+      <FleetKpiTile icon={RotateCcw} label="Flapping incidents"
+        value={(fleet?.fleet_flapping_findings ?? 0).toLocaleString()}
+        tone={(fleet?.fleet_flapping_findings ?? 0) > 0 ? 'text-amber-600' : undefined} />
+      <FleetKpiTile icon={Clock} label="Oldest open"
+        value={fmtDaysAgo(fleet?.fleet_oldest_open_at)}
+        tone={fleet?.fleet_oldest_open_at ? 'text-red-600' : undefined} />
+    </div>
+  )
+}
+
+function FleetTrendChart({
+  fleet, axisColor, gridColor, loading,
+}: { fleet: FleetOverview | undefined; axisColor: string; gridColor: string; loading: boolean }) {
+  if (loading) {
+    return <div className="h-[180px] rounded bg-gray-50 dark:bg-gray-700/40 animate-pulse" />
+  }
+  const series = fleet?.trend ?? []
+  if (series.length === 0) {
+    return <div className="h-[180px] flex items-center justify-center text-sm text-gray-400 dark:text-gray-400">No execution history in the last 30 days.</div>
+  }
+  const points = series.map(p => ({
+    day: p.day,
+    passRate: p.pass_rate === null ? null : Math.round(p.pass_rate * 100),
+    failed: (p.failed ?? 0) + (p.error ?? 0),
+  }))
+  return (
+    <div style={{ width: '100%', height: 200 }}>
+      <ResponsiveContainer>
+        <LineChart data={points} margin={{ top: 5, right: 20, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+          <XAxis dataKey="day" tick={{ fontSize: 10, fill: axisColor }} />
+          <YAxis yAxisId="left"  domain={[0, 100]} tick={{ fontSize: 10, fill: axisColor }} />
+          <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 10, fill: axisColor }} />
+          <Tooltip contentStyle={{ fontSize: 12 }} />
+          <Line yAxisId="left"  type="monotone" dataKey="passRate" stroke="#16a34a" strokeWidth={2} dot={false} name="Pass rate %" />
+          <Line yAxisId="right" type="monotone" dataKey="failed"   stroke="#dc2626" strokeWidth={2} dot={false} name="Failed runs" />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+function WorstTablesList({
+  fleet, loading, onOpen,
+}: {
+  fleet: FleetOverview | undefined
+  loading: boolean
+  onOpen: (db: string, sc: string, tb: string) => void
+}) {
+  if (loading) {
+    return (
+      <div className="space-y-2">
+        {[0, 1, 2, 3].map(i => (
+          <div key={i} className="h-10 rounded bg-gray-50 dark:bg-gray-700/40 animate-pulse" />
+        ))}
+      </div>
+    )
+  }
+  const tables = fleet?.tables ?? []
+  if (tables.length === 0) {
+    return <div className="text-sm text-gray-400 dark:text-gray-400">No tables with executions yet.</div>
+  }
+  return (
+    <ul className="space-y-1.5">
+      {tables.map(t => {
+        const key = `${t.database}.${t.schema}.${t.table}`
+        const pr = t.pass_rate == null ? null : Math.round(t.pass_rate * 100)
+        return (
+          <li key={key}>
+            <button
+              onClick={() => onOpen(t.database, t.schema, t.table)}
+              className="w-full flex items-center justify-between gap-2 text-left px-2.5 py-1.5 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-gray-800 dark:text-gray-200 truncate" title={key}>{t.table}</div>
+                <div className="text-[11px] text-gray-400 dark:text-gray-400 truncate">{t.database}.{t.schema}</div>
+              </div>
+              <div className="flex items-center gap-3 flex-shrink-0">
+                {t.open_findings > 0 && (
+                  <span className="text-xs font-semibold text-red-600">{t.open_findings} open</span>
+                )}
+                {t.flapping > 0 && (
+                  <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 inline-flex items-center gap-0.5">
+                    <RotateCcw className="w-2.5 h-2.5" />{t.flapping}
+                  </span>
+                )}
+                {pr != null && (
+                  <span className={`text-xs font-medium tabular-nums ${pr >= 95 ? 'text-green-600' : pr >= 80 ? 'text-amber-600' : 'text-red-600'}`}>{pr}%</span>
+                )}
+                <ChevronRight className="w-3.5 h-3.5 text-gray-300" />
+              </div>
+            </button>
+          </li>
+        )
+      })}
+    </ul>
   )
 }

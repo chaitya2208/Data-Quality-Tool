@@ -36,6 +36,16 @@ class FindingResponse(FindingBase):
     closed_at: Optional[datetime] = None
     updated_at: datetime
 
+    # Incident-lifecycle fields — populated by the new scan finalizer. Older
+    # rows are backfilled at migration time; new rows always have these.
+    first_detected_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    last_scan_id: Optional[str] = None
+    reopened_count: Optional[int] = 0
+    current_fail_count: Optional[int] = None
+    current_total_count: Optional[int] = None
+    fail_history: Optional[List[Dict[str, Any]]] = None
+
     class Config:
         from_attributes = True
 

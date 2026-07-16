@@ -148,8 +148,13 @@ function RunModal({
         connection_id: selectedId,
         workflow_template_id: workflow.id,
       }),
-    onSuccess: () => {
-      navigate('/workflow')
+    onSuccess: (res) => {
+      // Pass the freshly-created run id so AgentWorkflow lands on the live
+      // run instead of appearing idle (its two active-run discovery paths
+      // are ?run_id=… and the dq_active_run_id localStorage entry — writing
+      // the URL param is enough here).
+      const firstRunId = res?.data?.runs?.[0]?.id
+      navigate(firstRunId ? `/workflow?run_id=${firstRunId}` : '/workflow')
       onClose()
     },
   })

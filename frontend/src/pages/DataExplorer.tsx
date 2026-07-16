@@ -1,12 +1,15 @@
 import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { assetsApi, profilingApi } from '../api/client'
-import type { ColumnMeta, TableProfile, TopValue, ColumnProfile } from '../api/client'
+import { assetsApi, profilingApi, tableHealthApi } from '../api/client'
+import type { ColumnMeta, TableProfile, TopValue, ColumnProfile, HealthDot } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import {
   Database, Table2, Columns3, BarChart3, Loader2, ChevronRight,
-  KeyRound, Hash, AlertCircle,
+  KeyRound, Hash, AlertCircle, ShieldCheck,
 } from 'lucide-react'
+import DataHealthPanel, { ColumnStatusDot } from './DataHealthPanel'
+
+type ExplorerTab = 'overview' | 'stats' | 'health'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -313,6 +316,7 @@ export default function DataExplorer() {
   const [profile, setProfile] = useState<TableProfile | null>(
     () => profileCache.get(fqnKey(selectedDatabase, selectedSchema, selectedTable)) ?? null
   )
+  const [tab, setTab] = useState<ExplorerTab>('overview')
 
   const { selectedId: connId } = useConnection()
 
@@ -359,6 +363,16 @@ export default function DataExplorer() {
     staleTime: 5 * 60 * 1000,
   })
   const columns: ColumnMeta[] = columnsData?.columns ?? []
+
+  // Shared with DataHealthPanel via matching queryKey (react-query dedupes).
+  // Powers the per-column status dots on the Overview columns table.
+  const { data: health } = useQuery({
+    queryKey: ['table-health', selectedDatabase, selectedSchema, selectedTable],
+    queryFn: () => tableHealthApi.get(selectedDatabase!, selectedSchema!, selectedTable!).then(r => r.data),
+    enabled: !!selectedDatabase && !!selectedSchema && !!selectedTable,
+    staleTime: 30 * 1000,
+  })
+  const columnStatus: Record<string, HealthDot> = health?.column_status ?? {}
 
   const profileMutation = useMutation({
     mutationFn: () => profilingApi.profile(selectedDatabase!, selectedSchema!, selectedTable!, connId).then(r => r.data),
@@ -426,25 +440,75 @@ export default function DataExplorer() {
         />
       </div>
 
-      {/* ── Profile progress / results — rendered ABOVE the columns table so the
-            user sees status without scrolling ─────────────────────────────── */}
-      {selectedTable && profileMutation.isPending && (
+      {/* Tab bar — only meaningful once a table is picked */}
+      {selectedTable && (
+        <div className="flex items-center gap-1 border-b border-gray-200 dark:border-gray-700">
+          {([
+            { id: 'overview', label: 'Overview', icon: Table2 },
+            { id: 'stats',    label: 'Column Stats', icon: BarChart3 },
+            { id: 'health',   label: 'Data Health', icon: ShieldCheck,
+              badge: health && health.rules_failing > 0 ? health.rules_failing : undefined },
+          ] as const).map(t => {
+            const Icon = t.icon
+            const active = tab === t.id
+            return (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id as ExplorerTab)}
+                className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+                  active
+                    ? 'border-primary-500 text-primary-700 dark:text-primary-300'
+                    : 'border-transparent text-gray-500 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100'
+                }`}
+              >
+                <Icon className="w-4 h-4" />
+                {t.label}
+                {'badge' in t && t.badge !== undefined && (
+                  <span className="ml-1 text-xs font-semibold px-1.5 py-0.5 rounded-full bg-red-100 text-red-700">{t.badge}</span>
+                )}
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {/* ── Column Stats tab — profile progress / results ─────────────────── */}
+      {selectedTable && tab === 'stats' && profileMutation.isPending && (
         <ProfileProgressBar tableName={selectedTable} columnCount={columns.length} />
       )}
 
-      {selectedTable && profileMutation.isError && !profileMutation.isPending && (
+      {selectedTable && tab === 'stats' && profileMutation.isError && !profileMutation.isPending && (
         <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-500/40 rounded-xl px-5 py-3 text-sm text-red-700 dark:text-red-300 flex items-center gap-2">
           <AlertCircle className="w-4 h-4" />
           Profiling failed: {(profileMutation.error as any)?.response?.data?.detail ?? (profileMutation.error as Error).message}
         </div>
       )}
 
-      {profile && !profileMutation.isPending && selectedTable && (
+      {selectedTable && tab === 'stats' && profile && !profileMutation.isPending && (
         <ColumnStatsPanel tableName={selectedTable} profile={profile} />
       )}
 
-      {/* Table overview: meta strip + columns table */}
-      {selectedTable && (
+      {selectedTable && tab === 'stats' && !profile && !profileMutation.isPending && (
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-8 text-center">
+          <BarChart3 className="w-10 h-10 text-gray-200 mx-auto mb-3" />
+          <p className="text-gray-900 dark:text-gray-100 font-medium mb-1">No profile yet</p>
+          <p className="text-sm text-gray-400 mb-4">Run profiling to see null %, distinct counts, ranges, and top values.</p>
+          <button
+            onClick={() => profileMutation.mutate()}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 transition-colors"
+          >
+            <BarChart3 className="w-4 h-4" />Profile this table
+          </button>
+        </div>
+      )}
+
+      {/* ── Data Health tab ────────────────────────────────────────────────── */}
+      {selectedTable && tab === 'health' && (
+        <DataHealthPanel database={selectedDatabase!} schema={selectedSchema!} table={selectedTable} />
+      )}
+
+      {/* ── Overview tab: meta strip + columns table ──────────────────────── */}
+      {selectedTable && tab === 'overview' && (
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
           <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100 dark:border-gray-700">
             <div className="flex items-center gap-2 min-w-0">
@@ -483,7 +547,12 @@ export default function DataExplorer() {
                   <tbody className="divide-y divide-gray-50 dark:divide-gray-700/50">
                     {columns.map(c => (
                       <tr key={c.column_name} className="hover:bg-gray-50 dark:hover:bg-gray-700/40">
-                        <td className="py-2.5 pr-4 font-medium text-gray-800 dark:text-gray-200">{c.column_name}</td>
+                        <td className="py-2.5 pr-4 font-medium text-gray-800 dark:text-gray-200">
+                          <span className="inline-flex items-center gap-2">
+                            <ColumnStatusDot status={columnStatus[c.column_name]} />
+                            {c.column_name}
+                          </span>
+                        </td>
                         <td className="py-2.5 px-4 text-gray-500 dark:text-gray-300 font-mono text-xs">{c.data_type}</td>
                         <td className="py-2.5 px-4">
                           {c.is_nullable

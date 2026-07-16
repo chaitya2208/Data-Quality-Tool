@@ -205,11 +205,23 @@ class ScanService:
                 table_asset, column_assets, scan.id
             )
 
-            # Persist findings
-            for finding_data in findings_data:
-                storage.create_finding(**finding_data)
+            # Persist findings through the incident-lifecycle finalizer so
+            # this legacy path stays consistent with the agentic workflow —
+            # no more raw create_finding twins. We only know the FAILED
+            # instance ids here (legacy path doesn't track "which rules ran"
+            # end-to-end), so pass those as the executed set — auto-resolve
+            # is limited to instances that failed-then-passed, which never
+            # happens in a single call: safe.
+            from app.services.scan_finalizer import finalize_scan
+            failed_iids = {fd.get("instance_id") for fd in findings_data if fd.get("instance_id")}
+            stats = finalize_scan(
+                scan_id=scan.id,
+                asset_id_for_passed=table_asset.id,
+                findings_data=findings_data,
+                executed_instance_ids=failed_iids,
+            )
+            active_findings_count = stats["created"] + stats["reopened"] + stats["updated"]
 
-            # Update scan status
             active_table_rules  = len(self.rule_engine.get_active_rules("table"))
             active_column_rules = len(self.rule_engine.get_active_rules("column"))
             scan = storage.update_scan(
@@ -217,7 +229,7 @@ class ScanService:
                 status="completed",
                 completed_at=datetime.utcnow(),
                 rules_checked=active_table_rules + active_column_rules * len(column_assets),
-                findings_count=len(findings_data),
+                findings_count=active_findings_count,
             )
 
             logger.info(f"Scan completed successfully. Found {len(findings_data)} issues.")

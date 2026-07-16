@@ -58,9 +58,13 @@ def not_null_sql(database_name: str, schema_name: str, table_name: str, column_n
 def uniqueness_sql(database_name: str, schema_name: str, table_name: str, column_name: str) -> str:
     table = _fqn(database_name, schema_name, table_name)
     col = _safe_identifier(column_name)
+    # FAILED_COUNT must be rows-in-duplicate-groups, NOT the number of
+    # duplicate groups — otherwise "1 of 15 fail" is reported when a single
+    # duplicated value covers 15 rows, and the sample-rows SELECT (which
+    # returns rows) disagrees with the count.
     return (
         "SELECT\n"
-        "    COUNT(*) AS FAILED_COUNT,\n"
+        f"    COALESCE(SUM(CNT), 0) AS FAILED_COUNT,\n"
         f"    (SELECT COUNT(*) FROM {table}) AS TOTAL_COUNT\n"
         "FROM (\n"
         f"    SELECT {col}, COUNT(*) AS CNT\n"
@@ -145,9 +149,10 @@ def duplicate_key_sql(
     cols = [_safe_identifier(c) for c in columns]
     col_list = ", ".join(cols)
     not_null = " AND ".join(f"{c} IS NOT NULL" for c in cols)
+    # FAILED_COUNT is rows-in-duplicate-groups (same reason as uniqueness_sql).
     return (
         "SELECT\n"
-        "    COUNT(*) AS FAILED_COUNT,\n"
+        f"    COALESCE(SUM(CNT), 0) AS FAILED_COUNT,\n"
         f"    (SELECT COUNT(*) FROM {table}) AS TOTAL_COUNT\n"
         "FROM (\n"
         f"    SELECT {col_list}, COUNT(*) AS CNT\n"
@@ -248,6 +253,104 @@ def _normalize_threshold_config(threshold_config: dict[str, Any]) -> dict[str, A
         elif alias in out:
             out.pop(alias)  # canonical already present, drop the alias
     return out
+
+
+def failing_rows_sample_sql(
+    shape: str,
+    database_name: str,
+    schema_name: str,
+    table_name: str,
+    target_config: dict[str, Any],
+    threshold_config: Optional[dict[str, Any]] = None,
+    limit: int = 10,
+) -> Optional[str]:
+    """Return a SELECT that yields up to `limit` failing rows for the given
+    template shape — used to fetch evidence.sample_rows so findings can show
+    concrete violating data. Returns None for shapes where "failing rows"
+    isn't meaningful (freshness is aggregate; referential_integrity's failing
+    rows live in the primary table but the cross-table shape here already
+    covers it).
+
+    Uses the same predicate as the count SQL, so numbers and samples agree.
+    """
+    threshold_config = _normalize_threshold_config(threshold_config or {})
+    table = _fqn(database_name, schema_name, table_name)
+    n = max(1, int(limit))
+
+    if shape == "not_null":
+        col = _safe_identifier(target_config["column"])
+        return f"SELECT * FROM {table} WHERE {col} IS NULL LIMIT {n}"
+
+    if shape == "uniqueness":
+        col = _safe_identifier(target_config["column"])
+        return (
+            f"SELECT * FROM {table} WHERE {col} IN (\n"
+            f"  SELECT {col} FROM {table} WHERE {col} IS NOT NULL\n"
+            f"  GROUP BY {col} HAVING COUNT(*) > 1\n"
+            f") LIMIT {n}"
+        )
+
+    if shape == "accepted_values":
+        col = _safe_identifier(target_config["column"])
+        values = threshold_config.get("accepted_values") or []
+        if not values:
+            return None
+        values_sql = _quoted_list(values)
+        return (
+            f"SELECT * FROM {table} "
+            f"WHERE {col} IS NOT NULL AND {col} NOT IN ({values_sql}) LIMIT {n}"
+        )
+
+    if shape == "range":
+        col = _safe_identifier(target_config["column"])
+        min_value = threshold_config.get("min_value")
+        max_value = threshold_config.get("max_value")
+        predicates = []
+        if min_value is not None:
+            predicates.append(f"{col} < {float(min_value)}")
+        if max_value is not None:
+            predicates.append(f"{col} > {float(max_value)}")
+        if not predicates:
+            return None
+        return (
+            f"SELECT * FROM {table} "
+            f"WHERE {col} IS NOT NULL AND ({' OR '.join(predicates)}) LIMIT {n}"
+        )
+
+    if shape == "regex_match":
+        col = _safe_identifier(target_config["column"])
+        pattern = threshold_config.get("pattern") or ""
+        escaped = pattern.replace("\\", "\\\\").replace("'", "''")
+        return (
+            f"SELECT * FROM {table} "
+            f"WHERE {col} IS NOT NULL AND NOT REGEXP_LIKE({col}, '{escaped}') LIMIT {n}"
+        )
+
+    if shape == "duplicate_key":
+        cols = [_safe_identifier(c) for c in target_config.get("columns", [])]
+        if not cols:
+            return None
+        col_list = ", ".join(cols)
+        not_null = " AND ".join(f"{c} IS NOT NULL" for c in cols)
+        return (
+            f"SELECT * FROM {table} t WHERE ({col_list}) IN (\n"
+            f"  SELECT {col_list} FROM {table} WHERE {not_null}\n"
+            f"  GROUP BY {col_list} HAVING COUNT(*) > 1\n"
+            f") LIMIT {n}"
+        )
+
+    if shape == "referential_integrity":
+        col = _safe_identifier(target_config["column"])
+        ref = _fqn(target_config["ref_database"], target_config["ref_schema"], target_config["ref_table"])
+        ref_col = _safe_identifier(target_config["ref_column"])
+        return (
+            f"SELECT * FROM {table} t "
+            f"WHERE t.{col} IS NOT NULL AND NOT EXISTS "
+            f"(SELECT 1 FROM {ref} r WHERE r.{ref_col} = t.{col}) LIMIT {n}"
+        )
+
+    # freshness is aggregate — nothing to sample.
+    return None
 
 
 def render_template(

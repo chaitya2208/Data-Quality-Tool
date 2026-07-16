@@ -684,7 +684,12 @@ class WorkflowCoordinator:
                 severity_overrides=severity_overrides,
                 run_id=run.id,
             )
-            storage.update_agent_run(self.run_id, findings_count=len(findings))
+            # len(findings) is CREATED-only under the new lifecycle
+            # (list_findings_by_scan filters on SCAN_ID, which for UPDATE /
+            # REOPEN branches still points at the original scan). Read the
+            # authoritative count FindingsAgent just wrote onto SCANS instead.
+            active_count = getattr(storage.get_scan(scan.id), "findings_count", None) or len(findings)
+            storage.update_agent_run(self.run_id, findings_count=active_count)
 
             sev_breakdown = {}
             fired_instance_ids = set()  # instances that produced at least one finding
@@ -932,9 +937,13 @@ class WorkflowCoordinator:
                 severity_overrides={},
                 run_id=run.id,
             )
-            storage.update_agent_run(self.run_id, findings_count=len(findings))
+            # See sibling comment above: len(findings) is CREATED-only under
+            # the incident lifecycle — use SCANS.findings_count (created +
+            # reopened + updated) for the true active-incident count.
+            active_count = getattr(storage.get_scan(scan.id), "findings_count", None) or len(findings)
+            storage.update_agent_run(self.run_id, findings_count=active_count)
             self._complete_task(findings_task, output={
-                "findings_count": len(findings),
+                "findings_count": active_count,
                 "rules_applied": len(approved_instance_ids),
                 "patterns_skipped": len(skipped_patterns),
                 "skipped_reasons": skipped_patterns,

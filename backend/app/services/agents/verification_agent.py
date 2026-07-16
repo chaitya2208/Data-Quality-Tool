@@ -200,10 +200,13 @@ class VerificationAgent:
             )
 
             if not still_firing_now and rule_was_checked:
+                # Route through the lifecycle helper so LAST_SCAN_ID + audit
+                # trail stay consistent with scan-time RESOLVE (this used to
+                # bypass it and leave a stale LAST_SCAN_ID pointing at the
+                # scan that ORIGINALLY detected the finding).
+                storage.auto_resolve_finding(finding.id, scan_id="__verification__")
                 storage.update_finding(
                     finding.id,
-                    status="resolved",
-                    resolved_at=datetime.utcnow(),
                     resolution_notes="Auto-resolved by verification scan — rule no longer fires on current schema.",
                 )
                 newly_resolved += 1

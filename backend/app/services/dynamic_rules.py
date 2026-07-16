@@ -247,7 +247,16 @@ def _finding(
     """Build a finding dict from a rule-shape object. instance_id is left as
     None here — the caller (run_dynamic_checks) fills it from the
     handler_key → approved-instance-id map so the finding wires back to a
-    per-table approved instance, not to a (no-longer-existing) global one."""
+    per-table approved instance, not to a (no-longer-existing) global one.
+
+    Normalizes evidence to the standard contract — {fail_count, total_count,
+    sample_rows} — so the incident lifecycle can rely on those keys.
+    Dynamic checks are metadata-shape audits (no failing rows), so counts
+    default to 1/1 and sample_rows to []."""
+    ev = dict(evidence or {})
+    ev.setdefault("fail_count", 1)
+    ev.setdefault("total_count", 1)
+    ev.setdefault("sample_rows", [])
     return {
         "asset_id": asset_id,
         "scan_id": scan_id,
@@ -257,7 +266,7 @@ def _finding(
         "severity": rule.severity,
         "status": "detected",
         "context": context,
-        "evidence": evidence,
+        "evidence": ev,
     }
 
 

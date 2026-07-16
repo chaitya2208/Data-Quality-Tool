@@ -2,12 +2,13 @@ import { useState, useMemo, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { findingsApi, rulesApi } from '../api/client'
-import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck, ChevronDown, ChevronRight, BrainCircuit, TableIcon } from 'lucide-react'
+import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck, ChevronDown, ChevronRight, BrainCircuit, TableIcon, PanelRightOpen } from 'lucide-react'
 import { useConnection } from '../ConnectionContext'
+import FindingDetailDrawer, { FailCountSparkline } from './FindingDetailDrawer'
 
 // ── Finding card ──────────────────────────────────────────────────────────────
 
-function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter, ruleFilter, rulesData, sevColor, stColor }: any) {
+function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter, ruleFilter, rulesData, sevColor, stColor, onOpenDetail }: any) {
   const [showSamples, setShowSamples] = useState(false)
 
   const ai = finding.evidence?.ai_explanation
@@ -152,6 +153,45 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
             </div>
           )}
 
+          {/* Incident-lifecycle strip: how long has this been broken, current
+              row-count trend, and a fail-count sparkline for the last N runs.
+              Always rendered so the "Details" affordance is discoverable even
+              for findings that predate the lifecycle columns (they'll just
+              show a Details button and no lifecycle chips). */}
+          {(
+            <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+              {finding.first_detected_at && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 border border-red-100 dark:border-red-800/40">
+                  Failing since {new Date(finding.first_detected_at).toLocaleDateString()}
+                </span>
+              )}
+              {finding.current_fail_count != null && finding.current_total_count != null && (
+                <span className="inline-flex items-center gap-1 text-gray-700 dark:text-gray-300 font-medium tabular-nums">
+                  {finding.current_fail_count.toLocaleString()} / {finding.current_total_count.toLocaleString()} rows failing
+                  {finding.current_total_count > 0 && (
+                    <span className="text-red-600 dark:text-red-400 ml-1">({((finding.current_fail_count / finding.current_total_count) * 100).toFixed(1)}%)</span>
+                  )}
+                </span>
+              )}
+              {(finding.fail_history?.length ?? 0) > 1 && (
+                <FailCountSparkline history={finding.fail_history} />
+              )}
+              {finding.reopened_count > 0 && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                  Flapping · reopened {finding.reopened_count}×
+                </span>
+              )}
+              <button
+                onClick={() => onOpenDetail?.(finding)}
+                className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/40"
+                title="Open detail drawer — full history, samples, mute"
+              >
+                <PanelRightOpen className="w-3 h-3" />
+                Details
+              </button>
+            </div>
+          )}
+
           <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500 dark:text-gray-300">
             {finding.context?.fqn && (
               <span className="font-mono bg-gray-50 dark:bg-gray-900 px-2 py-1 rounded border border-gray-200 dark:border-gray-700">
@@ -159,9 +199,15 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
               </span>
             )}
             <span className="flex items-center">
-              <span className="text-gray-400 dark:text-gray-400 mr-1">Detected:</span>
-              {new Date(finding.detected_at).toLocaleString()}
+              <span className="text-gray-400 dark:text-gray-400 mr-1">First seen:</span>
+              {new Date(finding.first_detected_at ?? finding.detected_at).toLocaleString()}
             </span>
+            {finding.last_seen_at && (
+              <span className="flex items-center">
+                <span className="text-gray-400 dark:text-gray-400 mr-1">Last seen:</span>
+                {new Date(finding.last_seen_at).toLocaleString()}
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -196,6 +242,7 @@ export default function Findings() {
   const urlDatabase  = searchParams.get('database')   || ''
 
   const [selectedFindings, setSelectedFindings] = useState<string[]>([])
+  const [detailFinding, setDetailFinding] = useState<any | null>(null)
   const [page, setPage] = useState(1)
   const PAGE_SIZE = 50
 
@@ -576,6 +623,7 @@ export default function Findings() {
                 rulesData={rulesData}
                 sevColor={sevColor}
                 stColor={stColor}
+                onOpenDetail={setDetailFinding}
               />
             ))}
           </div>
@@ -621,6 +669,10 @@ export default function Findings() {
             </button>
           </div>
         </div>
+      )}
+
+      {detailFinding && (
+        <FindingDetailDrawer finding={detailFinding} onClose={() => setDetailFinding(null)} />
       )}
     </div>
   )

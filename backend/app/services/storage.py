@@ -338,6 +338,15 @@ def _finding_from_row(row: dict) -> SimpleNamespace:
         resolved_at=row["RESOLVED_AT"],
         closed_at=row["CLOSED_AT"],
         updated_at=row["UPDATED_AT"],
+        # Incident-lifecycle columns (04_migrations). Older rows may not have
+        # them backfilled yet, so fall back to DETECTED_AT for compatibility.
+        first_detected_at=row.get("FIRST_DETECTED_AT") or row["DETECTED_AT"],
+        last_seen_at=row.get("LAST_SEEN_AT") or row["UPDATED_AT"],
+        last_scan_id=row.get("LAST_SCAN_ID") or row["SCAN_ID"],
+        reopened_count=row.get("REOPENED_COUNT") or 0,
+        current_fail_count=row.get("CURRENT_FAIL_COUNT"),
+        current_total_count=row.get("CURRENT_TOTAL_COUNT"),
+        fail_history=_parse_json(row.get("FAIL_HISTORY")) or [],
     )
 
 
@@ -519,46 +528,6 @@ def update_finding_evidence(finding_id: str, evidence: dict) -> None:
 # Open (non-closed) finding statuses — anything not here is considered resolved/
 # closed and won't be superseded or shown under "Detected".
 _OPEN_FINDING_STATUSES = ("detected", "validated", "in_progress")
-
-
-def supersede_open_findings(
-    table_asset_id: str,
-    instance_ids,
-    except_scan_id: str,
-) -> int:
-    """
-    Mark still-open findings from PRIOR scans as 'superseded' when a new scan is
-    about to re-create findings for the same instances. Without this, re-running
-    a workflow on a table leaves stale 'detected' twins from the old scan, so one
-    real issue appears in both Detected and Resolved.
-
-    Scoped by INSTANCE_ID (these are this run's approved instances, all bound to
-    this table), still-open status only, and a DIFFERENT scan than the one being
-    created. `table_asset_id` is accepted for clarity/future use. Returns rows
-    affected.
-    """
-    ids = [i for i in (instance_ids or []) if i]
-    if not ids:
-        return 0
-    in_open = ", ".join(f"'{s}'" for s in _OPEN_FINDING_STATUSES)
-    placeholders = ", ".join(f"%(iid{n})s" for n in range(len(ids)))
-    params = {"except_scan": except_scan_id}
-    for n, iid in enumerate(ids):
-        params[f"iid{n}"] = iid
-    affected = sf_session.execute(
-        f"""
-        UPDATE FINDINGS
-        SET STATUS = 'superseded', CLOSED_AT = CURRENT_TIMESTAMP(),
-            UPDATED_AT = CURRENT_TIMESTAMP()
-        WHERE INSTANCE_ID IN ({placeholders})
-          AND STATUS IN ({in_open})
-          AND (SCAN_ID IS NULL OR SCAN_ID <> %(except_scan)s)
-        """,
-        params,
-    )
-    if affected:
-        logger.info(f"[storage] Superseded {affected} stale open findings for table asset {table_asset_id}")
-    return affected or 0
 
 
 def findings_with_asset_not_closed(
@@ -2543,3 +2512,271 @@ def get_lessons_for_synthesis(
     except Exception as e:
         logger.warning(f"[storage] get_lessons_for_synthesis failed: {type(e).__name__}: {e}")
         return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Incident-lifecycle helpers — one FINDINGS row per (INSTANCE_ID, ASSET_ID),
+# updated across scans. See services/scan_finalizer.py for the state machine.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_LIFECYCLE_OPEN = ("detected", "validated", "in_progress", "assigned", "acknowledged")
+_LIFECYCLE_RESOLVED = ("resolved", "false_positive", "wont_fix", "closed")
+_FAIL_HISTORY_MAX = 50
+
+
+def find_open_finding(instance_id: str, asset_id: str) -> Optional[SimpleNamespace]:
+    """The currently-open finding for this (rule, asset), if any. Used by the
+    scan finalizer to decide UPDATE vs CREATE / RESOLVE."""
+    in_open = ", ".join(f"'{s}'" for s in _LIFECYCLE_OPEN)
+    rows = sf_session.query(
+        f"""
+        SELECT * FROM FINDINGS
+        WHERE INSTANCE_ID = %(iid)s AND ASSET_ID = %(aid)s
+          AND STATUS IN ({in_open})
+        ORDER BY LAST_SEEN_AT DESC NULLS LAST, DETECTED_AT DESC
+        LIMIT 1
+        """,
+        {"iid": instance_id, "aid": asset_id},
+    )
+    return _finding_from_row(rows[0]) if rows else None
+
+
+def find_recently_resolved_finding(
+    instance_id: str, asset_id: str, within_days: int = 7,
+) -> Optional[SimpleNamespace]:
+    """The most-recently-resolved finding for this (rule, asset), if closed
+    within `within_days`. Used by the scan finalizer for REOPEN."""
+    in_res = ", ".join(f"'{s}'" for s in _LIFECYCLE_RESOLVED)
+    rows = sf_session.query(
+        f"""
+        SELECT * FROM FINDINGS
+        WHERE INSTANCE_ID = %(iid)s AND ASSET_ID = %(aid)s
+          AND STATUS IN ({in_res})
+          AND COALESCE(RESOLVED_AT, CLOSED_AT, UPDATED_AT)
+              >= DATEADD('day', -%(days)s, CURRENT_TIMESTAMP())
+        ORDER BY COALESCE(RESOLVED_AT, CLOSED_AT, UPDATED_AT) DESC
+        LIMIT 1
+        """,
+        {"iid": instance_id, "aid": asset_id, "days": int(within_days)},
+    )
+    return _finding_from_row(rows[0]) if rows else None
+
+
+def _bump_fail_history(existing_history, entry: dict) -> list:
+    hist = list(existing_history or [])
+    hist.append(entry)
+    if len(hist) > _FAIL_HISTORY_MAX:
+        hist = hist[-_FAIL_HISTORY_MAX:]
+    return hist
+
+
+def apply_finding_update(
+    finding_id: str, scan_id: str,
+    fail_count: int, total_count: int,
+    severity: Optional[str] = None, evidence: Optional[dict] = None,
+) -> SimpleNamespace:
+    """UPDATE branch: this finding is still failing this scan. Bump
+    last_seen_at + counts, append to fail_history. first_detected_at is
+    NEVER touched — preserves "broken since Tuesday"."""
+    existing = get_finding(finding_id)
+    if not existing:
+        raise ValueError(f"Finding not found: {finding_id}")
+    hist = _bump_fail_history(existing.fail_history, {
+        "scan_id": scan_id,
+        "at": datetime.datetime.utcnow().isoformat(),
+        "fail_count": int(fail_count),
+        "total_count": int(total_count),
+    })
+    set_clauses = [
+        "LAST_SEEN_AT = CURRENT_TIMESTAMP()",
+        "LAST_SCAN_ID = %(last_scan_id)s",
+        "CURRENT_FAIL_COUNT = %(fail_count)s",
+        "CURRENT_TOTAL_COUNT = %(total_count)s",
+        "FAIL_HISTORY = PARSE_JSON(%(fail_history)s)",
+        "UPDATED_AT = CURRENT_TIMESTAMP()",
+    ]
+    params = {
+        "id": finding_id, "last_scan_id": scan_id,
+        "fail_count": int(fail_count), "total_count": int(total_count),
+        "fail_history": json.dumps(hist, default=_json_default),
+    }
+    if severity:
+        set_clauses.append("SEVERITY = %(severity)s"); params["severity"] = severity
+    if evidence is not None:
+        set_clauses.append("EVIDENCE = PARSE_JSON(%(evidence)s)")
+        params["evidence"] = _json_or_null(evidence)
+    sf_session.execute(
+        f"UPDATE FINDINGS SET {', '.join(set_clauses)} WHERE ID = %(id)s", params,
+    )
+    return get_finding(finding_id)
+
+
+def auto_resolve_finding(finding_id: str, scan_id: str) -> SimpleNamespace:
+    """RESOLVE branch: rule passed this scan but the finding was open — auto-close."""
+    sf_session.execute(
+        """
+        UPDATE FINDINGS
+        SET STATUS = 'resolved',
+            RESOLVED_AT = CURRENT_TIMESTAMP(),
+            RESOLUTION_NOTES = COALESCE(RESOLUTION_NOTES, 'Auto-resolved by rescan'),
+            LAST_SCAN_ID = %(scan_id)s,
+            UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE ID = %(id)s
+        """,
+        {"id": finding_id, "scan_id": scan_id},
+    )
+    return get_finding(finding_id)
+
+
+def reopen_finding(
+    finding_id: str, scan_id: str,
+    fail_count: int, total_count: int,
+    severity: Optional[str] = None, evidence: Optional[dict] = None,
+) -> SimpleNamespace:
+    """REOPEN branch: recently-resolved finding failing again. Revive it
+    (reopened_count++, status='detected') instead of creating a duplicate;
+    first_detected_at stays put so the original break is preserved."""
+    existing = get_finding(finding_id)
+    if not existing:
+        raise ValueError(f"Finding not found: {finding_id}")
+    hist = _bump_fail_history(existing.fail_history, {
+        "scan_id": scan_id,
+        "at": datetime.datetime.utcnow().isoformat(),
+        "fail_count": int(fail_count),
+        "total_count": int(total_count),
+        "event": "reopened",
+    })
+    set_clauses = [
+        "STATUS = 'detected'",
+        "REOPENED_COUNT = COALESCE(REOPENED_COUNT, 0) + 1",
+        "LAST_SEEN_AT = CURRENT_TIMESTAMP()",
+        "LAST_SCAN_ID = %(scan_id)s",
+        "CURRENT_FAIL_COUNT = %(fail_count)s",
+        "CURRENT_TOTAL_COUNT = %(total_count)s",
+        "FAIL_HISTORY = PARSE_JSON(%(fail_history)s)",
+        "RESOLVED_AT = NULL", "CLOSED_AT = NULL", "RESOLUTION_NOTES = NULL",
+        "UPDATED_AT = CURRENT_TIMESTAMP()",
+    ]
+    params = {
+        "id": finding_id, "scan_id": scan_id,
+        "fail_count": int(fail_count), "total_count": int(total_count),
+        "fail_history": json.dumps(hist, default=_json_default),
+    }
+    if severity:
+        set_clauses.append("SEVERITY = %(severity)s"); params["severity"] = severity
+    if evidence is not None:
+        set_clauses.append("EVIDENCE = PARSE_JSON(%(evidence)s)")
+        params["evidence"] = _json_or_null(evidence)
+    sf_session.execute(
+        f"UPDATE FINDINGS SET {', '.join(set_clauses)} WHERE ID = %(id)s", params,
+    )
+    return get_finding(finding_id)
+
+
+def create_finding_with_lifecycle(
+    asset_id: str, scan_id: str, instance_id: str,
+    title: str, description: str, severity: str,
+    context: Optional[dict], evidence: Optional[dict],
+    fail_count: int, total_count: int,
+) -> SimpleNamespace:
+    """CREATE branch: brand-new incident. Sets first_detected_at = now,
+    initializes fail_history with the current run."""
+    finding_id = _new_id()
+    hist = [{
+        "scan_id": scan_id,
+        "at": datetime.datetime.utcnow().isoformat(),
+        "fail_count": int(fail_count),
+        "total_count": int(total_count),
+    }]
+    sf_session.execute(
+        """
+        INSERT INTO FINDINGS
+            (ID, ASSET_ID, SCAN_ID, INSTANCE_ID, TITLE, DESCRIPTION, STATUS, SEVERITY,
+             CONTEXT, EVIDENCE,
+             FIRST_DETECTED_AT, LAST_SEEN_AT, LAST_SCAN_ID,
+             CURRENT_FAIL_COUNT, CURRENT_TOTAL_COUNT, FAIL_HISTORY, REOPENED_COUNT)
+        SELECT
+            %(id)s, %(asset_id)s, %(scan_id)s, %(instance_id)s, %(title)s, %(description)s,
+            'detected', %(severity)s,
+            PARSE_JSON(%(context)s), PARSE_JSON(%(evidence)s),
+            CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), %(scan_id)s,
+            %(fail_count)s, %(total_count)s, PARSE_JSON(%(fail_history)s), 0
+        """,
+        {
+            "id": finding_id, "asset_id": asset_id, "scan_id": scan_id,
+            "instance_id": instance_id, "title": title, "description": description,
+            "severity": severity,
+            "context": _json_or_null(context), "evidence": _json_or_null(evidence),
+            "fail_count": int(fail_count), "total_count": int(total_count),
+            "fail_history": json.dumps(hist, default=_json_default),
+        },
+    )
+    return get_finding(finding_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MUTES — silence a specific (instance, asset) for a window. Scans still run
+# and RULE_EXECUTIONS still logs; the lifecycle skips update/reopen/create on
+# failure during a mute, so no new incident surfaces.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _mute_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        instance_id=row["INSTANCE_ID"],
+        asset_id=row["ASSET_ID"],
+        muted_until=row["MUTED_UNTIL"],
+        reason=row["REASON"],
+        muted_by=row["MUTED_BY"],
+        created_at=row["CREATED_AT"],
+    )
+
+
+def is_muted(instance_id: str, asset_id: str) -> bool:
+    rows = sf_session.query(
+        """
+        SELECT ID FROM MUTES
+        WHERE INSTANCE_ID = %(iid)s AND ASSET_ID = %(aid)s
+          AND MUTED_UNTIL > CURRENT_TIMESTAMP()
+        LIMIT 1
+        """,
+        {"iid": instance_id, "aid": asset_id},
+    )
+    return bool(rows)
+
+
+def create_mute(
+    instance_id: str, asset_id: str, muted_until: Any,
+    reason: Optional[str] = None, muted_by: Optional[str] = None,
+) -> SimpleNamespace:
+    mute_id = _new_id()
+    sf_session.execute(
+        """
+        INSERT INTO MUTES (ID, INSTANCE_ID, ASSET_ID, MUTED_UNTIL, REASON, MUTED_BY)
+        VALUES (%(id)s, %(iid)s, %(aid)s, %(until)s, %(reason)s, %(by)s)
+        """,
+        {"id": mute_id, "iid": instance_id, "aid": asset_id,
+         "until": muted_until, "reason": reason, "by": muted_by},
+    )
+    rows = sf_session.query("SELECT * FROM MUTES WHERE ID = %(id)s", {"id": mute_id})
+    return _mute_from_row(rows[0])
+
+
+def delete_mute(mute_id: str) -> None:
+    sf_session.execute("DELETE FROM MUTES WHERE ID = %(id)s", {"id": mute_id})
+
+
+def list_mutes(
+    instance_id: Optional[str] = None, asset_id: Optional[str] = None,
+    active_only: bool = True,
+) -> list[SimpleNamespace]:
+    where, params = [], {}
+    if instance_id:
+        where.append("INSTANCE_ID = %(iid)s"); params["iid"] = instance_id
+    if asset_id:
+        where.append("ASSET_ID = %(aid)s");    params["aid"] = asset_id
+    if active_only:
+        where.append("MUTED_UNTIL > CURRENT_TIMESTAMP()")
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    rows = sf_session.query(f"SELECT * FROM MUTES {where_sql} ORDER BY CREATED_AT DESC", params)
+    return [_mute_from_row(r) for r in rows]
