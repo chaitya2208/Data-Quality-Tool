@@ -1315,10 +1315,18 @@ class RuleIntelligenceAgent:
         runs produce the same name so similarity match hits on re-run, closing
         the library-bloat loop that rationale-prose slugs left open."""
         if template_shape:
-            target = column_name or scope or "table"
-            return f"AI: {template_shape} on {target}"[:100]
+            # Generic shape name — instance-specific targeting lives on the
+            # instance, not the definition. This fallback should only fire if
+            # the canonical seeded definition is somehow missing.
+            shape_labels = {
+                "not_null": "Not Null", "uniqueness": "Column Uniqueness",
+                "accepted_values": "Accepted Values", "range": "Numeric Range",
+                "regex_match": "Format / Regex Match", "freshness": "Stale Timestamp / Data Freshness",
+                "duplicate_key": "Duplicate Composite Key", "referential_integrity": "Referential Integrity",
+            }
+            return shape_labels.get(template_shape, template_shape.replace("_", " ").title())
         if column_name:
-            return f"AI check on {column_name}"[:100]
+            return f"Custom Check on {column_name}"[:100]
         # Nothing structural to hook to — fall back to rationale prefix.
         return (rationale[:60].rstrip(".,;:") or "AI-proposed check")
 

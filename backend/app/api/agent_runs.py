@@ -37,6 +37,17 @@ def _build_task_response(task) -> AgentTaskResponse:
     )
 
 
+def _get_ai_rules_proposed(run) -> int:
+    """Return the number of new rule definitions AI proposed this run.
+    Uses instance_review_state.ai_rules_proposed when present (even if 0 —
+    0 is a valid value meaning Claude proposed nothing new). Falls back to
+    ai_rules_count only when the review state hasn't been set yet."""
+    state = getattr(run, "instance_review_state", None)
+    if state is not None and "ai_rules_proposed" in state:
+        return state["ai_rules_proposed"] or 0
+    return getattr(run, "ai_rules_count", 0) or 0
+
+
 def _build_run_response(run) -> AgentRunResponse:
     return AgentRunResponse(
         id=run.id,
@@ -52,8 +63,7 @@ def _build_run_response(run) -> AgentRunResponse:
         completed_at=run.completed_at,
         findings_count=run.findings_count,
         ai_rules_count=getattr(run, "ai_rules_count", 0) or 0,
-        ai_rules_proposed=(getattr(run, "instance_review_state", None) or {}).get("ai_rules_proposed")
-            or getattr(run, "ai_rules_count", 0) or 0,
+        ai_rules_proposed=_get_ai_rules_proposed(run),
         instance_review_state=getattr(run, "instance_review_state", None),
         error_message=run.error_message,
         created_at=run.created_at,
@@ -172,9 +182,14 @@ def save_rule_review(run_id: str, request: RuleReviewRequest):
         if instance and entry.severity != instance.severity:
             storage.update_instance(entry.instance_id, severity=entry.severity, edited_by_human=True)
 
+    # Preserve keys set by rule_intelligence_agent (ai_rules_proposed,
+    # signals_missed, parse_failed, unused_library) — only overwrite
+    # active/skipped which are the user's review decisions.
+    existing_state = run.instance_review_state or {}
     run = storage.update_agent_run(
         run_id,
         instance_review_state={
+            **existing_state,
             "active":  [e.model_dump() for e in request.active],
             "skipped": [e.model_dump() for e in request.skipped],
         },

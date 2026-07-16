@@ -237,7 +237,15 @@ class RuleEngine:
         # instances created outside the AI proposal path.
         instance_rationale = (getattr(instance, "rationale", "") or "").strip()
         detail = instance_rationale or (definition.description or "").strip()
-        description = f"{failed} of {total} rows fail this check."
+        # Aggregate checks (freshness, row_count) return TOTAL_COUNT=1 as a
+        # sentinel — "1 of 1 rows" is misleading. Use plain "table-level check
+        # failed" language instead.
+        template_shape = getattr(definition, "template_shape", "") or ""
+        is_aggregate = int(total) == 1 and template_shape in ("freshness", "row_count_min", "row_count_max")
+        if is_aggregate:
+            description = "This table-level check failed."
+        else:
+            description = f"{failed} of {total} rows fail this check."
         if detail:
             description = f"{description} {detail}"
 

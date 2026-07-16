@@ -168,9 +168,19 @@ class VerificationAgent:
 
             if finding.instance_id:
                 still_firing_now = finding.instance_id in still_firing_instance_ids
-            else:
-                # Legacy finding with no instance_id — use the old string key.
+            elif still_firing_legacy:
+                # Legacy finding with no instance_id — use the old string key
+                # only when we actually collected legacy keys (i.e. something
+                # re-fired via the legacy path). If still_firing_legacy is empty
+                # it means the legacy re-run path produced nothing — which is
+                # indistinguishable from "rule passed" vs "rule never ran", so
+                # we must NOT auto-resolve these findings.
                 still_firing_now = (rule_code, asset_fqn) in still_firing_legacy
+            else:
+                # No instance_id and no legacy re-fire data — treat as still
+                # open (unverifiable) rather than incorrectly auto-resolving.
+                still_open += 1
+                continue
 
             # Log one RULE_EXECUTIONS row per instance re-checked this pass
             # (skip duplicates if multiple findings share the same instance).

@@ -291,8 +291,8 @@ export default function RunHistory() {
 
                     {/* AI rules */}
                     <div className="flex items-center text-xs text-gray-500 dark:text-gray-400">
-                      {run.ai_rules_count > 0
-                        ? <span className="text-purple-600 font-medium">{run.ai_rules_count} AI</span>
+                      {run.instance_review_state != null
+                        ? <span className="text-purple-600 font-medium">{run.ai_rules_proposed} AI</span>
                         : <span className="text-gray-400">—</span>
                       }
                     </div>

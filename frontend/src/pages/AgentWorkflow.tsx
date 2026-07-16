@@ -925,16 +925,25 @@ export default function AgentWorkflow() {
                 <AgentNode agentDef={getAgentDef('verification_agent')} task={getTask('verification_agent')}
                   isLast={true} runStatus={runStatus} scanId={activeRun.scan_id} navigate={navigate} />
               </div>
-              <div className="mt-5 pt-4 border-t border-gray-100 dark:border-gray-700 grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div className="mt-5 pt-4 border-t border-gray-100 dark:border-gray-700 grid grid-cols-2 sm:grid-cols-5 gap-4">
                 <div className="text-center">
                   <p className="text-2xl font-bold text-gray-900 dark:text-gray-100">{activeRun.findings_count}</p>
                   <p className="text-xs text-gray-500 dark:text-gray-300">Findings</p>
                 </div>
                 <div className="text-center">
+                  <p className="text-2xl font-bold text-gray-900 dark:text-gray-100">
+                    {findingsOutput?.rules_executed ?? '—'}
+                  </p>
+                  <p className="text-xs text-gray-500 dark:text-gray-300">Instances run</p>
+                </div>
+                <div className="text-center">
                   <p className="text-2xl font-bold text-purple-600 flex items-center justify-center gap-1">
                     <Sparkles className="w-5 h-5" />
-                    {activeRun.ai_rules_proposed}
-                    {activeRun.findings_count > 0 && activeRun.ai_rules_count !== activeRun.ai_rules_proposed && (
+                    {activeRun.instance_review_state != null
+                      ? activeRun.instance_review_state.ai_rules_proposed ?? 0
+                      : '—'}
+                    {activeRun.instance_review_state != null && activeRun.ai_rules_count > 0 &&
+                     activeRun.ai_rules_count !== (activeRun.instance_review_state.ai_rules_proposed ?? 0) && (
                       <span className="text-sm font-normal text-gray-400 dark:text-gray-500">
                         ({activeRun.ai_rules_count} approved)
                       </span>
@@ -1033,8 +1042,23 @@ export default function AgentWorkflow() {
                   Review Rules Before Running
                 </h2>
                 <p className="text-xs text-purple-700 dark:text-purple-300 mt-0.5">
-                  Claude kept {reviewActive.length} active and skipped {reviewSkipped.length}.
-                  Approve or reject AI-generated rules, activate skipped ones, edit new rules, or select several and use bulk actions. Then click Run Pipeline.
+                  {(() => {
+                    const allActive = reviewActive
+                    const existingDefs = new Set(allActive.filter(r => !r.is_new_definition).map(r => r.definition_id))
+                    const newDefs = new Set(allActive.filter(r => r.is_new_definition).map(r => r.definition_id))
+                    const skippedNewDefs = new Set(reviewSkipped.filter(r => r.is_new_definition).map(r => r.definition_id))
+                    const totalNewDefs = newDefs.size + skippedNewDefs.size
+                    const totalDefs = existingDefs.size + totalNewDefs
+                    return (
+                      <>
+                        Claude selected <strong>{totalDefs}</strong> rule {totalDefs === 1 ? 'definition' : 'definitions'}
+                        {' '}(<strong>{existingDefs.size}</strong> existing
+                        {totalNewDefs > 0 && <>, <strong>{totalNewDefs}</strong> newly generated</>})
+                        {' '}and skipped <strong>{reviewSkipped.length}</strong> from past active rules.
+                      </>
+                    )
+                  })()}
+                  {' '}Approve or reject AI-generated rules, activate skipped ones, edit new rules, or select several and use bulk actions. Then click Run Pipeline. You can also add more rules by activating them from Available in Library.
                 </p>
               </div>
               <button
@@ -1049,7 +1073,7 @@ export default function AgentWorkflow() {
               >
                 {(saveReviewMutation.isPending || runPipelineMutation.isPending)
                   ? <><Loader2 className="w-4 h-4 animate-spin" />Starting...</>
-                  : <><Play className="w-4 h-4" />Run Pipeline ({reviewActive.length} rules)</>
+                  : <><Play className="w-4 h-4" />Run Pipeline ({groupedActive.length} {groupedActive.length === 1 ? 'rule' : 'rules'}, {reviewActive.length} {reviewActive.length === 1 ? 'instance' : 'instances'})</>
                 }
               </button>
             </div>
@@ -1429,8 +1453,8 @@ export default function AgentWorkflow() {
                 ) : (
                   <>
                     <strong>{activeRun.findings_count}</strong> findings detected
-                    {activeRun.ai_rules_count > 0 && (
-                      <> · <strong>{activeRun.ai_rules_count}</strong> AI rules</>
+                    {findingsOutput?.rules_executed > 0 && (
+                      <> · <strong>{findingsOutput.rules_executed}</strong> instances run</>
                     )}
                   </>
                 )}.
@@ -1475,7 +1499,7 @@ export default function AgentWorkflow() {
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">
               {findingsOutput.rules_executed} instances executed ·{' '}
-              <span className="text-orange-700 dark:text-orange-300 font-medium">{findingsOutput.rules_used_count} fired</span> ·{' '}
+              <span className="text-orange-700 dark:text-orange-300 font-medium">{findingsOutput.rules_used_count} violated</span> ·{' '}
               <span className="text-green-700 dark:text-green-400 font-medium">{findingsOutput.rules_unused_count} clean</span>
               {findingsOutput.findings_count != null && <> · {findingsOutput.findings_count} findings</>}
             </p>
@@ -1486,25 +1510,38 @@ export default function AgentWorkflow() {
             <div className="p-5">
               <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-orange-500 inline-block" />
-                Instances Fired ({findingsOutput.rules_used_count})
+                Instances Violated ({findingsOutput.rules_used_count})
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
-                {findingsOutput.rules_used.map((r: any, i: number) => (
-                  <div key={r.instance_id ?? r.code ?? i} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
-                    <div className="min-w-0">
-                      <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 truncate">{r.name}</p>
+                {(() => {
+                  // Group instances by rule name — same definition fired on
+                  // multiple columns shows as one row with combined finding count.
+                  const grouped: Record<string, { instances: any[]; total: number }> = {}
+                  for (const r of findingsOutput.rules_used) {
+                    if (!grouped[r.name]) grouped[r.name] = { instances: [], total: 0 }
+                    grouped[r.name].instances.push(r)
+                    grouped[r.name].total += r.findings ?? 0
+                  }
+                  return Object.entries(grouped).map(([name, g]) => (
+                    <div key={name} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 truncate">{name}</p>
+                        {g.instances.length > 1 && (
+                          <p className="text-xs text-gray-500 dark:text-gray-400">{g.instances.length} instances</p>
+                        )}
+                      </div>
+                      {activeRun?.scan_id && (
+                        <button
+                          onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}${g.instances.length === 1 ? `&instance=${g.instances[0].instance_id}` : ''}`)}
+                          className="flex-shrink-0 text-xs px-1.5 py-1 text-orange-700 dark:text-orange-300 border border-orange-300 dark:border-orange-500/40 rounded hover:bg-orange-100 dark:hover:bg-orange-500/20 font-medium"
+                          title="View these findings"
+                        >
+                          {g.total} finding{g.total !== 1 ? 's' : ''}
+                        </button>
+                      )}
                     </div>
-                    {activeRun?.scan_id && (
-                      <button
-                        onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}&instance=${r.instance_id}`)}
-                        className="flex-shrink-0 text-xs px-1.5 py-1 text-orange-700 dark:text-orange-300 border border-orange-300 dark:border-orange-500/40 rounded hover:bg-orange-100 dark:hover:bg-orange-500/20 font-medium"
-                        title="View these findings"
-                      >
-                        {r.findings} finding{r.findings !== 1 ? 's' : ''}
-                      </button>
-                    )}
-                  </div>
-                ))}
+                  ))
+                })()}
                 {findingsOutput.rules_used_count === 0 && (
                   <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No rules fired — the data is clean.</p>
                 )}
@@ -1518,11 +1555,21 @@ export default function AgentWorkflow() {
                 Instances Clean ({findingsOutput.rules_unused_count})
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
-                {(findingsOutput.rules_unused || []).map((r: any, i: number) => (
-                  <div key={r.instance_id ?? i} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm">
-                    <p className="text-xs font-semibold text-gray-500 dark:text-gray-300 truncate">{r.name}</p>
-                  </div>
-                ))}
+                {(() => {
+                  const grouped: Record<string, { count: number }> = {}
+                  for (const r of (findingsOutput.rules_unused || [])) {
+                    if (!grouped[r.name]) grouped[r.name] = { count: 0 }
+                    grouped[r.name].count += 1
+                  }
+                  return Object.entries(grouped).map(([name, g]) => (
+                    <div key={name} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm">
+                      <p className="text-xs font-semibold text-gray-500 dark:text-gray-300 truncate">{name}</p>
+                      {g.count > 1 && (
+                        <p className="text-xs text-gray-400 dark:text-gray-500">{g.count} instances</p>
+                      )}
+                    </div>
+                  ))
+                })()}
                 {findingsOutput.rules_unused_count === 0 && (
                   <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">Every executed rule found at least one issue.</p>
                 )}

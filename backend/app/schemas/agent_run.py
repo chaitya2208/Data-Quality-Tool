@@ -58,7 +58,7 @@ class AgentRunResponse(BaseModel):
     completed_at: Optional[datetime] = None
     findings_count: int = 0
     ai_rules_count: int = 0  # approved instances after review
-    ai_rules_proposed: int = 0  # proposed by AI before review
+    ai_rules_proposed: int = 0  # new definitions proposed by AI before review
     instance_review_state: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
     created_at: datetime
