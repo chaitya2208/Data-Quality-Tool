@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { findingsApi, agentRunsApi, rulesApi } from '../api/client'
-import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck } from 'lucide-react'
+import { findingsApi, agentRunsApi } from '../api/client'
+import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table } from 'lucide-react'
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip,
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -48,18 +48,6 @@ export default function Dashboard() {
     queryKey: ['agent-runs'],
     queryFn: () => agentRunsApi.list().then(r => r.data),
     staleTime: 30_000,  // don't refetch-and-flash 0 on every dashboard revisit
-  })
-
-  // Rules are global (not connection-scoped) — a rule definition applies across
-  // sources by design, so this card is intentionally not filtered by connId.
-  const { data: ruleStats } = useQuery({
-    queryKey: ['rules-stats'],
-    queryFn: () => rulesApi.stats().then(r => r.data),
-  })
-
-  const { data: definitionStats } = useQuery({
-    queryKey: ['rules-definitions-stats'],
-    queryFn: () => rulesApi.listDefinitions({ status: 'active' }).then(r => r.data),
   })
 
   // Workflow-run count scoped to the selected source. NULL-connection (legacy)
@@ -380,142 +368,6 @@ export default function Dashboard() {
             <div className="h-52 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
           )}
         </div>
-      </div>
-
-      {/* Active Rules (definitions) */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="w-5 h-5 text-primary-600" />
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Active Rules</h2>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-gray-500 dark:text-gray-300">
-              <span className="font-semibold text-gray-900 dark:text-gray-100">{definitionStats?.total ?? 0}</span> active
-            </span>
-            <button onClick={() => navigate('/rule-library')} className="text-sm text-primary-600 hover:text-primary-800 font-medium">
-              Manage →
-            </button>
-          </div>
-        </div>
-
-        {definitionStats ? (() => {
-          const defs = definitionStats.definitions ?? []
-          const total = defs.length
-          const byCategory: Record<string, number> = {}
-          const bySeverity: Record<string, number> = {}
-          for (const d of defs) {
-            byCategory[d.category] = (byCategory[d.category] ?? 0) + 1
-            bySeverity[d.default_severity] = (bySeverity[d.default_severity] ?? 0) + 1
-          }
-          return (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-              <div>
-                <p className="text-xs font-medium text-gray-400 dark:text-gray-400 uppercase tracking-wide mb-2">By Category</p>
-                <div className="space-y-1.5">
-                  {Object.entries(byCategory).sort((a, b) => b[1] - a[1]).map(([cat, count]) => {
-                    const pct = total > 0 ? Math.round((count / total) * 100) : 0
-                    const label = cat.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
-                    return (
-                      <div key={cat} className="flex items-center gap-2 text-sm">
-                        <span className="w-28 text-gray-600 dark:text-gray-300 truncate">{label}</span>
-                        <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-1.5">
-                          <div className="bg-primary-500 h-1.5 rounded-full" style={{ width: `${pct}%` }} />
-                        </div>
-                        <span className="w-6 text-right text-xs font-medium text-gray-700 dark:text-gray-200">{count}</span>
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-              <div>
-                <p className="text-xs font-medium text-gray-400 dark:text-gray-400 uppercase tracking-wide mb-2">By Severity</p>
-                <div className="space-y-1.5">
-                  {(['critical','high','medium','low','info'] as const).filter(s => (bySeverity[s] ?? 0) > 0).map(sev => {
-                    const count = bySeverity[sev] ?? 0
-                    const pct = total > 0 ? Math.round((count / total) * 100) : 0
-                    const barColor = { critical: 'bg-red-500', high: 'bg-orange-500', medium: 'bg-yellow-500', low: 'bg-blue-500', info: 'bg-gray-400' }[sev]
-                    return (
-                      <div key={sev} className="flex items-center gap-2 text-sm">
-                        <span className="w-16 text-gray-600 dark:text-gray-300 capitalize">{sev}</span>
-                        <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-1.5">
-                          <div className={`${barColor} h-1.5 rounded-full`} style={{ width: `${pct}%` }} />
-                        </div>
-                        <span className="w-6 text-right text-xs font-medium text-gray-700 dark:text-gray-200">{count}</span>
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            </div>
-          )
-        })() : (
-          <p className="text-sm text-gray-400 dark:text-gray-400">Loading rule statistics...</p>
-        )}
-      </div>
-
-      {/* Active Instances */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="w-5 h-5 text-primary-600" />
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Active Instances</h2>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-gray-500 dark:text-gray-300">
-              <span className="font-semibold text-gray-900 dark:text-gray-100">{ruleStats?.active ?? 0}</span> active
-              {' / '}
-              <span className="font-semibold text-gray-900 dark:text-gray-100">{ruleStats?.total ?? 0}</span> total
-            </span>
-            <button onClick={() => navigate('/rule-library')} className="text-sm text-primary-600 hover:text-primary-800 font-medium">
-              Manage →
-            </button>
-          </div>
-        </div>
-
-        {ruleStats ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-            <div>
-              <p className="text-xs font-medium text-gray-400 dark:text-gray-400 uppercase tracking-wide mb-2">By Category</p>
-              <div className="space-y-1.5">
-                {Object.entries(ruleStats.by_category).sort((a, b) => b[1] - a[1]).map(([cat, count]) => {
-                  const pct = ruleStats.total > 0 ? Math.round((count / ruleStats.total) * 100) : 0
-                  const label = cat.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
-                  return (
-                    <div key={cat} className="flex items-center gap-2 text-sm">
-                      <span className="w-28 text-gray-600 dark:text-gray-300 truncate">{label}</span>
-                      <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-1.5">
-                        <div className="bg-primary-500 h-1.5 rounded-full" style={{ width: `${pct}%` }} />
-                      </div>
-                      <span className="w-6 text-right text-xs font-medium text-gray-700 dark:text-gray-200">{count}</span>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-            <div>
-              <p className="text-xs font-medium text-gray-400 dark:text-gray-400 uppercase tracking-wide mb-2">By Severity</p>
-              <div className="space-y-1.5">
-                {(['critical','high','medium','low','info'] as const).filter(s => (ruleStats.by_severity[s] ?? 0) > 0).map(sev => {
-                  const count = ruleStats.by_severity[sev] ?? 0
-                  const pct = ruleStats.total > 0 ? Math.round((count / ruleStats.total) * 100) : 0
-                  const barColor = { critical: 'bg-red-500', high: 'bg-orange-500', medium: 'bg-yellow-500', low: 'bg-blue-500', info: 'bg-gray-400' }[sev]
-                  return (
-                    <div key={sev} className="flex items-center gap-2 text-sm">
-                      <span className="w-16 text-gray-600 dark:text-gray-300 capitalize">{sev}</span>
-                      <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-1.5">
-                        <div className={`${barColor} h-1.5 rounded-full`} style={{ width: `${pct}%` }} />
-                      </div>
-                      <span className="w-6 text-right text-xs font-medium text-gray-700 dark:text-gray-200">{count}</span>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-          </div>
-        ) : (
-          <p className="text-sm text-gray-400 dark:text-gray-400">Loading instance statistics...</p>
-        )}
       </div>
 
     </div>
