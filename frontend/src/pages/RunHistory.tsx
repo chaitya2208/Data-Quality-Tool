@@ -1,8 +1,9 @@
 import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { agentRunsApi } from '../api/client'
 import { useConnection } from '../ConnectionContext'
+import { fmtIST } from '../utils/dates'
 import {
   History, Loader2, CheckCircle2, AlertTriangle, BrainCircuit,
   Wrench, Database, Search, Filter, ExternalLink, Clock,
@@ -51,12 +52,13 @@ function statusBadge(status: string) {
 
 export default function RunHistory() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [search, setSearch]           = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [originFilter, setOriginFilter] = useState<OriginFilter>('all')
-  const [dbFilter, setDbFilter]         = useState('')
-  const [schemaFilter, setSchemaFilter] = useState('')
-  const [tableFilter, setTableFilter]   = useState('')
+  const [dbFilter, setDbFilter]         = useState(() => searchParams.get('db') ?? '')
+  const [schemaFilter, setSchemaFilter] = useState(() => searchParams.get('schema') ?? '')
+  const [tableFilter, setTableFilter]   = useState(() => searchParams.get('table') ?? '')
   // Run History is scoped to the selected data source. Runs already carry
   // connection_id, so we filter client-side; legacy NULL-connection runs are
   // attributed to Snowflake to match the findings/dashboard scoping rule.
@@ -260,7 +262,7 @@ export default function RunHistory() {
                       </div>
                       <div className="flex items-center gap-3 mt-1">
                         <span className="text-xs text-gray-400 dark:text-gray-400">
-                          {new Date(run.created_at).toLocaleString()}
+                          {fmtIST(run.created_at)}
                         </span>
                         {run.batch_id && (
                           <span className="text-xs text-gray-400 dark:text-gray-500 font-mono">
@@ -334,7 +336,7 @@ export default function RunHistory() {
                             </span>
                             {t.completed_at && (
                               <span className="text-amber-600 dark:text-amber-400/80">
-                                {' · '}{new Date(t.completed_at).toLocaleString()}
+                                {' · '}{fmtIST(t.completed_at)}
                               </span>
                             )}
                             {t.error_message && (

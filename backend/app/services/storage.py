@@ -30,6 +30,7 @@ import decimal
 import json
 import logging
 import uuid
+from collections import defaultdict
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -48,7 +49,9 @@ def _sha256(text: str) -> str:
 
 
 def _json_default(value: Any) -> Any:
-    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+    if isinstance(value, datetime.datetime):
+        return value.isoformat() + 'Z'
+    if isinstance(value, (datetime.date, datetime.time)):
         return value.isoformat()
     if isinstance(value, decimal.Decimal):
         return float(value)
@@ -1394,6 +1397,32 @@ def list_executions_for_instance(instance_id: str, limit: int = 50) -> list[Simp
     return [_execution_from_row(r) for r in rows]
 
 
+def list_executions_for_instances(
+    instance_ids: list[str], limit_per_instance: int = 50,
+) -> Dict[str, list[SimpleNamespace]]:
+    """Batched version of list_executions_for_instance — one query for all
+    instance_ids instead of one query per instance. Used by table-health
+    aggregation to avoid N+1 round-trips to Snowflake."""
+    if not instance_ids:
+        return {}
+    placeholders = ", ".join(f"%(iid{n})s" for n in range(len(instance_ids)))
+    params = {f"iid{n}": iid for n, iid in enumerate(instance_ids)}
+    params["limit"] = limit_per_instance
+    rows = sf_session.query(
+        f"""
+        SELECT * FROM RULE_EXECUTIONS
+        WHERE INSTANCE_ID IN ({placeholders})
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY INSTANCE_ID ORDER BY EXECUTED_AT DESC) <= %(limit)s
+        ORDER BY INSTANCE_ID, EXECUTED_AT DESC
+        """,
+        params,
+    )
+    by_instance: Dict[str, list[SimpleNamespace]] = defaultdict(list)
+    for r in rows:
+        by_instance[r["INSTANCE_ID"]].append(_execution_from_row(r))
+    return by_instance
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # AGENT_RUNS / AGENT_TASKS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2541,6 +2570,31 @@ def find_open_finding(instance_id: str, asset_id: str) -> Optional[SimpleNamespa
     return _finding_from_row(rows[0]) if rows else None
 
 
+def find_open_findings(instance_ids: list[str], asset_id: str) -> Dict[str, SimpleNamespace]:
+    """Batched version of find_open_finding — one query for all instance_ids
+    against a single asset. Used by table-health aggregation to avoid N+1
+    round-trips to Snowflake."""
+    if not instance_ids:
+        return {}
+    in_open = ", ".join(f"'{s}'" for s in _LIFECYCLE_OPEN)
+    placeholders = ", ".join(f"%(iid{n})s" for n in range(len(instance_ids)))
+    params = {f"iid{n}": iid for n, iid in enumerate(instance_ids)}
+    params["aid"] = asset_id
+    rows = sf_session.query(
+        f"""
+        SELECT * FROM FINDINGS
+        WHERE INSTANCE_ID IN ({placeholders}) AND ASSET_ID = %(aid)s
+          AND STATUS IN ({in_open})
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY INSTANCE_ID
+            ORDER BY LAST_SEEN_AT DESC NULLS LAST, DETECTED_AT DESC
+        ) = 1
+        """,
+        params,
+    )
+    return {r["INSTANCE_ID"]: _finding_from_row(r) for r in rows}
+
+
 def find_recently_resolved_finding(
     instance_id: str, asset_id: str, within_days: int = 7,
 ) -> Optional[SimpleNamespace]:
@@ -2583,7 +2637,7 @@ def apply_finding_update(
         raise ValueError(f"Finding not found: {finding_id}")
     hist = _bump_fail_history(existing.fail_history, {
         "scan_id": scan_id,
-        "at": datetime.datetime.utcnow().isoformat(),
+        "at": datetime.datetime.utcnow().isoformat() + 'Z',
         "fail_count": int(fail_count),
         "total_count": int(total_count),
     })
@@ -2641,7 +2695,7 @@ def reopen_finding(
         raise ValueError(f"Finding not found: {finding_id}")
     hist = _bump_fail_history(existing.fail_history, {
         "scan_id": scan_id,
-        "at": datetime.datetime.utcnow().isoformat(),
+        "at": datetime.datetime.utcnow().isoformat() + 'Z',
         "fail_count": int(fail_count),
         "total_count": int(total_count),
         "event": "reopened",
@@ -2684,7 +2738,7 @@ def create_finding_with_lifecycle(
     finding_id = _new_id()
     hist = [{
         "scan_id": scan_id,
-        "at": datetime.datetime.utcnow().isoformat(),
+        "at": datetime.datetime.utcnow().isoformat() + 'Z',
         "fail_count": int(fail_count),
         "total_count": int(total_count),
     }]
@@ -2743,6 +2797,25 @@ def is_muted(instance_id: str, asset_id: str) -> bool:
         {"iid": instance_id, "aid": asset_id},
     )
     return bool(rows)
+
+
+def muted_instance_ids(instance_ids: list[str], asset_id: str) -> set[str]:
+    """Batched version of is_muted — one query for all instance_ids against a
+    single asset. Used by table-health aggregation to avoid N+1 round-trips."""
+    if not instance_ids:
+        return set()
+    placeholders = ", ".join(f"%(iid{n})s" for n in range(len(instance_ids)))
+    params = {f"iid{n}": iid for n, iid in enumerate(instance_ids)}
+    params["aid"] = asset_id
+    rows = sf_session.query(
+        f"""
+        SELECT DISTINCT INSTANCE_ID FROM MUTES
+        WHERE INSTANCE_ID IN ({placeholders}) AND ASSET_ID = %(aid)s
+          AND MUTED_UNTIL > CURRENT_TIMESTAMP()
+        """,
+        params,
+    )
+    return {r["INSTANCE_ID"] for r in rows}
 
 
 def create_mute(

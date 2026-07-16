@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { tableHealthApi } from '../api/client'
 import type { TableHealth, TableHealthRule, HealthDot } from '../api/client'
+import { fmtIST } from '../utils/dates'
 import {
   ShieldCheck, AlertTriangle, Activity, Clock, Loader2,
   CheckCircle2, XCircle, HelpCircle, AlertCircle, BellOff, RotateCcw, TrendingUp,
@@ -194,8 +195,8 @@ export default function DataHealthPanel({
       {/* KPI tiles */}
       <div className="flex flex-wrap gap-3">
         <KpiTile icon={ShieldCheck} label="Health Score" value={fmtScore(h.health_score)} tone={healthTone(h.health_score)} />
-        <KpiTile icon={Activity}    label="Active Rules" value={h.rules_total.toLocaleString()} />
-        <KpiTile icon={AlertTriangle} label="Failing Rules"
+        <KpiTile icon={Activity}    label="Active Instances" value={h.rules_total.toLocaleString()} />
+        <KpiTile icon={AlertTriangle} label="Failed Instances"
                  value={h.rules_failing.toLocaleString()}
                  tone={h.rules_failing > 0 ? 'text-red-600' : 'text-green-600'} />
         <KpiTile icon={AlertCircle} label="Open Findings"
@@ -215,7 +216,7 @@ export default function DataHealthPanel({
             Rules applied to this table
           </h2>
           <p className="text-xs text-gray-600 dark:text-gray-300 mt-1">
-            {h.rules_passing} passing · {h.rules_failing} failing · {h.rules_unrun} not yet run
+            {h.rules_passing} passing · {h.rules_failing} failed · {h.rules_unrun} not yet run
           </p>
         </div>
         <div className="overflow-x-auto">
@@ -240,9 +241,9 @@ export default function DataHealthPanel({
                       {r.name}
                       {r.first_detected_at && !r.muted && (
                         <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-red-50 text-red-700 border border-red-100"
-                              title={`First detected ${new Date(r.first_detected_at).toLocaleString()}`}>
+                              title={`First detected ${fmtIST(r.first_detected_at)}`}>
                           failing {fmtDaysAgo(r.first_detected_at)}
-                          {r.current_fail_count != null && r.current_total_count != null && r.current_total_count > 0
+                          {r.current_fail_count != null && r.current_total_count != null && r.current_total_count > 1
                             ? ` · ${r.current_fail_count}/${r.current_total_count} rows (${((r.current_fail_count / r.current_total_count) * 100).toFixed(1)}%)`
                             : ''}
                         </span>

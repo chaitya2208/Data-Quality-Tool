@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { mutesApi } from '../api/client'
 import type { Finding, Mute } from '../api/client'
+import { fmtIST } from '../utils/dates'
 import {
   X, BellOff, Bell, RotateCcw, Clock, TableIcon, AlertCircle, Loader2,
 } from 'lucide-react'
@@ -81,6 +82,18 @@ export default function FindingDetailDrawer({
   const sampleRows: Record<string, any>[] = finding.evidence?.sample_rows ?? []
   const sampleHeaders = sampleRows.length ? Object.keys(sampleRows[0]) : []
 
+  // Metadata-shape rules (PII, generic name, type mismatch, …) have no failing
+  // rows — dynamic_rules._finding defaults counts to 1/1 and sample_rows to [].
+  // Detect that shape and (a) suppress the misleading "1/1 (100%)" fails tile,
+  // (b) render the rule-specific evidence keys instead.
+  const CONTRACT_KEYS = new Set(['fail_count', 'total_count', 'sample_rows'])
+  const extraEvidence: Array<[string, any]> = Object.entries(finding.evidence ?? {})
+    .filter(([k, v]) => !CONTRACT_KEYS.has(k) && v !== null && v !== undefined && v !== '')
+  const isMetadataRule =
+    sampleRows.length === 0 &&
+    (finding.current_total_count ?? 0) <= 1 &&
+    (finding.current_fail_count ?? 0) <= 1
+
   return (
     // Backdrop
     <div className="fixed inset-0 z-50 flex" onClick={onClose}>
@@ -105,20 +118,20 @@ export default function FindingDetailDrawer({
           <div className="flex flex-wrap gap-3 text-sm">
             <SummaryTile
               icon={Clock} label="Failing since"
-              value={finding.first_detected_at
-                ? new Date(finding.first_detected_at).toLocaleString()
-                : new Date(finding.detected_at).toLocaleString()}
+              value={fmtIST(finding.first_detected_at ?? finding.detected_at)}
             />
-            <SummaryTile
-              icon={AlertCircle} label="Current fails"
-              value={finding.current_fail_count != null && finding.current_total_count != null
-                ? `${finding.current_fail_count.toLocaleString()} / ${finding.current_total_count.toLocaleString()}`
-                  + (finding.current_total_count > 0
-                      ? ` (${((finding.current_fail_count / finding.current_total_count) * 100).toFixed(1)}%)`
-                      : '')
-                : '—'}
-              tone={(finding.current_fail_count ?? 0) > 0 ? 'text-red-600' : undefined}
-            />
+            {!isMetadataRule && (
+              <SummaryTile
+                icon={AlertCircle} label="Current fails"
+                value={finding.current_fail_count != null && finding.current_total_count != null
+                  ? `${finding.current_fail_count.toLocaleString()} / ${finding.current_total_count.toLocaleString()}`
+                    + (finding.current_total_count > 0
+                        ? ` (${((finding.current_fail_count / finding.current_total_count) * 100).toFixed(1)}%)`
+                        : '')
+                  : '—'}
+                tone={(finding.current_fail_count ?? 0) > 0 ? 'text-red-600' : undefined}
+              />
+            )}
             <SummaryTile
               icon={RotateCcw} label="Reopened"
               value={(finding.reopened_count ?? 0).toString()}
@@ -126,7 +139,7 @@ export default function FindingDetailDrawer({
             />
             <SummaryTile
               icon={Clock} label="Last seen"
-              value={finding.last_seen_at ? new Date(finding.last_seen_at).toLocaleString() : '—'}
+              value={fmtIST(finding.last_seen_at)}
             />
           </div>
 
@@ -135,7 +148,7 @@ export default function FindingDetailDrawer({
             <div className="flex items-center justify-between gap-3">
               <div className="flex items-center gap-2 text-sm font-medium text-gray-900 dark:text-gray-100">
                 {activeMute
-                  ? <><BellOff className="w-4 h-4 text-amber-600" /> Muted until {new Date(activeMute.muted_until).toLocaleString()}</>
+                  ? <><BellOff className="w-4 h-4 text-amber-600" /> Muted until {fmtIST(activeMute.muted_until)}</>
                   : <><Bell    className="w-4 h-4 text-gray-500" /> Not muted</>}
               </div>
               {activeMute
@@ -184,8 +197,8 @@ export default function FindingDetailDrawer({
             )}
           </div>
 
-          {/* Fail history */}
-          {history.length > 0 && (
+          {/* Fail history — hidden on metadata-shape rules, where every run is 1/1. */}
+          {!isMetadataRule && history.length > 0 && (
             <div>
               <div className="flex items-center gap-2 mb-2">
                 <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Run history</h3>
@@ -205,13 +218,38 @@ export default function FindingDetailDrawer({
                   <tbody className="divide-y divide-gray-100 dark:divide-gray-700 bg-white dark:bg-gray-900">
                     {[...history].reverse().map((h, i) => (
                       <tr key={i}>
-                        <td className="px-3 py-1.5 text-gray-700 dark:text-gray-300">{new Date(h.at).toLocaleString()}</td>
+                        <td className="px-3 py-1.5 text-gray-700 dark:text-gray-300">{fmtIST(h.at)}</td>
                         <td className="px-3 py-1.5 font-mono tabular-nums text-red-600">{h.fail_count.toLocaleString()}</td>
                         <td className="px-3 py-1.5 font-mono tabular-nums text-gray-500">{h.total_count.toLocaleString()}</td>
                         <td className="px-3 py-1.5 text-gray-500">
                           {h.event === 'reopened'
                             ? <span className="inline-flex items-center gap-1 text-amber-700"><RotateCcw className="w-3 h-3" /> reopened</span>
                             : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Evidence — rule-specific key/value pairs (PII match, type mismatch, …). */}
+          {extraEvidence.length > 0 && (
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-2">Evidence</h3>
+              <div className="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-700">
+                <table className="text-xs w-full">
+                  <tbody className="divide-y divide-gray-100 dark:divide-gray-700 bg-white dark:bg-gray-900">
+                    {extraEvidence.map(([k, v]) => (
+                      <tr key={k}>
+                        <td className="px-3 py-1.5 font-semibold text-gray-600 dark:text-gray-300 whitespace-nowrap align-top w-1/3">{k}</td>
+                        <td className="px-3 py-1.5 font-mono text-gray-700 dark:text-gray-300 break-all">
+                          {Array.isArray(v)
+                            ? v.length === 0 ? <span className="text-gray-400 italic">empty</span> : v.map(String).join(', ')
+                            : typeof v === 'object'
+                              ? JSON.stringify(v)
+                              : String(v)}
                         </td>
                       </tr>
                     ))}

@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { assetsApi, profilingApi, tableHealthApi } from '../api/client'
 import type { ColumnMeta, TableProfile, TopValue, ColumnProfile, HealthDot } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import {
   Database, Table2, Columns3, BarChart3, Loader2, ChevronRight,
-  KeyRound, Hash, AlertCircle, ShieldCheck,
+  KeyRound, Hash, AlertCircle, ShieldCheck, History,
 } from 'lucide-react'
 import DataHealthPanel, { ColumnStatusDot } from './DataHealthPanel'
 
@@ -309,6 +310,7 @@ const fqnKey = (db: string | null, sc: string | null, tb: string | null) =>
   db && sc && tb ? `${db}.${sc}.${tb}` : ''
 
 export default function DataExplorer() {
+  const navigate = useNavigate()
   const [selectedDatabase, setSelectedDatabase] = usePersisted('dq_explorer_db')
   const [selectedSchema,   setSelectedSchema]   = usePersisted('dq_explorer_schema')
   const [selectedTable,    setSelectedTable]    = usePersisted('dq_explorer_table')
@@ -517,13 +519,16 @@ export default function DataExplorer() {
               {columns.length > 0 && <span className="text-xs text-gray-400 dark:text-gray-400">{columns.length} columns</span>}
             </div>
             <button
-              onClick={() => profileMutation.mutate()}
-              disabled={profileMutation.isPending}
-              className="flex items-center gap-2 px-4 py-2 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 disabled:opacity-50 transition-colors flex-shrink-0"
+              onClick={() => {
+                const params = new URLSearchParams()
+                if (selectedDatabase) params.set('db', selectedDatabase)
+                if (selectedSchema)   params.set('schema', selectedSchema)
+                if (selectedTable)    params.set('table', selectedTable)
+                navigate(`/run-history?${params.toString()}`)
+              }}
+              className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-200 text-sm font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors flex-shrink-0"
             >
-              {profileMutation.isPending
-                ? <><Loader2 className="w-4 h-4 animate-spin" />Profiling…</>
-                : <><BarChart3 className="w-4 h-4" />{profile ? 'Re-profile' : 'Profile this table'}</>}
+              <History className="w-4 h-4" />View Run History
             </button>
           </div>
 
