@@ -1246,6 +1246,17 @@ class RuleIntelligenceAgent:
             "fingerprint": fingerprint,
             "definition": definition,  # None if is_new_definition
             "new_definition_data": new_definition_data if is_new_definition else None,
+            # Normalized name — lets the coordinator collapse multiple "new"
+            # proposals from the SAME run into one persisted definition when
+            # Claude proposes the identical concept for several column pairs
+            # in one response (e.g. "Cross-Column Numeric Ordering (Min <=
+            # Max)" for HIGH/LOW, OUTRIGHT_HIGH/LOW, PREMIUM_HIGH/LOW all at
+            # once). Storage-based dedup can't catch this because none of
+            # these candidates are persisted yet when the others are checked.
+            "new_definition_key": (
+                (new_definition_data.get("name") or "").strip().lower()
+                if is_new_definition and new_definition_data else None
+            ),
             "template_shape": effective_template_shape,
             "scope": scope,
             "target_config": target_config,
@@ -1265,13 +1276,27 @@ class RuleIntelligenceAgent:
         existing_definitions: List[Any],
         threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     ) -> Optional[Any]:
-        """Best-match by word overlap on name+description. `threshold` defaults
-        to the codebase-wide default (0.7); the synthesis path passes a lower
-        value (0.5) because rationale prose wording drifts more than deliberate
-        `new_definition` names do."""
-        name = new_def.get("name", "")
+        """Best-match by exact name first, then word overlap on name+desc.
+
+        Exact-name check runs BEFORE fuzzy scoring: two definitions with the
+        identical name but differently-worded descriptions (e.g. Claude
+        re-describing "Cross-Column Timestamp Ordering" with fresh prose on a
+        second table) used to score ~0.41 on the combined name+description
+        overlap — below threshold — and silently spawn a duplicate row. A
+        matching name is never a coincidence for these short, deliberate
+        concept names, so it short-circuits straight to a match.
+
+        `threshold` defaults to the codebase-wide default (0.7 — actually
+        0.55, see DEFAULT_SIMILARITY_THRESHOLD); the synthesis path passes a
+        lower value (0.5) because rationale prose wording drifts more than
+        deliberate `new_definition` names do."""
+        name = (new_def.get("name") or "").strip().lower()
+        if name:
+            for d in existing_definitions:
+                if (d.name or "").strip().lower() == name:
+                    return d
         desc = new_def.get("description", "")
-        combined = f"{name} {desc}"
+        combined = f"{new_def.get('name', '')} {desc}"
         best_score, best = 0.0, None
         for d in existing_definitions:
             score = word_overlap_score(combined, f"{d.name} {d.description or ''}")

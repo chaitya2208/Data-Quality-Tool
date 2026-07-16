@@ -15,7 +15,7 @@ import logging
 import threading
 from datetime import datetime
 from types import SimpleNamespace
-from typing import List, Any
+from typing import List, Any, Dict
 
 from app.services import storage
 from app.services.snowflake_session import session as sf_session
@@ -383,6 +383,16 @@ class WorkflowCoordinator:
         # table orphan relationship) go through this exact same gate —
         # bypassing the LLM for the objective fact never bypasses human
         # review of whether to activate the check.
+        #
+        # Same-run dedup: Claude sometimes proposes the identical new concept
+        # for several column pairs in ONE response (e.g. "Cross-Column
+        # Numeric Ordering (Min <= Max)" for HIGH/LOW, OUTRIGHT_HIGH/LOW, and
+        # PREMIUM_HIGH/LOW all at once). The agent's storage-based similarity
+        # check can't catch this — none of these candidates are persisted yet
+        # when the others are checked. Collapse by new_definition_key here so
+        # only ONE definition row is created per run, and every matching
+        # proposal's instance points at that shared definition.
+        new_definitions_by_key: Dict[str, Any] = {}
         for proposal in proposed_instances:
             if proposal["kind"] == "new":
                 nd = proposal["new_definition_data"] or {}
@@ -399,21 +409,35 @@ class WorkflowCoordinator:
                 # definitions.sql) so a shape not yet seeded still becomes
                 # canonical from this point forward, closing the definition-
                 # library-explosion loop for future shapes too.
-                definition = storage.create_definition(
-                    name=nd.get("name", "Untitled Check"),
-                    category=category,
-                    description=nd.get("description", ""),
-                    check_kind="sql_template",
-                    sql_template=proposal["rule_sql"],
-                    template_shape=proposal.get("template_shape"),
-                    default_threshold_config=proposal["threshold_config"],
-                    default_severity=proposal["severity"],
-                    allowed_scopes=[proposal["scope"]],
-                    source="claude",
-                    status="proposed",
-                    owner="rule_intelligence_agent",
-                    created_by="rule_intelligence_agent",
-                )
+                dedup_key = proposal.get("new_definition_key")
+                definition = new_definitions_by_key.get(dedup_key) if dedup_key else None
+                if definition is None:
+                    definition = storage.create_definition(
+                        name=nd.get("name", "Untitled Check"),
+                        category=category,
+                        description=nd.get("description", ""),
+                        check_kind="sql_template",
+                        sql_template=proposal["rule_sql"],
+                        template_shape=proposal.get("template_shape"),
+                        default_threshold_config=proposal["threshold_config"],
+                        default_severity=proposal["severity"],
+                        allowed_scopes=[proposal["scope"]],
+                        source="claude",
+                        status="proposed",
+                        owner="rule_intelligence_agent",
+                        created_by="rule_intelligence_agent",
+                    )
+                    if dedup_key:
+                        new_definitions_by_key[dedup_key] = definition
+                    logger.info(
+                        f"[Coordinator] Created new definition '{definition.name}' "
+                        f"(id={definition.id}) for run {self.run_id}"
+                    )
+                else:
+                    logger.info(
+                        f"[Coordinator] Reusing same-run definition '{definition.name}' "
+                        f"(id={definition.id}) for another target instead of duplicating"
+                    )
             else:
                 definition = proposal["definition"]
 

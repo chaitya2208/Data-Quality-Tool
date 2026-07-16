@@ -375,7 +375,7 @@ function InstancesView({ definition, onBack }: { definition: RuleDefinition; onB
 
 function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }) {
   const [categoryFilter, setCategoryFilter] = useState('')
-  const [checkKindFilter, setCheckKindFilter] = useState('')
+  const [sourceFilter, setSourceFilter] = useState('')
   const [search, setSearch] = useState('')
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [showModal, setShowModal] = useState(false)
@@ -459,7 +459,8 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
     const q = search.trim().toLowerCase()
     return (data?.definitions ?? []).filter(d => {
       if (categoryFilter && d.category !== categoryFilter) return false
-      if (checkKindFilter && d.check_kind !== checkKindFilter) return false
+      if (sourceFilter === 'ai' && d.source !== 'claude') return false
+      if (sourceFilter === 'existing' && d.source === 'claude') return false
       if (q) return (
         d.name.toLowerCase().includes(q) ||
         d.description.toLowerCase().includes(q) ||
@@ -468,7 +469,7 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
       )
       return true
     })
-  }, [data, categoryFilter, checkKindFilter, search])
+  }, [data, categoryFilter, sourceFilter, search])
 
   const grouped = filtered.reduce<Record<string, RuleDefinition[]>>((acc, d) => {
     const cat = d.category || 'other'
@@ -477,7 +478,7 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
   }, {})
 
   const totalInstances = (data?.definitions ?? []).reduce((sum, d) => sum + d.instance_count, 0)
-  const anyFilter = search || categoryFilter || checkKindFilter
+  const anyFilter = search || categoryFilter || sourceFilter
 
   return (
     <div className="space-y-6">
@@ -528,16 +529,16 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
             {CATEGORIES.map(c => <option key={c} value={c}>{cap(c)}</option>)}
           </select>
 
-          <select value={checkKindFilter} onChange={e => setCheckKindFilter(e.target.value)}
+          <select value={sourceFilter} onChange={e => setSourceFilter(e.target.value)}
             className="px-3 py-2 border border-gray-200 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:border-primary-500">
-            <option value="">All Check Kinds</option>
-            <option value="sql_template">SQL</option>
-            <option value="python_handler">Handler</option>
+            <option value="">All Sources</option>
+            <option value="ai">AI-proposed</option>
+            <option value="existing">Existing</option>
           </select>
 
           {anyFilter && (
             <button
-              onClick={() => { setSearch(''); setCategoryFilter(''); setCheckKindFilter('') }}
+              onClick={() => { setSearch(''); setCategoryFilter(''); setSourceFilter('') }}
               className="flex items-center gap-1 px-3 py-2 text-sm text-gray-500 dark:text-gray-300 hover:text-gray-700 border border-dashed border-gray-300 dark:border-gray-600 rounded-lg"
             >
               <X className="w-3.5 h-3.5" /> Clear
