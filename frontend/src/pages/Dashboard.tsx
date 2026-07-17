@@ -193,13 +193,15 @@ export default function Dashboard() {
 
       {/* ── Overall trend + Worst tables ─────────────────────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="lg:col-span-2 bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+        <div className="lg:col-span-2 bg-white dark:bg-gray-800 rounded-xl shadow p-4 flex flex-col">
           <div className="flex items-center gap-2 mb-3">
             <TrendingUp className="w-4 h-4 text-primary-600" />
             <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet health trend — last 30 days</h2>
             <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">pass-rate % · failed runs</span>
           </div>
-          <FleetTrendChart fleet={fleet} axisColor={axisColor} gridColor={gridColor} loading={loadingFleet} />
+          <div className="flex-1 min-h-[180px]">
+            <FleetTrendChart fleet={fleet} axisColor={axisColor} gridColor={gridColor} loading={loadingFleet} />
+          </div>
         </div>
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
           <div className="flex items-center gap-2 mb-3">
@@ -435,7 +437,10 @@ function healthTone(score: number | null | undefined): string {
 
 function fmtDaysAgo(iso: string | null | undefined): string {
   if (!iso) return '—'
-  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
+  const normalized = iso.replace(' ', 'T').replace(/Z?$/, 'Z')
+  const ms = new Date(normalized).getTime()
+  if (isNaN(ms)) return '—'
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
   if (s < 3600)  return 'today'
   if (s < 86400) return `${Math.round(s / 3600)}h ago`
   return `${Math.round(s / 86400)}d ago`
@@ -491,11 +496,11 @@ function FleetTrendChart({
   fleet, axisColor, gridColor, loading,
 }: { fleet: FleetOverview | undefined; axisColor: string; gridColor: string; loading: boolean }) {
   if (loading) {
-    return <div className="h-[180px] rounded bg-gray-50 dark:bg-gray-700/40 animate-pulse" />
+    return <div className="h-full rounded bg-gray-50 dark:bg-gray-700/40 animate-pulse" />
   }
   const series = fleet?.trend ?? []
   if (series.length === 0) {
-    return <div className="h-[180px] flex items-center justify-center text-sm text-gray-400 dark:text-gray-400">No execution history in the last 30 days.</div>
+    return <div className="h-full flex items-center justify-center text-sm text-gray-400 dark:text-gray-400">No execution history in the last 30 days.</div>
   }
   const points = series.map(p => ({
     day: p.day,
@@ -503,7 +508,7 @@ function FleetTrendChart({
     failed: (p.failed ?? 0) + (p.error ?? 0),
   }))
   return (
-    <div style={{ width: '100%', height: 200 }}>
+    <div style={{ width: '100%', height: '100%' }}>
       <ResponsiveContainer>
         <LineChart data={points} margin={{ top: 5, right: 20, left: 0, bottom: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />

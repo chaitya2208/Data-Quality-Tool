@@ -713,3 +713,75 @@ planning, or Claude's job, or over-engineered.
 - Build semantic-type classifier only after users report PII misses.
 - Everything else called "ML" (anomaly, threshold tuning, RCA) is
   statistics or LLM work already on the roadmap.
+
+---
+
+## Table health N+1 query fix + syntax error (2026-07-17, shipped)
+
+Investigated why loading table health was slow. `get_table_health`
+(`backend/app/api/table_health.py`) looped over every active rule
+instance on the table and fired 3 separate Snowflake queries per
+instance (`list_executions_for_instance`, `find_open_finding`,
+`is_muted`) — N+1, up to ~90 round-trips for a 30-rule table. The fleet
+overview endpoint next to it does the equivalent work in 3 aggregate
+queries total, which is why only the per-table view was slow.
+
+**Fixed:** added 3 batched `storage.py` helpers —
+`list_executions_for_instances` (QUALIFY ROW_NUMBER partition per
+instance), `find_open_findings`, `muted_instance_ids` — each a single
+`IN (...)` query, and rewired the loop in `table_health.py` to read from
+pre-fetched dicts. Down to ~3-4 queries regardless of table size.
+
+**Also found (pre-existing, unrelated to the above):** the same file had
+5 ternary expressions missing a space after `if` (e.g. `'Z'
+ifoldest_by_table.get(key) else None`) — likely a prior automated
+find/replace that appended `+ 'Z'` to timestamps and ate the space. This
+meant the module couldn't even be imported. Fixed all 5; confirmed via
+`ast.parse` that both `table_health.py` and `storage.py` compile.
+
+## Profiling stats to add (2026-07-17, deferred — implement later)
+
+AI suggested a longer list of profiling stats (percentiles, zero/
+negative %, text min/max length + empty-string %, char-set detection,
+missing-dates/time-gaps/arrival-frequency, data volume trends).
+
+**Checked against RuleIntelligence safety first**: RuleIntelligence
+never reads `profiling_service.py`'s raw per-column output directly —
+it only consumes `column_stats` / `pk_shaped_candidates` /
+`freshness_signals` / `closed_set_columns`, which `ProfilingAgent.
+_derive_facts()` (`profiling_agent.py:140-182`) builds independently by
+pulling exactly `total, nulls, null_pct, distinct, top_values,
+tail_values` off each column. So adding new fields to the profile output
+is purely additive — nothing does positional unpacking or "all keys"
+iteration on the profile dict. Safe to add without touching the
+2026-07-16 duplication-bug-fixed, regression-tested RuleIntelligence
+path, as long as new fields aren't also wired into `_derive_facts`
+(a separate, deliberate decision).
+
+**Already covered, don't rebuild:** min/max, mean, stddev, an outlier
+hint, top-N values, null%, unique%, duplicate count (id-category only
+today), cardinality, freshness days, email/phone pattern-match %.
+
+**Cheap to add** (fit into the existing batched aggregate query in
+`column_stats()` — `snowflake_source.py` / `postgres_source.py` — no
+extra round-trips):
+- Median / percentiles (numeric). Open question: exact
+  (`PERCENTILE_CONT`, full sort per column — real cost, and this table
+  already hit a `NUMBER(38,0)` overflow profiling a 15.7M-row table) vs.
+  approximate (`APPROX_PERCENTILE`, t-digest, no sort). Leaning
+  approximate since percentiles are a display/context stat here, not a
+  rule threshold — not decided, ask before implementing.
+- Zero / negative-value % (numeric).
+- Min/max length, empty-string % (text).
+- Future-dates % (date).
+
+**Bigger projects, not just an extra column** — fold into the
+anomaly-detection Tier A work above rather than build standalone:
+- Missing dates / time gaps / arrival frequency — needs calendar-gap
+  logic, same shape as the batch-cadence gap noted in the rule-library
+  audit.
+- Character-set detection — needs its own classification pass.
+- Data volume trends — needs `METRIC_SNAPSHOTS`, exactly Tier A above.
+
+**Skip as standalone features** — the rest of the AI's list overlaps
+what's already computed (see "already covered" above).

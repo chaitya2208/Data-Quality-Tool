@@ -46,4 +46,8 @@
   - Metadata-shape rules (PII column names, FK constraints, nullable IDs) are less meaningful 
   on views — the underlying tables are the source of truth.
   - Materialized views need volume/freshness rules; regular views don't.
-shou
+
+
+  Behavior: first scan of a table returns 0 drift findings (no prior snapshot). Re-adding a   
+  removed column auto-resolves the removal incident. Re-dropping it inside the 7d REOPEN      
+  window reopens the same incident (flapping detection via existing lifecycle).
