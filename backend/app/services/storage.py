@@ -432,18 +432,22 @@ def _is_snowflake_connection(connection_id: Optional[str]) -> bool:
 
 def _findings_connection_clause(connection_id: str, params: dict, alias: str = "") -> str:
     """SQL predicate restricting FINDINGS to one connection, via the SCANS join
-    (FINDINGS has no CONNECTION_ID column). Snowflake also absorbs legacy rows
-    whose scan is missing or has a NULL connection. `alias` (e.g. "f") qualifies
-    the SCAN_ID column when the query aliases FINDINGS."""
+    (FINDINGS has no CONNECTION_ID column). `alias` (e.g. "f") qualifies the
+    SCAN_ID column when the query aliases FINDINGS.
+
+    Snowflake connections short-circuit to a no-op: the connection row is just
+    credentials for the shared warehouse — deleting/recreating it must not hide
+    historical findings — so all Snowflake findings are always visible."""
+    # Snowflake connections are just credentials pointing at the shared
+    # warehouse — the underlying data (and thus findings) belongs to Snowflake
+    # itself, not to any particular CONNECTIONS row. Deleting/recreating a
+    # connection row must not orphan historical findings, so we don't filter
+    # Snowflake findings by connection_id at all.
+    if _is_snowflake_connection(connection_id):
+        return "1=1"
     params["conn_id"] = connection_id
     col = f"{alias}.SCAN_ID" if alias else "SCAN_ID"
-    scan_match = f"{col} IN (SELECT ID FROM SCANS WHERE CONNECTION_ID = %(conn_id)s)"
-    if _is_snowflake_connection(connection_id):
-        return (
-            f"({scan_match} OR {col} IS NULL "
-            f"OR {col} IN (SELECT ID FROM SCANS WHERE CONNECTION_ID IS NULL))"
-        )
-    return scan_match
+    return f"{col} IN (SELECT ID FROM SCANS WHERE CONNECTION_ID = %(conn_id)s)"
 
 
 def list_findings(

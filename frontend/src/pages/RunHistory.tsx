@@ -72,10 +72,16 @@ export default function RunHistory() {
   })
 
   const allRuns = data?.runs ?? []
+  // For Snowflake, the CONNECTIONS row is just credentials for the shared
+  // warehouse — history must survive delete/recreate of that row. So show
+  // ALL runs regardless of which (possibly-orphaned) connection_id they
+  // carry. Non-Snowflake sources stay scoped to their own connection.
   const runs = allRuns.filter(run =>
     !connId
       ? true
-      : run.connection_id === connId || (isSnowflake && !run.connection_id)
+      : isSnowflake
+        ? true
+        : run.connection_id === connId
   )
 
   // Cascading DB → schema → table option lists, derived from the (connection-

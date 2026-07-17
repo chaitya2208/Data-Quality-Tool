@@ -813,3 +813,97 @@ ROW_COUNT, FRESHNESS, STDDEV, quantiles, SCHEMA_CHANGE_COUNT) is already
 covered by existing rule templates or schema drift detection. Do NOT add
 a DMF integration — it requires Enterprise Edition and replicates work
 we've already done in plain SQL.
+
+---
+
+## Findings disappearing after a connection is deleted/recreated (2026-07-17)
+
+### Symptom
+The Findings page showed only **3** findings while the database held **43**.
+Filter/pagination were fine; the API itself was returning 3 for the current
+connection.
+
+### Root cause
+The `CONNECTIONS` table held a single row (`cafbc067-...`, created today).
+But 45 of 46 rows in `SCANS` still carried `CONNECTION_ID = 123eb060-...`,
+a previous connection row that had been deleted/recreated. Findings inherit
+their connection via the `FINDINGS → SCANS.CONNECTION_ID` join.
+
+`storage.delete_connection` (storage.py:1839) is a plain
+`DELETE FROM CONNECTIONS WHERE ID = ...` — no cascade, no null-out of
+`SCANS.CONNECTION_ID`. So every scan (and every finding under it) was left
+pointing at a now-nonexistent UUID.
+
+`_findings_connection_clause` (storage.py:433) filtered findings by the
+*current* connection UUID. Its Snowflake branch tried to be lenient by also
+accepting `SCAN_ID IS NULL` and scans with `CONNECTION_ID IS NULL`, but scans
+pointing at a **deleted** UUID matched none of those three cases, so their
+findings became invisible.
+
+Distribution at time of bug:
+- `123eb060-...` (deleted UUID): 40 findings, 45 scans → invisible
+- `NULL` scan connection: 3 findings, 1 scan → visible (fallback)
+- `cafbc067-...` (current UUID): 0 findings → visible
+
+### The conceptual mistake
+Findings were scoped by `CONNECTION_ID` as if a connection *owns* the data.
+But for Snowflake, a connection row is just credentials pointing at the
+shared warehouse — the data (databases, schemas, tables, findings) lives in
+Snowflake itself. Two connections pointing at the same Snowflake account
+should see the same findings. Deleting a connection row should never make
+history disappear.
+
+### Fix applied (option 2 — decouple)
+In `_findings_connection_clause` (storage.py:433), for Snowflake connections
+the predicate now short-circuits to `"1=1"` — all Snowflake findings are
+always visible regardless of which historical connection row a scan
+references. Non-Snowflake connections (Postgres/RDS) are unchanged: they
+remain scoped to their own `CONNECTION_ID`, since each RDS/Postgres
+connection genuinely points at a distinct database.
+
+This immediately restores the 40 orphaned findings and makes future
+connection deletes/recreates on Snowflake harmless.
+
+### Option 1 — still worth doing (defense in depth)
+Even with the query-layer fix, `delete_connection` still silently orphans
+`SCANS` rows for non-Snowflake connections. Hardening plan:
+
+1. **Refuse delete when dependents exist.** In
+   `storage.delete_connection`, count `SELECT COUNT(*) FROM SCANS WHERE
+   CONNECTION_ID = %(id)s`. If > 0, raise a domain error; the
+   `DELETE /connections/{id}` endpoint (connections.py:132) translates it
+   into HTTP 409 with the dependent-scan count, forcing an explicit choice
+   at the API layer.
+
+2. **Explicit cascade options at the API.** Add a `?cascade=` query param
+   with three values:
+   - `block` (default) — the 409 above.
+   - `orphan` — set `SCANS.CONNECTION_ID = NULL` for matching rows in a
+     transaction, then delete the connection. History is preserved and
+     stays visible under the Snowflake `1=1` rule; for RDS/Postgres it
+     falls back to a "connection unknown" bucket.
+   - `purge` — delete matching `AGENT_RUNS`, `FINDINGS`, `SCANS`, in that
+     order, in one transaction, then the connection. Requires a
+     `confirm=<name>` query param to prevent accidents.
+
+3. **Startup / migration sweep.** On boot, run once:
+   ```sql
+   UPDATE SCANS SET CONNECTION_ID = NULL
+   WHERE CONNECTION_ID IS NOT NULL
+     AND CONNECTION_ID NOT IN (SELECT ID FROM CONNECTIONS);
+   ```
+   This heals any pre-existing orphans (like the 45 scans in this
+   incident) without human intervention. Idempotent — safe to run on
+   every deploy.
+
+4. **Foreign-key-style integrity in Snowflake.** Snowflake doesn't enforce
+   FKs, but a background task (or a scheduled Snowflake TASK) could
+   periodically detect orphans and either null them out or emit a warning
+   finding. Nice-to-have; not urgent once (1)–(3) are in.
+
+### File references
+- `backend/app/services/storage.py:433` — `_findings_connection_clause` (fixed)
+- `backend/app/services/storage.py:1839` — `delete_connection` (needs option 1)
+- `backend/app/api/connections.py:132` — DELETE endpoint (needs cascade param)
+- `backend/app/api/findings.py:15` — 30-second TTL cache; clears itself or
+  restart backend to pick up fix

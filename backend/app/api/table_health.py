@@ -62,9 +62,16 @@ def get_fleet_overview(connection_id: Optional[str] = None, days: int = 30, top_
     conn_filter_scan_alias = ""
     params: dict = {"days": days}
     if connection_id:
-        conn_filter_scan = "AND S.CONNECTION_ID = %(conn)s"
-        conn_filter_scan_alias = "AND S2.CONNECTION_ID = %(conn)s"
-        params["conn"] = connection_id
+        # Snowflake connections are just credentials pointing at the shared
+        # warehouse — historical data must not vanish when a connection row is
+        # deleted/recreated. So don't filter fleet aggregates by CONNECTION_ID
+        # for Snowflake. Non-Snowflake sources stay scoped.
+        conn = storage.get_connection_record(connection_id)
+        ctype = (getattr(conn, "type", None).value if hasattr(getattr(conn, "type", None), "value") else str(getattr(conn, "type", "") or "")).lower()
+        if conn and ctype != "snowflake":
+            conn_filter_scan = "AND S.CONNECTION_ID = %(conn)s"
+            conn_filter_scan_alias = "AND S2.CONNECTION_ID = %(conn)s"
+            params["conn"] = connection_id
 
     # ── Overall trend (daily pass-rate + failed-run count) ──────────────
     trend_rows = sf_session.query(
