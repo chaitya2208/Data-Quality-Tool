@@ -139,6 +139,7 @@ class FindingsExplanationAgent:
             table_asset=table_asset,
             target_col=target_col,
             source=source,
+            finding_count=finding_count,
         )
 
         # Build any context from the existing finding evidence field
@@ -227,6 +228,7 @@ class FindingsExplanationAgent:
         table_asset: Any,
         target_col: str,
         source: Optional[Any] = None,
+        finding_count: int = 0,
     ) -> str:
         """Run the rule's SQL to find rows that actually fail, then fetch
         those specific rows for concrete evidence.
@@ -255,7 +257,11 @@ class FindingsExplanationAgent:
             elif predicate:
                 sample_sql = f"SELECT * FROM {fqn} WHERE {predicate} LIMIT {_MAX_SAMPLE_ROWS}"
             else:
-                sample_sql = f"SELECT * FROM {fqn} LIMIT {_MAX_SAMPLE_ROWS}"
+                # No extractable WHERE predicate — this is a table-level
+                # aggregate check (e.g. freshness: MAX(col) < threshold).
+                # There are no individual "failing rows"; the whole table fails
+                # as a unit. Showing arbitrary rows is misleading, so skip.
+                return "(no individual failing rows — table-level aggregate check)"
 
             querier = source if source is not None else sf_session
             rows = querier.query(sample_sql)

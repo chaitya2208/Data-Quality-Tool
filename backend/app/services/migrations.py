@@ -146,6 +146,41 @@ _MIGRATIONS = [
         )
         """,
     ),
+    # ── Incident lifecycle on FINDINGS ────────────────────────────────────
+    # One FINDINGS row per (INSTANCE_ID, ASSET_ID) persists across scans;
+    # each scan UPDATEs / RESOLVEs / REOPENs / CREATEs. Columns added below.
+    ("add_findings_first_detected_at",
+     "ALTER TABLE FINDINGS ADD COLUMN IF NOT EXISTS FIRST_DETECTED_AT TIMESTAMP_TZ(9)"),
+    ("add_findings_last_seen_at",
+     "ALTER TABLE FINDINGS ADD COLUMN IF NOT EXISTS LAST_SEEN_AT TIMESTAMP_TZ(9)"),
+    ("add_findings_last_scan_id",
+     "ALTER TABLE FINDINGS ADD COLUMN IF NOT EXISTS LAST_SCAN_ID VARCHAR(36)"),
+    ("add_findings_reopened_count",
+     "ALTER TABLE FINDINGS ADD COLUMN IF NOT EXISTS REOPENED_COUNT NUMBER(38,0) DEFAULT 0"),
+    ("add_findings_current_fail_count",
+     "ALTER TABLE FINDINGS ADD COLUMN IF NOT EXISTS CURRENT_FAIL_COUNT NUMBER(38,0)"),
+    ("add_findings_current_total_count",
+     "ALTER TABLE FINDINGS ADD COLUMN IF NOT EXISTS CURRENT_TOTAL_COUNT NUMBER(38,0)"),
+    ("add_findings_fail_history",
+     "ALTER TABLE FINDINGS ADD COLUMN IF NOT EXISTS FAIL_HISTORY VARIANT"),
+    ("backfill_findings_first_detected_at",
+     "UPDATE FINDINGS SET FIRST_DETECTED_AT = DETECTED_AT WHERE FIRST_DETECTED_AT IS NULL"),
+    ("backfill_findings_last_seen_at",
+     "UPDATE FINDINGS SET LAST_SEEN_AT = COALESCE(UPDATED_AT, DETECTED_AT) WHERE LAST_SEEN_AT IS NULL"),
+    ("backfill_findings_last_scan_id",
+     "UPDATE FINDINGS SET LAST_SCAN_ID = SCAN_ID WHERE LAST_SCAN_ID IS NULL"),
+    ("create_mutes",
+     """
+     CREATE TABLE IF NOT EXISTS MUTES (
+         ID          VARCHAR(36) NOT NULL PRIMARY KEY,
+         INSTANCE_ID VARCHAR(36) NOT NULL,
+         ASSET_ID    VARCHAR(36) NOT NULL,
+         MUTED_UNTIL TIMESTAMP_TZ(9) NOT NULL,
+         REASON      VARCHAR(16777216),
+         MUTED_BY    VARCHAR(255),
+         CREATED_AT  TIMESTAMP_TZ(9) NOT NULL DEFAULT CURRENT_TIMESTAMP()
+     )
+     """),
     (
         "create_rule_intelligence_search",
         # Cortex Search — requires CORTEX_USER privilege.

@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
+import { fmtIST } from '../utils/dates'
 import {
   schedulesApi, workflowsApi, assetsApi,
   type Schedule, type ScheduleCreatePayload, type ScheduleCadence, type WorkflowScope,
@@ -493,7 +494,7 @@ export default function Schedules() {
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-xs">
                   {s.next_run_at && (
                     <span className="text-gray-500 dark:text-gray-400">
-                      Next: {new Date(s.next_run_at).toLocaleString()}
+                      Next: {fmtIST(s.next_run_at)}
                     </span>
                   )}
                   {s.last_run_at && (
@@ -501,7 +502,7 @@ export default function Schedules() {
                       {s.last_status === 'error'
                         ? <AlertTriangle className="w-3.5 h-3.5 text-red-500" />
                         : <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />}
-                      Last: {new Date(s.last_run_at).toLocaleString()}
+                      Last: {fmtIST(s.last_run_at)}
                     </span>
                   )}
                 </div>

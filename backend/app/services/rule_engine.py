@@ -237,7 +237,46 @@ class RuleEngine:
         # instances created outside the AI proposal path.
         instance_rationale = (getattr(instance, "rationale", "") or "").strip()
         detail = instance_rationale or (definition.description or "").strip()
-        description = f"{failed} of {total} rows fail this check."
+        template_shape = getattr(definition, "template_shape", "") or ""
+        is_aggregate = int(total) == 1 and template_shape in ("freshness", "row_count_min", "row_count_max")
+
+        # Fetch a small sample of failing rows for the finding UI drill-down.
+        # Uses the same predicate as the count SQL so numbers + samples agree.
+        # Best-effort — a failure here must NOT lose the finding itself.
+        sample_rows: list[dict] = []
+        try:
+            from app.services import rule_sql_templates
+            if template_shape:
+                sample_sql = rule_sql_templates.failing_rows_sample_sql(
+                    template_shape,
+                    table_asset.database_name, table_asset.schema_name, table_asset.table_name,
+                    instance.target_config or {},
+                    instance.threshold_config or {},
+                    limit=10,
+                )
+                if sample_sql:
+                    src = source if source is not None else sf_session
+                    sample_rows = src.query(sample_sql) or []
+        except Exception as e:
+            logger.warning(f"sample-rows fetch failed for instance {instance.id}: {e}")
+
+        # Reconcile count vs samples. If the check SQL reports fewer failing
+        # rows than we actually fetched as samples, the count SQL is buggy
+        # (usually a Claude-authored draft that counts groups instead of rows,
+        # or an aggregate that returned 1 as a sentinel while real rows are
+        # bigger). Trust the samples — they are the actual failing rows and
+        # the user will see them. Log so we can catch these instances.
+        if not is_aggregate and len(sample_rows) > int(failed):
+            logger.warning(
+                f"[rule_engine] count/samples mismatch on instance {instance.id}: "
+                f"FAILED_COUNT={failed}, samples={len(sample_rows)} — using samples."
+            )
+            failed = len(sample_rows)
+
+        if is_aggregate:
+            description = "This table-level check failed."
+        else:
+            description = f"{failed} of {total} rows fail this check."
         if detail:
             description = f"{description} {detail}"
 
@@ -258,7 +297,15 @@ class RuleEngine:
                 "column_name": column_name,
                 "ai_generated": True,
             },
-            "evidence": {"failed_count": int(failed), "total_count": int(total)},
+            # Evidence contract: fail_count / total_count / sample_rows.
+            # See docs in scan_finalizer.py — every rule result standardizes
+            # these three keys so downstream (finding lifecycle, UI drill-down,
+            # health trend) can rely on them.
+            "evidence": {
+                "fail_count": int(failed),
+                "total_count": int(total),
+                "sample_rows": sample_rows,
+            },
         }
 
     def _execute_instance(self, instance: Any, asset: Any, scan_id: str) -> Optional[Dict[str, Any]]:
@@ -301,6 +348,7 @@ class RuleEngine:
                     "rule_code": instance.code,
                 },
                 "evidence": {
+                    "fail_count": 1, "total_count": 1, "sample_rows": [],
                     "current_comment": asset.comment,
                 }
             }
@@ -328,6 +376,7 @@ class RuleEngine:
                     "rule_code": instance.code,
                 },
                 "evidence": {
+                    "fail_count": 1, "total_count": 1, "sample_rows": [],
                     "current_owner": asset.owner,
                 }
             }
@@ -356,6 +405,7 @@ class RuleEngine:
                     "rule_code": instance.code,
                 },
                 "evidence": {
+                    "fail_count": 1, "total_count": 1, "sample_rows": [],
                     "current_comment": asset.comment,
                 }
             }

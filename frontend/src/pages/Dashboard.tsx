@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { findingsApi, agentRunsApi, rulesApi } from '../api/client'
-import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck } from 'lucide-react'
+import { findingsApi, agentRunsApi, tableHealthApi } from '../api/client'
+import type { FleetOverview } from '../api/client'
+import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck, RotateCcw, TrendingUp } from 'lucide-react'
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip,
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
+  LineChart, Line,
 } from 'recharts'
 import { useTheme } from '../ThemeContext'
 import { useConnection } from '../ConnectionContext'
@@ -50,16 +52,15 @@ export default function Dashboard() {
     staleTime: 30_000,  // don't refetch-and-flash 0 on every dashboard revisit
   })
 
-  // Rules are global (not connection-scoped) — a rule definition applies across
-  // sources by design, so this card is intentionally not filtered by connId.
-  const { data: ruleStats } = useQuery({
-    queryKey: ['rules-stats'],
-    queryFn: () => rulesApi.stats().then(r => r.data),
-  })
-
-  const { data: definitionStats } = useQuery({
-    queryKey: ['rules-definitions-stats'],
-    queryFn: () => rulesApi.listDefinitions({ status: 'active' }).then(r => r.data),
+  // Fleet-wide health aggregation — powers the KPI row + worst-tables list +
+  // 30-day trend line. Scoped to the selected connection just like everything
+  // else on this page.
+  const { data: fleet, isLoading: loadingFleet } = useQuery({
+    queryKey: ['fleet-health', connId, 30],
+    queryFn: () => tableHealthApi.fleet({
+      connection_id: connId || undefined, days: 30, top_n: 8,
+    }).then(r => r.data),
+    staleTime: 60_000,
   })
 
   // Workflow-run count scoped to the selected source. NULL-connection (legacy)
@@ -182,6 +183,43 @@ export default function Dashboard() {
         <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           loading={loadingStats} />
         <StatCard title="Pending Issues"   value={stats?.by_status?.detected ?? 0} icon={Clock}       color="bg-yellow-500" href="/findings?status=detected" loading={loadingStats} />
         <StatCard title="Workflow Runs"    value={scopedRuns.length}               icon={CheckCircle} color="bg-green-500"  href="/run-history"        loading={loadingRuns} />
+      </div>
+
+      {/* ── Fleet Health KPI row ─────────────────────────────────────────
+          Overall pass-rate across every rule execution on every table in
+          the last 30 days; open + flapping incident counts across the
+          fleet; oldest currently-open incident. */}
+      <FleetHealthKpis fleet={fleet} loading={loadingFleet} />
+
+      {/* ── Overall trend + Worst tables ─────────────────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-2 bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <TrendingUp className="w-4 h-4 text-primary-600" />
+            <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet health trend — last 30 days</h2>
+            <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">pass-rate % · failed runs</span>
+          </div>
+          <FleetTrendChart fleet={fleet} axisColor={axisColor} gridColor={gridColor} loading={loadingFleet} />
+        </div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <AlertCircle className="w-4 h-4 text-red-500" />
+            <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Worst tables</h2>
+            <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">click to drill in</span>
+          </div>
+          <WorstTablesList
+            fleet={fleet} loading={loadingFleet}
+            onOpen={(db, sc, tb) => {
+              // Persist the drill-down so DataExplorer opens with the right selection.
+              try {
+                localStorage.setItem('dq_explorer_db', db)
+                localStorage.setItem('dq_explorer_schema', sc)
+                localStorage.setItem('dq_explorer_table', tb)
+              } catch {}
+              navigate('/explorer')
+            }}
+          />
+        </div>
       </div>
 
       {/* ── Database / Table issues chart ── */}
@@ -382,142 +420,158 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Active Rules (definitions) */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="w-5 h-5 text-primary-600" />
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Active Rules</h2>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-gray-500 dark:text-gray-300">
-              <span className="font-semibold text-gray-900 dark:text-gray-100">{definitionStats?.total ?? 0}</span> active
-            </span>
-            <button onClick={() => navigate('/rule-library')} className="text-sm text-primary-600 hover:text-primary-800 font-medium">
-              Manage →
-            </button>
-          </div>
-        </div>
-
-        {definitionStats ? (() => {
-          const defs = definitionStats.definitions ?? []
-          const total = defs.length
-          const byCategory: Record<string, number> = {}
-          const bySeverity: Record<string, number> = {}
-          for (const d of defs) {
-            byCategory[d.category] = (byCategory[d.category] ?? 0) + 1
-            bySeverity[d.default_severity] = (bySeverity[d.default_severity] ?? 0) + 1
-          }
-          return (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-              <div>
-                <p className="text-xs font-medium text-gray-400 dark:text-gray-400 uppercase tracking-wide mb-2">By Category</p>
-                <div className="space-y-1.5">
-                  {Object.entries(byCategory).sort((a, b) => b[1] - a[1]).map(([cat, count]) => {
-                    const pct = total > 0 ? Math.round((count / total) * 100) : 0
-                    const label = cat.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
-                    return (
-                      <div key={cat} className="flex items-center gap-2 text-sm">
-                        <span className="w-28 text-gray-600 dark:text-gray-300 truncate">{label}</span>
-                        <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-1.5">
-                          <div className="bg-primary-500 h-1.5 rounded-full" style={{ width: `${pct}%` }} />
-                        </div>
-                        <span className="w-6 text-right text-xs font-medium text-gray-700 dark:text-gray-200">{count}</span>
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-              <div>
-                <p className="text-xs font-medium text-gray-400 dark:text-gray-400 uppercase tracking-wide mb-2">By Severity</p>
-                <div className="space-y-1.5">
-                  {(['critical','high','medium','low','info'] as const).filter(s => (bySeverity[s] ?? 0) > 0).map(sev => {
-                    const count = bySeverity[sev] ?? 0
-                    const pct = total > 0 ? Math.round((count / total) * 100) : 0
-                    const barColor = { critical: 'bg-red-500', high: 'bg-orange-500', medium: 'bg-yellow-500', low: 'bg-blue-500', info: 'bg-gray-400' }[sev]
-                    return (
-                      <div key={sev} className="flex items-center gap-2 text-sm">
-                        <span className="w-16 text-gray-600 dark:text-gray-300 capitalize">{sev}</span>
-                        <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-1.5">
-                          <div className={`${barColor} h-1.5 rounded-full`} style={{ width: `${pct}%` }} />
-                        </div>
-                        <span className="w-6 text-right text-xs font-medium text-gray-700 dark:text-gray-200">{count}</span>
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            </div>
-          )
-        })() : (
-          <p className="text-sm text-gray-400 dark:text-gray-400">Loading rule statistics...</p>
-        )}
-      </div>
-
-      {/* Active Instances */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="w-5 h-5 text-primary-600" />
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Active Instances</h2>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-gray-500 dark:text-gray-300">
-              <span className="font-semibold text-gray-900 dark:text-gray-100">{ruleStats?.active ?? 0}</span> active
-              {' / '}
-              <span className="font-semibold text-gray-900 dark:text-gray-100">{ruleStats?.total ?? 0}</span> total
-            </span>
-            <button onClick={() => navigate('/rule-library')} className="text-sm text-primary-600 hover:text-primary-800 font-medium">
-              Manage →
-            </button>
-          </div>
-        </div>
-
-        {ruleStats ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-            <div>
-              <p className="text-xs font-medium text-gray-400 dark:text-gray-400 uppercase tracking-wide mb-2">By Category</p>
-              <div className="space-y-1.5">
-                {Object.entries(ruleStats.by_category).sort((a, b) => b[1] - a[1]).map(([cat, count]) => {
-                  const pct = ruleStats.total > 0 ? Math.round((count / ruleStats.total) * 100) : 0
-                  const label = cat.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
-                  return (
-                    <div key={cat} className="flex items-center gap-2 text-sm">
-                      <span className="w-28 text-gray-600 dark:text-gray-300 truncate">{label}</span>
-                      <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-1.5">
-                        <div className="bg-primary-500 h-1.5 rounded-full" style={{ width: `${pct}%` }} />
-                      </div>
-                      <span className="w-6 text-right text-xs font-medium text-gray-700 dark:text-gray-200">{count}</span>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-            <div>
-              <p className="text-xs font-medium text-gray-400 dark:text-gray-400 uppercase tracking-wide mb-2">By Severity</p>
-              <div className="space-y-1.5">
-                {(['critical','high','medium','low','info'] as const).filter(s => (ruleStats.by_severity[s] ?? 0) > 0).map(sev => {
-                  const count = ruleStats.by_severity[sev] ?? 0
-                  const pct = ruleStats.total > 0 ? Math.round((count / ruleStats.total) * 100) : 0
-                  const barColor = { critical: 'bg-red-500', high: 'bg-orange-500', medium: 'bg-yellow-500', low: 'bg-blue-500', info: 'bg-gray-400' }[sev]
-                  return (
-                    <div key={sev} className="flex items-center gap-2 text-sm">
-                      <span className="w-16 text-gray-600 dark:text-gray-300 capitalize">{sev}</span>
-                      <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-1.5">
-                        <div className={`${barColor} h-1.5 rounded-full`} style={{ width: `${pct}%` }} />
-                      </div>
-                      <span className="w-6 text-right text-xs font-medium text-gray-700 dark:text-gray-200">{count}</span>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-          </div>
-        ) : (
-          <p className="text-sm text-gray-400 dark:text-gray-400">Loading instance statistics...</p>
-        )}
-      </div>
-
     </div>
+  )
+}
+
+// ── Fleet Health components ─────────────────────────────────────────────
+
+function healthTone(score: number | null | undefined): string {
+  if (score == null) return 'text-gray-400'
+  if (score >= 0.95) return 'text-green-600'
+  if (score >= 0.8)  return 'text-amber-600'
+  return 'text-red-600'
+}
+
+function fmtDaysAgo(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
+  if (s < 3600)  return 'today'
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`
+  return `${Math.round(s / 86400)}d ago`
+}
+
+function FleetKpiTile({
+  icon: Icon, label, value, tone,
+}: { icon: React.ComponentType<{ className?: string }>; label: string; value: React.ReactNode; tone?: string }) {
+  return (
+    <div className="flex-1 min-w-[10rem] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3">
+      <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-gray-400 dark:text-gray-400">
+        <Icon className="w-3.5 h-3.5" />
+        {label}
+      </div>
+      <div className={`mt-1 text-2xl font-bold tabular-nums ${tone ?? 'text-gray-900 dark:text-gray-100'}`}>{value}</div>
+    </div>
+  )
+}
+
+function FleetHealthKpis({ fleet, loading }: { fleet: FleetOverview | undefined; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="flex flex-wrap gap-3">
+        {[0, 1, 2, 3].map(i => (
+          <div key={i} className="flex-1 min-w-[10rem] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3">
+            <div className="h-3 w-20 rounded bg-gray-100 dark:bg-gray-700 animate-pulse" />
+            <div className="mt-2 h-6 w-24 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+          </div>
+        ))}
+      </div>
+    )
+  }
+  const score = fleet?.overall_health_score ?? null
+  return (
+    <div className="flex flex-wrap gap-3">
+      <FleetKpiTile icon={ShieldCheck} label="Fleet health score"
+        value={score == null ? '—' : `${Math.round(score * 100)}%`}
+        tone={healthTone(score)} />
+      <FleetKpiTile icon={AlertCircle} label="Open incidents"
+        value={(fleet?.fleet_open_findings ?? 0).toLocaleString()}
+        tone={(fleet?.fleet_open_findings ?? 0) > 0 ? 'text-red-600' : 'text-green-600'} />
+      <FleetKpiTile icon={RotateCcw} label="Flapping incidents"
+        value={(fleet?.fleet_flapping_findings ?? 0).toLocaleString()}
+        tone={(fleet?.fleet_flapping_findings ?? 0) > 0 ? 'text-amber-600' : undefined} />
+      <FleetKpiTile icon={Clock} label="Oldest open"
+        value={fmtDaysAgo(fleet?.fleet_oldest_open_at)}
+        tone={fleet?.fleet_oldest_open_at ? 'text-red-600' : undefined} />
+    </div>
+  )
+}
+
+function FleetTrendChart({
+  fleet, axisColor, gridColor, loading,
+}: { fleet: FleetOverview | undefined; axisColor: string; gridColor: string; loading: boolean }) {
+  if (loading) {
+    return <div className="h-[180px] rounded bg-gray-50 dark:bg-gray-700/40 animate-pulse" />
+  }
+  const series = fleet?.trend ?? []
+  if (series.length === 0) {
+    return <div className="h-[180px] flex items-center justify-center text-sm text-gray-400 dark:text-gray-400">No execution history in the last 30 days.</div>
+  }
+  const points = series.map(p => ({
+    day: p.day,
+    passRate: p.pass_rate === null ? null : Math.round(p.pass_rate * 100),
+    failed: (p.failed ?? 0) + (p.error ?? 0),
+  }))
+  return (
+    <div style={{ width: '100%', height: 200 }}>
+      <ResponsiveContainer>
+        <LineChart data={points} margin={{ top: 5, right: 20, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+          <XAxis dataKey="day" tick={{ fontSize: 10, fill: axisColor }} />
+          <YAxis yAxisId="left"  domain={[0, 100]} tick={{ fontSize: 10, fill: axisColor }} />
+          <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 10, fill: axisColor }} />
+          <Tooltip contentStyle={{ fontSize: 12 }} />
+          <Line yAxisId="left"  type="monotone" dataKey="passRate" stroke="#16a34a" strokeWidth={2} dot={false} name="Pass rate %" />
+          <Line yAxisId="right" type="monotone" dataKey="failed"   stroke="#dc2626" strokeWidth={2} dot={false} name="Failed runs" />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+function WorstTablesList({
+  fleet, loading, onOpen,
+}: {
+  fleet: FleetOverview | undefined
+  loading: boolean
+  onOpen: (db: string, sc: string, tb: string) => void
+}) {
+  if (loading) {
+    return (
+      <div className="space-y-2">
+        {[0, 1, 2, 3].map(i => (
+          <div key={i} className="h-10 rounded bg-gray-50 dark:bg-gray-700/40 animate-pulse" />
+        ))}
+      </div>
+    )
+  }
+  const tables = fleet?.tables ?? []
+  if (tables.length === 0) {
+    return <div className="text-sm text-gray-400 dark:text-gray-400">No tables with executions yet.</div>
+  }
+  return (
+    <ul className="space-y-1.5">
+      {tables.map(t => {
+        const key = `${t.database}.${t.schema}.${t.table}`
+        const pr = t.pass_rate == null ? null : Math.round(t.pass_rate * 100)
+        return (
+          <li key={key}>
+            <button
+              onClick={() => onOpen(t.database, t.schema, t.table)}
+              className="w-full flex items-center justify-between gap-2 text-left px-2.5 py-1.5 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-gray-800 dark:text-gray-200 truncate" title={key}>{t.table}</div>
+                <div className="text-[11px] text-gray-400 dark:text-gray-400 truncate">{t.database}.{t.schema}</div>
+              </div>
+              <div className="flex items-center gap-3 flex-shrink-0">
+                {t.open_findings > 0 && (
+                  <span className="text-xs font-semibold text-red-600">{t.open_findings} open</span>
+                )}
+                {t.flapping > 0 && (
+                  <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 inline-flex items-center gap-0.5">
+                    <RotateCcw className="w-2.5 h-2.5" />{t.flapping}
+                  </span>
+                )}
+                {pr != null && (
+                  <span className={`text-xs font-medium tabular-nums ${pr >= 95 ? 'text-green-600' : pr >= 80 ? 'text-amber-600' : 'text-red-600'}`}>{pr}%</span>
+                )}
+                <ChevronRight className="w-3.5 h-3.5 text-gray-300" />
+              </div>
+            </button>
+          </li>
+        )
+      })}
+    </ul>
   )
 }

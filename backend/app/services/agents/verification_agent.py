@@ -168,9 +168,19 @@ class VerificationAgent:
 
             if finding.instance_id:
                 still_firing_now = finding.instance_id in still_firing_instance_ids
-            else:
-                # Legacy finding with no instance_id — use the old string key.
+            elif still_firing_legacy:
+                # Legacy finding with no instance_id — use the old string key
+                # only when we actually collected legacy keys (i.e. something
+                # re-fired via the legacy path). If still_firing_legacy is empty
+                # it means the legacy re-run path produced nothing — which is
+                # indistinguishable from "rule passed" vs "rule never ran", so
+                # we must NOT auto-resolve these findings.
                 still_firing_now = (rule_code, asset_fqn) in still_firing_legacy
+            else:
+                # No instance_id and no legacy re-fire data — treat as still
+                # open (unverifiable) rather than incorrectly auto-resolving.
+                still_open += 1
+                continue
 
             # Log one RULE_EXECUTIONS row per instance re-checked this pass
             # (skip duplicates if multiple findings share the same instance).
@@ -190,10 +200,13 @@ class VerificationAgent:
             )
 
             if not still_firing_now and rule_was_checked:
+                # Route through the lifecycle helper so LAST_SCAN_ID + audit
+                # trail stay consistent with scan-time RESOLVE (this used to
+                # bypass it and leave a stale LAST_SCAN_ID pointing at the
+                # scan that ORIGINALLY detected the finding).
+                storage.auto_resolve_finding(finding.id, scan_id="__verification__")
                 storage.update_finding(
                     finding.id,
-                    status="resolved",
-                    resolved_at=datetime.utcnow(),
                     resolution_notes="Auto-resolved by verification scan — rule no longer fires on current schema.",
                 )
                 newly_resolved += 1

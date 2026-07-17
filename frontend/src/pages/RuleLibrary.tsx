@@ -2,6 +2,7 @@ import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { ruleLibraryApi, rulesApi } from '../api/client'
+import { fmtIST } from '../utils/dates'
 import type { RuleDefinition, RuleInstance, RuleCreatePayload, GeneratedRule, Rule } from '../api/client'
 import {
   ShieldCheck, FileText, Database, Tag, Filter, Search, X,
@@ -167,7 +168,7 @@ function InstanceRow({ instance }: { instance: RuleInstance }) {
           {instance.status === 'active' && instance.approved_by && (
             <p className="text-xs text-green-700 dark:text-green-300 mt-1">
               ✓ Approved by <span className="font-medium">{instance.approved_by}</span>
-              {instance.approved_at ? ` · ${new Date(instance.approved_at).toLocaleString()}` : ''}
+              {instance.approved_at ? ` · ${fmtIST(instance.approved_at)}` : ''}
             </p>
           )}
           {instance.rejection_reason && (
@@ -465,7 +466,7 @@ function PendingReviewRow({ rule, onReviewed }: { rule: Rule; onReviewed: () => 
         <p className="text-[11px] text-gray-400 dark:text-gray-500 mt-0.5">
           Owner: <span className="text-gray-600 dark:text-gray-300">{rule.owner || '—'}</span>
           {rule.created_by ? <> · Added by: <span className="text-gray-600 dark:text-gray-300">{rule.created_by}</span></> : null}
-          {rule.created_at ? <> · {new Date(rule.created_at).toLocaleString()}</> : null}
+          {rule.created_at ? <> · {fmtIST(rule.created_at)}</> : null}
           {rule.applies_to?.length ? <> · Applies to: {rule.applies_to.join(', ')}</> : null}
         </p>
       </div>

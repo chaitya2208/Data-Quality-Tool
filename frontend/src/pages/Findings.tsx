@@ -2,17 +2,27 @@ import { useState, useMemo, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { findingsApi, rulesApi } from '../api/client'
-import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck, ChevronDown, ChevronRight, BrainCircuit, TableIcon } from 'lucide-react'
+import { fmtIST } from '../utils/dates'
+import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck, ChevronDown, ChevronRight, BrainCircuit, TableIcon, PanelRightOpen, Search } from 'lucide-react'
 import { useConnection } from '../ConnectionContext'
+import FindingDetailDrawer, { FailCountSparkline } from './FindingDetailDrawer'
 
 // ── Finding card ──────────────────────────────────────────────────────────────
 
-function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter, ruleFilter, rulesData, sevColor, stColor }: any) {
+function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter, ruleFilter, rulesData, sevColor, stColor, onOpenDetail }: any) {
   const [showSamples, setShowSamples] = useState(false)
 
   const ai = finding.evidence?.ai_explanation
   const sampleRows: Record<string, string>[] = finding.evidence?.sample_rows ?? []
   const sampleHeaders = sampleRows.length > 0 ? Object.keys(sampleRows[0]) : []
+
+  // Metadata-shape rules (PII, generic name, type mismatch, …) have no failing
+  // rows — dynamic_rules._finding defaults counts to 1/1. Suppress the
+  // "1/1 rows failing (100%)" chip on those; the finding itself IS the signal.
+  const isMetadataRule =
+    sampleRows.length === 0 &&
+    (finding.current_total_count ?? 0) <= 1 &&
+    (finding.current_fail_count ?? 0) <= 1
 
   const confidenceColor = (c: string) => ({
     high:   'text-green-700 bg-green-50 border-green-200',
@@ -152,6 +162,45 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
             </div>
           )}
 
+          {/* Incident-lifecycle strip: how long has this been broken, current
+              row-count trend, and a fail-count sparkline for the last N runs.
+              Always rendered so the "Details" affordance is discoverable even
+              for findings that predate the lifecycle columns (they'll just
+              show a Details button and no lifecycle chips). */}
+          {(
+            <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+              {finding.first_detected_at && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 border border-red-100 dark:border-red-800/40">
+                  Failing since {new Date(finding.first_detected_at).toLocaleDateString()}
+                </span>
+              )}
+              {!isMetadataRule && finding.current_fail_count != null && finding.current_total_count != null && (
+                <span className="inline-flex items-center gap-1 text-gray-700 dark:text-gray-300 font-medium tabular-nums">
+                  {finding.current_fail_count.toLocaleString()} / {finding.current_total_count.toLocaleString()} rows failing
+                  {finding.current_total_count > 0 && (
+                    <span className="text-red-600 dark:text-red-400 ml-1">({((finding.current_fail_count / finding.current_total_count) * 100).toFixed(1)}%)</span>
+                  )}
+                </span>
+              )}
+              {!isMetadataRule && (finding.fail_history?.length ?? 0) > 1 && (
+                <FailCountSparkline history={finding.fail_history} />
+              )}
+              {finding.reopened_count > 0 && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                  Flapping · reopened {finding.reopened_count}×
+                </span>
+              )}
+              <button
+                onClick={() => onOpenDetail?.(finding)}
+                className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/40"
+                title="Open detail drawer — full history, samples, mute"
+              >
+                <PanelRightOpen className="w-3 h-3" />
+                Details
+              </button>
+            </div>
+          )}
+
           <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500 dark:text-gray-300">
             {finding.context?.fqn && (
               <span className="font-mono bg-gray-50 dark:bg-gray-900 px-2 py-1 rounded border border-gray-200 dark:border-gray-700">
@@ -159,9 +208,15 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
               </span>
             )}
             <span className="flex items-center">
-              <span className="text-gray-400 dark:text-gray-400 mr-1">Detected:</span>
-              {new Date(finding.detected_at).toLocaleString()}
+              <span className="text-gray-400 dark:text-gray-400 mr-1">First seen:</span>
+              {fmtIST(finding.first_detected_at ?? finding.detected_at)}
             </span>
+            {finding.last_seen_at && (
+              <span className="flex items-center">
+                <span className="text-gray-400 dark:text-gray-400 mr-1">Last seen:</span>
+                {fmtIST(finding.last_seen_at)}
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -190,12 +245,14 @@ export default function Findings() {
   const [instanceFilter, setInstanceFilter] = useState(searchParams.get('instance') || '')
   // scan_id filter: pre-applied when navigating from Workflow "Fix Issues"
   const [scanIdFilter,   setScanIdFilter]   = useState(searchParams.get('scan_id')  || '')
+  const [searchQuery,    setSearchQuery]    = useState('')
 
   // URL-param helpers (table_name + database from Dashboard drill-down)
   const urlTableName = searchParams.get('table_name') || ''
   const urlDatabase  = searchParams.get('database')   || ''
 
   const [selectedFindings, setSelectedFindings] = useState<string[]>([])
+  const [detailFinding, setDetailFinding] = useState<any | null>(null)
   const [page, setPage] = useState(1)
   const PAGE_SIZE = 50
 
@@ -304,12 +361,20 @@ export default function Findings() {
       }
       if (ruleFilter && f.context?.rule_code !== ruleFilter) return false
       if (instanceFilter && f.instance_id !== instanceFilter) return false
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase()
+        const inTitle = f.title?.toLowerCase().includes(q)
+        const inTable = f.context?.table_name?.toLowerCase().includes(q)
+        const inRule  = (f.context?.rule_code ?? '').toLowerCase().includes(q)
+        const inDesc  = (f.description ?? '').toLowerCase().includes(q)
+        if (!inTitle && !inTable && !inRule && !inDesc) return false
+      }
       return true
     })
-  }, [allFindings, tableFilter, ruleFilter, instanceFilter])
+  }, [allFindings, tableFilter, ruleFilter, instanceFilter, searchQuery])
 
   // Reset to page 1 whenever filters change
-  useEffect(() => { setPage(1) }, [severityFilter, statusFilter, scanIdFilter, tableFilter, ruleFilter, instanceFilter])
+  useEffect(() => { setPage(1) }, [severityFilter, statusFilter, scanIdFilter, tableFilter, ruleFilter, instanceFilter, searchQuery])
 
   const totalPages = Math.max(1, Math.ceil(filteredFindings.length / PAGE_SIZE))
   const pagedFindings = filteredFindings.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
@@ -345,11 +410,11 @@ export default function Findings() {
 
   const clearAll = () => {
     setSeverityFilter(''); setStatusFilter(''); setTableFilter(''); setRuleFilter('')
-    setInstanceFilter(''); setScanIdFilter('')
+    setInstanceFilter(''); setScanIdFilter(''); setSearchQuery('')
     setSearchParams({})
   }
 
-  const anyFilter = severityFilter || statusFilter || tableFilter || ruleFilter || instanceFilter || scanIdFilter
+  const anyFilter = severityFilter || statusFilter || tableFilter || ruleFilter || instanceFilter || scanIdFilter || searchQuery
 
   // ── Colour helpers ─────────────────────────────────────────────────────────
   const sevColor = (s: string) => ({
@@ -360,9 +425,14 @@ export default function Findings() {
   }[s] ?? 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   const stColor = (s: string) => ({
-    detected:  'bg-red-50 text-red-700 border-red-200',
-    assigned:  'bg-blue-50 text-blue-700 border-blue-200',
-    resolved:  'bg-green-50 text-green-700 border-green-200',
+    detected:       'bg-red-50 text-red-700 border-red-200',
+    validated:      'bg-orange-50 text-orange-700 border-orange-200',
+    in_progress:    'bg-blue-50 text-blue-700 border-blue-200',
+    resolved:       'bg-green-50 text-green-700 border-green-200',
+    false_positive: 'bg-gray-100 text-gray-500 border-gray-300',
+    wont_fix:       'bg-yellow-50 text-yellow-700 border-yellow-200',
+    closed:         'bg-gray-50 text-gray-500 border-gray-200',
+    superseded:     'bg-purple-50 text-purple-600 border-purple-200',
   }[s] ?? 'bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   return (
@@ -402,6 +472,23 @@ export default function Findings() {
             <button onClick={clearAll}
               className="ml-auto flex items-center gap-1 text-xs text-gray-500 dark:text-gray-300 hover:text-gray-800 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700">
               <X className="w-3 h-3" /> Clear all
+            </button>
+          )}
+        </div>
+
+        {/* Search bar */}
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search by title, table, rule code, or description…"
+            className="w-full pl-9 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+          />
+          {searchQuery && (
+            <button onClick={() => setSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+              <X className="w-3.5 h-3.5" />
             </button>
           )}
         </div>
@@ -463,8 +550,13 @@ export default function Findings() {
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Statuses</option>
               <option value="detected">Detected</option>
-              <option value="assigned">Assigned</option>
+              <option value="validated">Validated</option>
+              <option value="in_progress">In Progress</option>
               <option value="resolved">Resolved</option>
+              <option value="false_positive">False Positive</option>
+              <option value="wont_fix">Won't Fix</option>
+              <option value="closed">Closed</option>
+              <option value="superseded">Superseded</option>
             </select>
           </div>
         </div>
@@ -576,6 +668,7 @@ export default function Findings() {
                 rulesData={rulesData}
                 sevColor={sevColor}
                 stColor={stColor}
+                onOpenDetail={setDetailFinding}
               />
             ))}
           </div>
@@ -621,6 +714,10 @@ export default function Findings() {
             </button>
           </div>
         </div>
+      )}
+
+      {detailFinding && (
+        <FindingDetailDrawer finding={detailFinding} onClose={() => setDetailFinding(null)} />
       )}
     </div>
   )

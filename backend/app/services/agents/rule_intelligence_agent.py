@@ -184,6 +184,17 @@ what is already running or pending on this exact table), you will:
    this table referenced) before it can ever run — if it fails validation
    the instance is discarded, so write it carefully and test it mentally
    against the column stats you were given.
+   CRITICAL — FAILED_COUNT counts ROWS, never groups. If the concept
+   involves duplicates, aggregations, or a HAVING filter, FAILED_COUNT must
+   equal the number of underlying rows that violate the rule, so it agrees
+   with a "sample of failing rows" SELECT using the same predicate. For
+   example, for a uniqueness-style check use
+     SELECT COALESCE(SUM(CNT), 0) AS FAILED_COUNT,
+            (SELECT COUNT(*) FROM T) AS TOTAL_COUNT
+     FROM (SELECT col, COUNT(*) AS CNT FROM T
+           WHERE col IS NOT NULL GROUP BY col HAVING COUNT(*) > 1)
+   — not `SELECT COUNT(*)` over the grouped subquery, which would return
+   the number of duplicate groups (wrong) instead of duplicate rows (right).
 5. Use the column statistics (null%, distinct count, min/max, top values)
    to decide whether a check is worth proposing and whether it's currently
    violated — you have real numbers, not just a 3-row guess.
@@ -914,6 +925,9 @@ class RuleIntelligenceAgent:
                 f"Rules:\n"
                 f"- Must be a single SELECT statement\n"
                 f"- Must return exactly two columns named FAILED_COUNT and TOTAL_COUNT\n"
+                f"- FAILED_COUNT counts ROWS that violate the rule, never groups.\n"
+                f"  For duplicate/uniqueness-style checks use SUM(CNT) over the\n"
+                f"  GROUP BY … HAVING COUNT(*) > 1 subquery, not COUNT(*).\n"
                 f"- May only reference these tables: {', '.join(allowed_tables)}\n"
                 f"- No DML, no CTEs that reference other tables, no LIMIT\n\n"
                 f"Original SQL:\n{draft_sql}\n\n"
@@ -1315,10 +1329,18 @@ class RuleIntelligenceAgent:
         runs produce the same name so similarity match hits on re-run, closing
         the library-bloat loop that rationale-prose slugs left open."""
         if template_shape:
-            target = column_name or scope or "table"
-            return f"AI: {template_shape} on {target}"[:100]
+            # Generic shape name — instance-specific targeting lives on the
+            # instance, not the definition. This fallback should only fire if
+            # the canonical seeded definition is somehow missing.
+            shape_labels = {
+                "not_null": "Not Null", "uniqueness": "Column Uniqueness",
+                "accepted_values": "Accepted Values", "range": "Numeric Range",
+                "regex_match": "Format / Regex Match", "freshness": "Stale Timestamp / Data Freshness",
+                "duplicate_key": "Duplicate Composite Key", "referential_integrity": "Referential Integrity",
+            }
+            return shape_labels.get(template_shape, template_shape.replace("_", " ").title())
         if column_name:
-            return f"AI check on {column_name}"[:100]
+            return f"Custom Check on {column_name}"[:100]
         # Nothing structural to hook to — fall back to rationale prefix.
         return (rationale[:60].rstrip(".,;:") or "AI-proposed check")
 
