@@ -58,6 +58,11 @@ class ScanService:
         if not columns:
             raise ValueError(f"Table {database}.{schema}.{table} not found or has no columns")
 
+        # Schema drift Tier 1: snapshot the prior column asset state BEFORE
+        # the upsert overwrites it. The diff runs after the upsert.
+        from app.services import schema_drift
+        prior_column_snapshot = schema_drift.snapshot_columns(database, schema, table)
+
         table_fqn = f"{database}.{schema}.{table}"
         table_asset = self.create_or_update_asset(
             fqn=table_fqn,
@@ -105,8 +110,26 @@ class ScanService:
 
         storage.update_asset_last_scanned(table_asset.id)
 
+        # Compute drift findings vs prior snapshot and stash on the scan for
+        # FindingsAgent to fold into its lifecycle pass. Non-fatal if it fails.
+        try:
+            drift_findings = schema_drift.detect_column_drift(
+                scan_id=scan.id,
+                table_asset=table_asset,
+                prior_snapshot=prior_column_snapshot,
+                live_columns=columns,
+            )
+        except Exception as e:
+            logger.warning(f"[MetadataAgent] drift detection failed for {table_fqn}: {e}")
+            drift_findings = []
+        # Attach as a plain attribute — the downstream FindingsAgent looks for
+        # this via getattr(scan, "drift_findings", []) and merges it into
+        # findings_data before finalize_scan.
+        setattr(scan, "drift_findings", drift_findings)
+
         logger.info(
             f"[MetadataAgent] Done: {table_fqn} — {len(column_assets)} columns"
+            + (f", {len(drift_findings)} drift finding(s)" if drift_findings else "")
         )
         return scan, table_asset, column_assets
 
@@ -152,6 +175,10 @@ class ScanService:
 
             if not table_metadata:
                 raise ValueError(f"Table {database}.{schema}.{table} not found")
+
+            # Schema drift snapshot (BEFORE upsert overwrites ASSETS).
+            from app.services import schema_drift
+            prior_column_snapshot = schema_drift.snapshot_columns(database, schema, table)
 
             table_fqn = f"{database}.{schema}.{table}"
             table_asset = self.create_or_update_asset(
@@ -205,6 +232,23 @@ class ScanService:
                 table_asset, column_assets, scan.id
             )
 
+            # Fold in schema drift findings — same shape as rule engine output.
+            try:
+                live_cols = [
+                    {"column_name": c["COLUMN_NAME"],
+                     "data_type":   c.get("DATA_TYPE"),
+                     "is_nullable": c.get("IS_NULLABLE")}
+                    for c in columns
+                ]
+                drift_findings = schema_drift.detect_column_drift(
+                    scan_id=scan.id, table_asset=table_asset,
+                    prior_snapshot=prior_column_snapshot, live_columns=live_cols,
+                )
+            except Exception as e:
+                logger.warning(f"drift detection failed for {table_fqn}: {e}")
+                drift_findings = []
+            findings_data = list(findings_data) + drift_findings
+
             # Persist findings through the incident-lifecycle finalizer so
             # this legacy path stays consistent with the agentic workflow —
             # no more raw create_finding twins. We only know the FAILED
@@ -214,6 +258,21 @@ class ScanService:
             # happens in a single call: safe.
             from app.services.scan_finalizer import finalize_scan
             failed_iids = {fd.get("instance_id") for fd in findings_data if fd.get("instance_id")}
+            # Include drift instance ids for both failing AND passing drift
+            # checks in this scan, so a resolved drift incident (e.g. a
+            # re-added column) actually auto-closes.
+            drift_failed_handlers = {
+                (f.get("context") or {}).get("rule_code", "").lower()
+                for f in drift_findings
+            }
+            for hk in schema_drift.DRIFT_HANDLER_KEYS:
+                if hk in drift_failed_handlers:
+                    continue
+                iid = schema_drift._ensure_per_table_drift_instance(
+                    hk, database, schema, table,
+                ).id
+                if storage.find_open_finding(iid, table_asset.id):
+                    failed_iids.add(iid)
             stats = finalize_scan(
                 scan_id=scan.id,
                 asset_id_for_passed=table_asset.id,

@@ -79,6 +79,20 @@ class FindingsAgent:
             source=source,
         )
 
+        # Schema drift findings — computed in MetadataAgent's scan pass and
+        # stashed on the scan object. Merge in BEFORE severity overrides so
+        # drift severity can also be overridden if configured. Their
+        # instance_ids are threaded into executed_instance_ids so the
+        # finalizer's PASS branch can auto-resolve a drift incident once the
+        # schema is stable again (e.g. a removed column re-added).
+        drift_findings = list(getattr(scan, "drift_findings", []) or [])
+        drift_executed_iids: Set[str] = {
+            f["instance_id"] for f in drift_findings if f.get("instance_id")
+        }
+        if drift_findings:
+            findings_data = list(findings_data) + drift_findings
+            logger.info(f"[FindingsAgent] Merged {len(drift_findings)} drift finding(s)")
+
         # Severity overrides are applied to the produced findings in memory —
         # NEVER by mutating the shared instance row. The old approach wrote the
         # override onto RULE_INSTANCES, ran the check, then restored it; if
@@ -95,6 +109,36 @@ class FindingsAgent:
         executed_instance_ids = self._log_executions(
             findings_data, allowed_instance_ids, scan.id, run_id,
         )
+        # Drift instances aren't in allowed_instance_ids (they're auto-
+        # provisioned per-table by schema_drift, not part of the approved
+        # rule set for this scan). Include them in the finalizer's executed
+        # set so PASS-branch auto-resolve fires when drift disappears.
+        for iid in drift_executed_iids:
+            executed_instance_ids.add(iid)
+        # Also mark passed drift instances: for any drift handler we didn't
+        # emit a finding for this scan, log a PASSED execution + include in
+        # the executed set. This is what lets a prior drift incident resolve.
+        drift_failed_handler_keys = {
+            (f.get("context") or {}).get("rule_code", "").lower()
+            for f in drift_findings
+        }
+        from app.services.schema_drift import DRIFT_HANDLER_KEYS, _ensure_per_table_drift_instance
+        for hk in DRIFT_HANDLER_KEYS:
+            if hk in drift_failed_handler_keys:
+                continue  # already accounted for via drift_executed_iids
+            # Only log a PASS if a prior open incident exists — otherwise this
+            # writes a PASSED execution for every drift check on every scan
+            # even when there was never a problem, which is just noise.
+            iid = _ensure_per_table_drift_instance(
+                hk, table_asset.database_name, table_asset.schema_name,
+                table_asset.table_name,
+            ).id
+            if storage.find_open_finding(iid, table_asset.id):
+                storage.create_execution(
+                    instance_id=iid, status="passed",
+                    scan_id=scan.id, run_id=run_id, evidence=None,
+                )
+                executed_instance_ids.add(iid)
 
         # Incident lifecycle: UPDATE / RESOLVE / REOPEN / CREATE per
         # (instance, asset). Replaces the old supersede-then-bulk-insert flow.
