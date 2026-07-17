@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+#
+# Data Quality — Shift-Left DDL Validation pre-commit hook (Gate 1)
+#
+# Runs ci/validate_ddl.py against every staged *.sql file that contains a
+# CREATE TABLE statement, before the commit is recorded. Catches metadata /
+# convention problems (missing PK, unmasked PII, date-as-VARCHAR, nullable ID,
+# boolean-as-VARCHAR) so they never reach Snowflake.
+#
+# SOFT MODE (default): findings are printed as WARNINGS and the commit is
+# ALLOWED through (exit 0). Flip DQ_BLOCK=1 to make blocking findings abort the
+# commit once the team is ready to enforce.
+#
+# Config via environment variables:
+#   DQ_URL      Base URL of the DQ Platform backend (default http://localhost:8000)
+#   DQ_FAIL_ON  Space-separated severities that count as "blocking"
+#               (default "critical high")
+#   DQ_BLOCK    "1" = abort commit on blocking findings; anything else = warn only
+#
+# Install:  bash ci/hooks/install-hooks.sh   (sets core.hooksPath = ci/hooks)
+# Bypass:   git commit --no-verify
+
+set -u
+
+DQ_URL="${DQ_URL:-http://localhost:8000}"
+DQ_FAIL_ON="${DQ_FAIL_ON:-critical high}"
+DQ_BLOCK="${DQ_BLOCK:-0}"
+
+# Locate repo root and the validator (relative to this hook, which lives in
+# ci/hooks/ regardless of where core.hooksPath points).
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+VALIDATOR="$REPO_ROOT/ci/validate_ddl.py"
+
+if [ ! -f "$VALIDATOR" ]; then
+    echo "[dq] validator not found at $VALIDATOR — skipping DDL validation." >&2
+    exit 0
+fi
+
+# Pick a python interpreter (validator is stdlib-only, so any 3.x works).
+PY=""
+for candidate in python python3 py; do
+    if command -v "$candidate" >/dev/null 2>&1; then PY="$candidate"; break; fi
+done
+if [ -z "$PY" ]; then
+    echo "[dq] no python interpreter found — skipping DDL validation." >&2
+    exit 0
+fi
+
+# Staged files added/copied/modified (not deleted), *.sql only.
+STAGED_SQL="$(git diff --cached --name-only --diff-filter=ACM -- '*.sql')"
+if [ -z "$STAGED_SQL" ]; then
+    exit 0
+fi
+
+echo "[dq] Shift-left DDL validation on staged .sql files…"
+
+had_blocking=0
+checked_any=0
+
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    # Only bother validating files that actually declare a table.
+    if ! grep -iqE 'create[[:space:]]+(or[[:space:]]+replace[[:space:]]+)?(transient[[:space:]]+)?table' "$REPO_ROOT/$file"; then
+        continue
+    fi
+    checked_any=1
+    echo ""
+    echo "── $file ─────────────────────────────────────────────"
+    # --allow-offline: if the backend is down, warn and pass rather than block
+    # a developer who doesn't have it running locally.
+    "$PY" "$VALIDATOR" \
+        --sql "$REPO_ROOT/$file" \
+        --url "$DQ_URL" \
+        --fail-on $DQ_FAIL_ON \
+        --allow-offline
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        had_blocking=1
+    fi
+done <<EOF
+$STAGED_SQL
+EOF
+
+if [ "$checked_any" -eq 0 ]; then
+    exit 0
+fi
+
+echo ""
+if [ "$had_blocking" -ne 0 ]; then
+    if [ "$DQ_BLOCK" = "1" ]; then
+        echo "[dq] ✗ Blocking DDL findings — commit aborted (DQ_BLOCK=1)." >&2
+        echo "[dq]   Fix the findings above, or bypass with: git commit --no-verify" >&2
+        exit 1
+    fi
+    echo "[dq] ⚠ Blocking DDL findings above (soft mode — commit allowed)." >&2
+    echo "[dq]   Set DQ_BLOCK=1 to enforce, or fix before pushing." >&2
+else
+    echo "[dq] ✓ DDL validation clean."
+fi
+
+# Soft mode: never block the commit.
+exit 0
