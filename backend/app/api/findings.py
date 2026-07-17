@@ -1,118 +1,143 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from typing import Optional, List
-from app.core.database import get_db
-from app.models.finding import Finding, FindingStatus
-from app.models.asset import Asset
+from fastapi import APIRouter, HTTPException
+from typing import Optional
+from app.services import storage
 from app.schemas.finding import FindingResponse, FindingListResponse, FindingUpdate
 from datetime import datetime
 from collections import defaultdict
+import logging
+import time
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Simple TTL cache — avoids re-hitting Snowflake on every page visit
+_findings_cache: dict = {}   # key → (expires_at, payload)
+_CACHE_TTL = 30              # seconds
+
+
+def _cache_key(asset_id, scan_id, status, severity, connection_id, skip, limit):
+    return f"{asset_id}|{scan_id}|{status}|{severity}|{connection_id}|{skip}|{limit}"
+
+
+def _invalidate_findings_cache():
+    _findings_cache.clear()
 
 
 @router.get("", response_model=FindingListResponse)
 def list_findings(
     asset_id: Optional[str] = None,
     scan_id: Optional[str] = None,
-    status: Optional[FindingStatus] = None,
+    status: Optional[str] = None,
     severity: Optional[str] = None,
+    connection_id: Optional[str] = None,
     skip: int = 0,
     limit: int = 5000,
-    db: Session = Depends(get_db)
 ):
     """List all findings with optional filters"""
-    query = db.query(Finding)
+    key = _cache_key(asset_id, scan_id, status, severity, connection_id, skip, limit)
+    cached = _findings_cache.get(key)
+    if cached and cached[0] > time.time():
+        return cached[1]
 
-    if asset_id:
-        query = query.filter(Finding.asset_id == asset_id)
-    if scan_id:
-        query = query.filter(Finding.scan_id == scan_id)
-    if status:
-        query = query.filter(Finding.status == status)
-    if severity:
-        query = query.filter(Finding.severity == severity)
-
-    # Order by most recent first
-    query = query.order_by(Finding.detected_at.desc())
-
-    total = query.count()
-    findings = query.offset(skip).limit(limit).all()
-
-    return FindingListResponse(total=total, findings=findings)
+    total, raw_findings = storage.list_findings(
+        asset_id=asset_id, scan_id=scan_id, status=status, severity=severity,
+        connection_id=connection_id, skip=skip, limit=limit,
+    )
+    findings = []
+    for f in raw_findings:
+        try:
+            findings.append(FindingResponse.model_validate(f, from_attributes=True))
+        except Exception as e:
+            logger.warning(f"[findings] Skipping unserializable finding {getattr(f, 'id', '?')}: {e}")
+    result = FindingListResponse(total=total, findings=findings)
+    _findings_cache[key] = (time.time() + _CACHE_TTL, result)
+    return result
 
 
 @router.get("/{finding_id}", response_model=FindingResponse)
-def get_finding(finding_id: str, db: Session = Depends(get_db)):
+def get_finding(finding_id: str):
     """Get a specific finding by ID"""
-    finding = db.query(Finding).filter(Finding.id == finding_id).first()
+    finding = storage.get_finding(finding_id)
     if not finding:
         raise HTTPException(status_code=404, detail="Finding not found")
     return finding
 
 
 @router.patch("/{finding_id}", response_model=FindingResponse)
-def update_finding(
-    finding_id: str,
-    update_data: FindingUpdate,
-    db: Session = Depends(get_db)
-):
+def update_finding(finding_id: str, update_data: FindingUpdate):
     """Update a finding (status, assignment, resolution notes)"""
-    finding = db.query(Finding).filter(Finding.id == finding_id).first()
+    finding = storage.get_finding(finding_id)
     if not finding:
         raise HTTPException(status_code=404, detail="Finding not found")
 
-    # Update fields
+    fields = {}
     if update_data.status is not None:
-        finding.status = update_data.status
-
-        # Update timestamps based on status change
-        if update_data.status == FindingStatus.VALIDATED and not finding.validated_at:
-            finding.validated_at = datetime.utcnow()
-        elif update_data.status == FindingStatus.RESOLVED and not finding.resolved_at:
-            finding.resolved_at = datetime.utcnow()
-        elif update_data.status == FindingStatus.CLOSED and not finding.closed_at:
-            finding.closed_at = datetime.utcnow()
+        # FindingStatus is a (str, Enum); the Snowflake connector rejects binding
+        # the enum member itself ("Binding data in type (findingstatus) is not
+        # supported"), so coerce to its plain string value.
+        status_value = update_data.status.value if hasattr(update_data.status, "value") else str(update_data.status)
+        fields["status"] = status_value
+        if status_value == "resolved" and not finding.resolved_at:
+            fields["resolved_at"] = datetime.utcnow()
+        elif status_value == "closed" and not finding.closed_at:
+            fields["closed_at"] = datetime.utcnow()
 
     if update_data.assigned_to is not None:
-        finding.assigned_to = update_data.assigned_to
+        fields["assigned_to"] = update_data.assigned_to
 
     if update_data.resolution_notes is not None:
-        finding.resolution_notes = update_data.resolution_notes
+        fields["resolution_notes"] = update_data.resolution_notes
 
-    finding.updated_at = datetime.utcnow()
+    result = storage.update_finding(finding_id, **fields)
+    _invalidate_findings_cache()
 
-    db.commit()
-    db.refresh(finding)
+    # If this update resolved/closed the finding and it was the LAST open finding
+    # for its run, kick an immediate verification so the workflow can complete
+    # right away instead of waiting for the 5-min auto-verify cycle. Best-effort:
+    # any failure here must never break the PATCH response.
+    _CLOSED_STATUSES = {"resolved", "false_positive", "wont_fix", "closed"}
+    if update_data.status is not None and fields.get("status") in _CLOSED_STATUSES:
+        try:
+            _maybe_trigger_verification(finding.scan_id)
+        except Exception as e:
+            logger.warning(f"[findings] post-resolve verify trigger failed: {e}")
 
-    return finding
+    return result
+
+
+def _maybe_trigger_verification(scan_id: Optional[str]) -> None:
+    """When a run's findings are all resolved, verify now (delay=0) rather than
+    waiting for the periodic auto-verify. Only acts on runs in awaiting_fixes."""
+    if not scan_id:
+        return
+    run = storage.get_agent_run_by_scan(scan_id)
+    if not run or run.status != "awaiting_fixes":
+        return
+    if storage.count_open_findings_for_scan(scan_id) > 0:
+        return  # still open findings — nothing to complete yet
+    from app.services.agents import auto_verify_scheduler
+    auto_verify_scheduler.schedule(run.id, delay=0)
+    logger.info(f"[findings] All findings resolved for run {run.id} — verifying now")
 
 
 @router.get("/stats/by-database")
-def get_findings_by_database(db: Session = Depends(get_db)):
+def get_findings_by_database(connection_id: Optional[str] = None):
     """
     Aggregate findings by database → schema → table.
     Joins findings with assets to get proper database/schema/table names.
-    Used for the dashboard chart.
+    Used for the dashboard chart. Optionally scoped to one connection.
     """
-    # Join findings with their assets to get database/schema/table
-    rows = (
-        db.query(Finding, Asset)
-        .join(Asset, Finding.asset_id == Asset.id)
-        .filter(Finding.status.notin_([FindingStatus.RESOLVED, FindingStatus.CLOSED]))
-        .all()
-    )
+    pairs = storage.findings_with_asset_not_closed(connection_id=connection_id)
 
-    # Build nested structure: database → tables with counts
     db_map: dict = defaultdict(lambda: defaultdict(lambda: {"total": 0, "by_severity": defaultdict(int)}))
 
-    for finding, asset in rows:
+    for finding, asset in pairs:
         db_name    = asset.database_name or "Unknown"
         table_name = asset.table_name or asset.fqn or "Unknown"
         db_map[db_name][table_name]["total"] += 1
         db_map[db_name][table_name]["by_severity"][finding.severity] += 1
 
-    # Shape into list sorted by total descending
     result = []
     for db_name, tables in db_map.items():
         table_list = []
@@ -135,22 +160,6 @@ def get_findings_by_database(db: Session = Depends(get_db)):
 
 
 @router.get("/stats/summary")
-def get_findings_summary(db: Session = Depends(get_db)):
-    """Get summary statistics of findings"""
-    total = db.query(Finding).count()
-
-    by_status = {}
-    for status in FindingStatus:
-        count = db.query(Finding).filter(Finding.status == status).count()
-        by_status[status.value] = count
-
-    by_severity = {}
-    for severity in ["critical", "high", "medium", "low", "info"]:
-        count = db.query(Finding).filter(Finding.severity == severity).count()
-        by_severity[severity] = count
-
-    return {
-        "total": total,
-        "by_status": by_status,
-        "by_severity": by_severity,
-    }
+def get_findings_summary(connection_id: Optional[str] = None):
+    """Get summary statistics of findings, optionally scoped to one connection."""
+    return storage.findings_summary(connection_id=connection_id)

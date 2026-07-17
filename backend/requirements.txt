@@ -4,14 +4,18 @@ uvicorn[standard]==0.27.0
 pydantic==2.5.3
 pydantic-settings==2.1.0
 
-# Database
-sqlalchemy==2.0.25
-alembic==1.13.1
+# Snowflake — app storage (assets/scans/findings/rules/etc.) and source-table
+# scanning both go through this connector; no ORM layer.
+snowflake-connector-python==3.6.0
+
+# Postgres/RDS source adapter (multi-source connections) — psycopg v3.
+# App state lives in Snowflake; this is only for scanning Postgres sources.
 psycopg[binary]==3.1.18
 
-# Snowflake
-snowflake-connector-python==3.6.0
-snowflake-sqlalchemy==1.5.1
+# Real SQL parser for validating any SQL that reaches an executable
+# RULE_INSTANCES.rule_sql (template-rendered or Claude-drafted) before it
+# ever runs against Snowflake — see app/services/sql_validation.py.
+sqlglot>=23.0.0
 
 # Anthropic Claude API (via AWS Bedrock)
 anthropic[bedrock]>=0.116.0

@@ -1,0 +1,30 @@
+-- Chaitya's multi-source connections + app settings, ported from the old
+-- SQLAlchemy models (connection.py, app_setting.py) into the DQ_APP schema.
+-- "SCHEMA", "KEY", "VALUE" are reserved words in Snowflake so they are quoted;
+-- kept uppercase so DictCursor returns them as UPPERCASE keys like every other
+-- column (the storage reshaper reads row["SCHEMA"] and exposes it as .schema_).
+
+CREATE TABLE IF NOT EXISTS CONNECTIONS (
+	ID VARCHAR(36) NOT NULL,
+	NAME VARCHAR(255) NOT NULL,
+	TYPE VARCHAR(50) NOT NULL,
+	HOST VARCHAR(512),
+	PORT NUMBER(38,0),
+	DATABASE VARCHAR(255),
+	"SCHEMA" VARCHAR(255),
+	USERNAME VARCHAR(255),
+	SECRET VARCHAR(16777216),
+	AUTH_METHOD VARCHAR(50),
+	EXTRA VARIANT,
+	IS_ACTIVE BOOLEAN NOT NULL DEFAULT TRUE,
+	CREATED_AT TIMESTAMP_TZ(9) NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+	UPDATED_AT TIMESTAMP_TZ(9) NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+	PRIMARY KEY (ID)
+);
+
+CREATE TABLE IF NOT EXISTS APP_SETTINGS (
+	"KEY" VARCHAR(128) NOT NULL,
+	"VALUE" VARIANT,
+	UPDATED_AT TIMESTAMP_TZ(9) NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+	PRIMARY KEY ("KEY")
+);

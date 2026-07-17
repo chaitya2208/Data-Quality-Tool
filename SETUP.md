@@ -1,3 +1,5 @@
+C:\D\Agentic-App-v2\Data-Quality-Tool\backend> cd C:\D\Agentic-App-v2\Data-Quality-Tool\backend && .venv\Scripts\activate && uvicorn   app.main:app --port 8002
+
 # Setup Guide - Data Quality Platform
 
 This guide will walk you through setting up the backend for Phase 0.
@@ -5,29 +7,10 @@ This guide will walk you through setting up the backend for Phase 0.
 ## Prerequisites
 
 - Python 3.9+
-- PostgreSQL 15+ (or use Docker)
-- Snowflake account with credentials
+- Snowflake account with credentials (app storage and source-table scanning
+  both live in Snowflake — no separate database to install)
 
-## Step 1: Database Setup
-
-### Option A: Using Docker (Recommended)
-
-```bash
-cd backend
-docker-compose up -d
-```
-
-This will start PostgreSQL on port 5432.
-
-### Option B: Local PostgreSQL
-
-Install PostgreSQL and create a database:
-
-```sql
-CREATE DATABASE data_quality;
-```
-
-## Step 2: Backend Setup
+## Step 1: Backend Setup
 
 ### 1. Create virtual environment
 
@@ -59,17 +42,17 @@ cp .env.example .env
 Edit `.env` with your actual values:
 
 ```env
-# Database
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/data_quality
-
-# Snowflake - Update these with your credentials
+# Snowflake - Update these with your credentials.
+# App storage (assets/scans/findings/rules/etc.) lives in SNOWFLAKE_APP_SCHEMA
+# inside SNOWFLAKE_DATABASE — separate from whatever source data gets scanned.
 SNOWFLAKE_ACCOUNT=your_account
 SNOWFLAKE_USER=your_user
 SNOWFLAKE_PASSWORD=your_password
 SNOWFLAKE_WAREHOUSE=your_warehouse
-SNOWFLAKE_DATABASE=your_database
+SNOWFLAKE_DATABASE=PLAYGROUND_DB
 SNOWFLAKE_SCHEMA=your_schema
 SNOWFLAKE_ROLE=your_role
+SNOWFLAKE_APP_SCHEMA=DQ_APP
 
 # API
 API_V1_STR=/api/v1
@@ -89,8 +72,8 @@ python setup_db.py
 ```
 
 This will:
-- Create all database tables
-- Initialize default rules (MISSING_TABLE_COMMENT, MISSING_TABLE_OWNER, MISSING_COLUMN_COMMENT)
+- Create the DQ_APP schema and all app tables in Snowflake (see `backend/snowflake/*.sql`)
+- Seed default rules (MISSING_TABLE_COMMENT, MISSING_TABLE_OWNER, MISSING_COLUMN_COMMENT, plus the 12 dynamic rule codes)
 
 ## Step 3: Start the Backend Server
 
@@ -195,13 +178,6 @@ After setup, you can:
 
 ## Troubleshooting
 
-### Database connection issues
-
-Check that PostgreSQL is running:
-```bash
-docker ps  # If using Docker
-```
-
 ### Snowflake connection issues
 
 1. Verify your credentials in `.env`
@@ -225,9 +201,8 @@ With Phase 0 complete, you now have:
 - ✅ Full CRUD operations
 
 **What to build next:**
-1. React frontend to visualize findings
-2. More sophisticated rules
-3. Background job processing for async scans
-4. AI-powered recommendations (Phase 2)
+1. More sophisticated rules
+2. Background job processing for async scans
+3. AI-powered recommendations (Phase 2)
 
 See the main README.md for the full roadmap.

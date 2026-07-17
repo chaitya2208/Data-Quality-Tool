@@ -16,6 +16,12 @@ build/
 *.db
 *.sqlite3
 *.sql
+# ...but the app-schema DDL run by setup_db.py MUST be tracked (this is what
+# creates the DQ_APP tables on a fresh clone — the reason harsh's branch
+# couldn't boot was these files being ignored).
+!backend/snowflake/*.sql
+# Never commit the throwaway GET_DDL dump helper output.
+backend/snowflake/_*.sql
 
 # Environment
 .env

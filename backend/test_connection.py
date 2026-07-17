@@ -75,38 +75,37 @@ def test_snowflake_connection():
         return False
 
 
-def test_database_connection():
-    """Test PostgreSQL connection"""
+def test_app_storage() -> bool:
+    """
+    Test app storage — the SNOWFLAKE_APP_SCHEMA tables (assets/scans/findings/
+    rules/etc.) that setup_db.py creates. Runs on the same Snowflake connection
+    as test_snowflake_connection(), just scoped to the app's own schema.
+    """
     print("\n" + "=" * 60)
-    print("Testing Database Connection")
+    print("Testing App Storage (Snowflake)")
     print("=" * 60)
 
     try:
-        from app.core.database import engine
-        from sqlalchemy import text
+        from app.services.snowflake_session import session as sf_session
 
-        print(f"\nDatabase URL: {settings.DATABASE_URL.split('@')[1]}")  # Hide password
+        print(f"\nDatabase: {settings.SNOWFLAKE_DATABASE}")
+        print(f"App schema: {settings.SNOWFLAKE_APP_SCHEMA}")
 
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT version()"))
-            version = result.fetchone()[0]
-            print(f"\n✓ PostgreSQL connection successful!")
-            print(f"  Version: {version.split(',')[0]}")
+        sf_session.connect()
+        rows = sf_session.query(
+            f"SHOW TABLES IN SCHEMA {settings.SNOWFLAKE_DATABASE}.{settings.SNOWFLAKE_APP_SCHEMA}"
+        )
+        tables = [r.get("name") or r.get("NAME") for r in rows if r.get("name") or r.get("NAME")]
+        print(f"\n✓ App schema reachable!")
+        print(f"  Found {len(tables)} tables: {', '.join(tables) or '(none — run setup_db.py)'}")
 
-        # Check tables
-        from app.core.database import Base
-        print("\n✓ Checking tables...")
-        tables = Base.metadata.tables.keys()
-        print(f"  Found {len(tables)} tables: {', '.join(tables)}")
-
-        return True
+        return len(tables) > 0
 
     except Exception as e:
-        print(f"\n✗ Database connection failed: {str(e)}")
+        print(f"\n✗ App storage check failed: {str(e)}")
         print("\nPlease check:")
-        print("  1. PostgreSQL is running (docker-compose up -d)")
-        print("  2. DATABASE_URL in .env is correct")
-        print("  3. You ran 'python setup_db.py' to create tables")
+        print("  1. SNOWFLAKE_DATABASE / SNOWFLAKE_APP_SCHEMA in .env are correct")
+        print("  2. You ran 'python setup_db.py' to create the schema and tables")
         return False
 
 
@@ -116,20 +115,18 @@ def main():
     print("DATA QUALITY PLATFORM - CONNECTION TESTS")
     print("=" * 60)
 
-    # Test database first
-    db_ok = test_database_connection()
-
-    # Test Snowflake
+    # Test Snowflake first (app storage test reuses this connection)
     sf_ok = test_snowflake_connection()
+    storage_ok = test_app_storage()
 
     print("\n" + "=" * 60)
     print("TEST SUMMARY")
     print("=" * 60)
-    print(f"Database:  {'✓ PASS' if db_ok else '✗ FAIL'}")
-    print(f"Snowflake: {'✓ PASS' if sf_ok else '✗ FAIL'}")
+    print(f"Snowflake:   {'✓ PASS' if sf_ok else '✗ FAIL'}")
+    print(f"App Storage: {'✓ PASS' if storage_ok else '✗ FAIL'}")
     print("=" * 60)
 
-    if db_ok and sf_ok:
+    if sf_ok and storage_ok:
         print("\n✓ All systems operational! You can now start the API server:")
         print("  uvicorn app.main:app --reload")
         sys.exit(0)

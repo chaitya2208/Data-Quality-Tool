@@ -1,51 +1,310 @@
 import { useState, useMemo, useEffect } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { findingsApi, assetsApi, rulesApi } from '../api/client'
-import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck } from 'lucide-react'
+import { findingsApi, rulesApi } from '../api/client'
+import { fmtIST } from '../utils/dates'
+import { AlertCircle, Filter, X, Database, Sparkles, ShieldCheck, ChevronDown, ChevronRight, BrainCircuit, TableIcon, PanelRightOpen, Search } from 'lucide-react'
+import { useConnection } from '../ConnectionContext'
+import FindingDetailDrawer, { FailCountSparkline } from './FindingDetailDrawer'
+
+// ── Finding card ──────────────────────────────────────────────────────────────
+
+function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter, ruleFilter, rulesData, sevColor, stColor, onOpenDetail }: any) {
+  const [showSamples, setShowSamples] = useState(false)
+
+  const ai = finding.evidence?.ai_explanation
+  const sampleRows: Record<string, string>[] = finding.evidence?.sample_rows ?? []
+  const sampleHeaders = sampleRows.length > 0 ? Object.keys(sampleRows[0]) : []
+
+  // Metadata-shape rules (PII, generic name, type mismatch, …) have no failing
+  // rows — dynamic_rules._finding defaults counts to 1/1. Suppress the
+  // "1/1 rows failing (100%)" chip on those; the finding itself IS the signal.
+  const isMetadataRule =
+    sampleRows.length === 0 &&
+    (finding.current_total_count ?? 0) <= 1 &&
+    (finding.current_fail_count ?? 0) <= 1
+
+  const confidenceColor = (c: string) => ({
+    high:   'text-green-700 bg-green-50 border-green-200',
+    medium: 'text-yellow-700 bg-yellow-50 border-yellow-200',
+    low:    'text-red-700 bg-red-50 border-red-200',
+  }[c] ?? 'text-gray-600 bg-gray-50 border-gray-200')
+
+  return (
+    <div className="p-6 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 pt-1">
+          <input type="checkbox"
+            checked={selected}
+            onChange={onSelect}
+            className="w-5 h-5 text-primary-600 border-gray-300 dark:border-gray-600 rounded focus:ring-primary-500 cursor-pointer" />
+        </div>
+
+        <div className="flex-1 min-w-0">
+          {/* Badges row */}
+          <div className="flex flex-wrap items-center gap-2 mb-2">
+            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${sevColor(finding.severity)}`}>
+              {finding.severity.toUpperCase()}
+            </span>
+            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${stColor(finding.status)}`}>
+              {finding.status}
+            </span>
+            {finding.context?.rule_code && (
+              <button
+                onClick={() => onRuleFilter(finding.context.rule_code)}
+                className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border transition-colors ${
+                  ruleFilter === finding.context.rule_code
+                    ? 'bg-purple-200 text-purple-900 border-purple-300'
+                    : 'bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100'
+                }`}
+                title="Filter by this rule"
+              >
+                <ShieldCheck className="w-3 h-3" />
+                {rulesData?.rules.find((r: any) => r.code === finding.context.rule_code)?.name ?? finding.context.rule_code}
+              </button>
+            )}
+            {ai && (
+              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border ${confidenceColor(ai.confidence)}`}>
+                <BrainCircuit className="w-3 h-3" />
+                AI · {ai.confidence}
+              </span>
+            )}
+          </div>
+
+          {/* Table badge */}
+          {finding.context?.table_name && (
+            <div className="mb-2">
+              <button
+                onClick={() => onTableFilter(
+                  `${finding.context.database_name}.${finding.context.schema_name}.${finding.context.table_name}`
+                )}
+                className="inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-300 dark:border-gray-600 hover:bg-gray-200 transition-colors"
+                title="Filter by this table"
+              >
+                <Database className="w-3 h-3 mr-1" />
+                {finding.context.table_name}
+              </button>
+            </div>
+          )}
+
+          <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-1">{finding.title}</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">{finding.description}</p>
+
+          {/* AI Explanation */}
+          {ai && (
+            <div className="mb-3 rounded-lg border border-purple-100 dark:border-purple-800/40 bg-purple-50/50 dark:bg-purple-950/20 p-3 space-y-1.5">
+              <div className="flex items-center gap-1.5 mb-1">
+                <BrainCircuit className="w-3.5 h-3.5 text-purple-600" />
+                <span className="text-xs font-semibold text-purple-800 dark:text-purple-300">AI Analysis</span>
+              </div>
+              {ai.root_cause && (
+                <div>
+                  <span className="text-xs font-medium text-purple-700 dark:text-purple-400">Root cause: </span>
+                  <span className="text-xs text-gray-700 dark:text-gray-300">{ai.root_cause}</span>
+                </div>
+              )}
+              {ai.affected_scope && (
+                <div>
+                  <span className="text-xs font-medium text-purple-700 dark:text-purple-400">Scope: </span>
+                  <span className="text-xs text-gray-700 dark:text-gray-300">{ai.affected_scope}</span>
+                </div>
+              )}
+              {ai.fix_action && (
+                <div>
+                  <span className="text-xs font-medium text-purple-700 dark:text-purple-400">Fix: </span>
+                  <span className="text-xs text-gray-700 dark:text-gray-300">{ai.fix_action}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Sample failed rows — collapsible */}
+          {sampleRows.length > 0 && (
+            <div className="mb-3">
+              <button
+                onClick={() => setShowSamples(s => !s)}
+                className="flex items-center gap-1.5 text-xs font-medium text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-gray-100 mb-1.5"
+              >
+                {showSamples
+                  ? <ChevronDown className="w-3.5 h-3.5" />
+                  : <ChevronRight className="w-3.5 h-3.5" />
+                }
+                <TableIcon className="w-3.5 h-3.5" />
+                {sampleRows.length} sample failing row{sampleRows.length !== 1 ? 's' : ''}
+              </button>
+              {showSamples && (
+                <div className="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-700">
+                  <table className="text-xs w-full">
+                    <thead className="bg-gray-100 dark:bg-gray-800">
+                      <tr>
+                        {sampleHeaders.map(h => (
+                          <th key={h} className="px-3 py-1.5 text-left font-semibold text-gray-600 dark:text-gray-300 whitespace-nowrap">
+                            {h}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100 dark:divide-gray-700 bg-white dark:bg-gray-900">
+                      {sampleRows.map((row, i) => (
+                        <tr key={i} className="hover:bg-red-50/50 dark:hover:bg-red-950/20">
+                          {sampleHeaders.map(h => (
+                            <td key={h} className="px-3 py-1.5 font-mono text-gray-700 dark:text-gray-300 whitespace-nowrap max-w-[200px] truncate"
+                                title={row[h]}>
+                              {row[h] ?? <span className="text-gray-400 italic">null</span>}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Incident-lifecycle strip: how long has this been broken, current
+              row-count trend, and a fail-count sparkline for the last N runs.
+              Always rendered so the "Details" affordance is discoverable even
+              for findings that predate the lifecycle columns (they'll just
+              show a Details button and no lifecycle chips). */}
+          {(
+            <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+              {finding.first_detected_at && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 border border-red-100 dark:border-red-800/40">
+                  Failing since {new Date(finding.first_detected_at).toLocaleDateString()}
+                </span>
+              )}
+              {!isMetadataRule && finding.current_fail_count != null && finding.current_total_count != null && (
+                <span className="inline-flex items-center gap-1 text-gray-700 dark:text-gray-300 font-medium tabular-nums">
+                  {finding.current_fail_count.toLocaleString()} / {finding.current_total_count.toLocaleString()} rows failing
+                  {finding.current_total_count > 0 && (
+                    <span className="text-red-600 dark:text-red-400 ml-1">({((finding.current_fail_count / finding.current_total_count) * 100).toFixed(1)}%)</span>
+                  )}
+                </span>
+              )}
+              {!isMetadataRule && (finding.fail_history?.length ?? 0) > 1 && (
+                <FailCountSparkline history={finding.fail_history} />
+              )}
+              {finding.reopened_count > 0 && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                  Flapping · reopened {finding.reopened_count}×
+                </span>
+              )}
+              <button
+                onClick={() => onOpenDetail?.(finding)}
+                className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/40"
+                title="Open detail drawer — full history, samples, mute"
+              >
+                <PanelRightOpen className="w-3 h-3" />
+                Details
+              </button>
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500 dark:text-gray-300">
+            {finding.context?.fqn && (
+              <span className="font-mono bg-gray-50 dark:bg-gray-900 px-2 py-1 rounded border border-gray-200 dark:border-gray-700">
+                {finding.context.fqn}
+              </span>
+            )}
+            <span className="flex items-center">
+              <span className="text-gray-400 dark:text-gray-400 mr-1">First seen:</span>
+              {fmtIST(finding.first_detected_at ?? finding.detected_at)}
+            </span>
+            {finding.last_seen_at && (
+              <span className="flex items-center">
+                <span className="text-gray-400 dark:text-gray-400 mr-1">Last seen:</span>
+                {fmtIST(finding.last_seen_at)}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Findings() {
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate    = useNavigate()
-  const queryClient = useQueryClient()
+  // Findings are scoped to the selected data source. connId in the query key
+  // makes a source switch refetch the correct rows.
+  const { selectedId: connId } = useConnection()
 
   // ── Filters (initialised from URL params) ──────────────────────────────────
   const [severityFilter, setSeverityFilter] = useState(searchParams.get('severity') || '')
   const [statusFilter,   setStatusFilter]   = useState(searchParams.get('status')   || '')
   const [tableFilter,    setTableFilter]    = useState(searchParams.get('table')    || '')
   const [ruleFilter,     setRuleFilter]     = useState(searchParams.get('rule_code')|| '')
+  // instance filter: pre-applied when navigating from Rule Library's "View Findings"
+  // link — filters by instance_id directly, so it works for every check kind
+  // (SQL template, python handler, AI-proposed, deterministic), unlike rule_code
+  // which is only reliably set in context for python_handler checks.
+  const [instanceFilter, setInstanceFilter] = useState(searchParams.get('instance') || '')
   // scan_id filter: pre-applied when navigating from Workflow "Fix Issues"
   const [scanIdFilter,   setScanIdFilter]   = useState(searchParams.get('scan_id')  || '')
+  const [searchQuery,    setSearchQuery]    = useState('')
 
   // URL-param helpers (table_name + database from Dashboard drill-down)
   const urlTableName = searchParams.get('table_name') || ''
   const urlDatabase  = searchParams.get('database')   || ''
 
   const [selectedFindings, setSelectedFindings] = useState<string[]>([])
+  const [detailFinding, setDetailFinding] = useState<any | null>(null)
+  const [page, setPage] = useState(1)
+  const PAGE_SIZE = 50
 
   // Sync URL params → filter state once on mount
   useEffect(() => {
     if (urlTableName) setTableFilter('__table_name__' + urlTableName + '__db__' + urlDatabase)
-    const urlRule   = searchParams.get('rule_code')
-    const urlScanId = searchParams.get('scan_id')
-    if (urlRule)   setRuleFilter(urlRule)
-    if (urlScanId) setScanIdFilter(urlScanId)
+    const urlRule     = searchParams.get('rule_code')
+    const urlInstance = searchParams.get('instance')
+    const urlScanId   = searchParams.get('scan_id')
+    if (urlRule)     setRuleFilter(urlRule)
+    if (urlInstance) setInstanceFilter(urlInstance)
+    if (urlScanId)   setScanIdFilter(urlScanId)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Sync filter state → URL whenever a filter changes, so the current filters
+  // live in the URL. That way navigating away (e.g. to AI-Fix to resolve a
+  // finding) and coming Back restores the exact filtered view instead of
+  // resetting — handleGetAIFixes captures window.location.search as return_to.
+  // Uses replace so filter tweaks don't pile up in browser history.
+  useEffect(() => {
+    const next: Record<string, string> = {}
+    if (severityFilter) next.severity  = severityFilter
+    if (statusFilter)   next.status    = statusFilter
+    if (ruleFilter)     next.rule_code = ruleFilter
+    if (instanceFilter) next.instance  = instanceFilter
+    if (scanIdFilter)   next.scan_id   = scanIdFilter
+    // tableFilter is either a plain FQN (from the dropdown) or the
+    // "__table_name__<t>__db__<db>" sentinel (from a table_name/database URL).
+    // Persist both forms so Back-navigation restores the exact table filter.
+    if (tableFilter) {
+      if (tableFilter.startsWith('__table_name__')) {
+        const parts = tableFilter.split('__db__')
+        next.table_name = parts[0].replace('__table_name__', '')
+        if (parts[1]) next.database = parts[1]
+      } else {
+        next.table = tableFilter
+      }
+    }
+    setSearchParams(next, { replace: true })
+  }, [severityFilter, statusFilter, ruleFilter, instanceFilter, scanIdFilter, tableFilter]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Data fetching ──────────────────────────────────────────────────────────
   const { data: allFindings, isLoading } = useQuery({
-    queryKey: ['findings', severityFilter, statusFilter, scanIdFilter],
+    queryKey: ['findings', severityFilter, statusFilter, scanIdFilter, connId],
     queryFn: () => findingsApi.list({
-      severity: severityFilter || undefined,
-      status:   statusFilter   || undefined,
-      scan_id:  scanIdFilter   || undefined,
-      limit:    5000,
+      severity:      severityFilter || undefined,
+      status:        statusFilter   || undefined,
+      scan_id:       scanIdFilter   || undefined,
+      connection_id: connId         || undefined,
+      limit:         5000,
     }).then(r => r.data),
-  })
-
-  const { data: assetsData } = useQuery({
-    queryKey: ['assets', 'tables'],
-    queryFn: () => assetsApi.list({ asset_type: 'table' }).then(r => r.data),
+    staleTime: 60_000,
   })
 
   const { data: rulesData } = useQuery({
@@ -84,18 +343,15 @@ export default function Findings() {
   }, [allFindings])
 
   // ── Client-side filtering ──────────────────────────────────────────────────
-  const data = useMemo(() => {
-    if (!allFindings) return allFindings
+  const filteredFindings = useMemo(() => {
+    if (!allFindings) return []
 
-    const filtered = allFindings.findings.filter(f => {
-      // Table filter — two modes:
-      // 1. FQN mode (from findings filter dropdown)
-      // 2. table_name+database mode (from Dashboard drill-down)
+    return allFindings.findings.filter(f => {
       if (tableFilter) {
         if (tableFilter.startsWith('__table_name__')) {
-          const parts   = tableFilter.split('__db__')
-          const tName   = parts[0].replace('__table_name__', '')
-          const dbName  = parts[1] || ''
+          const parts  = tableFilter.split('__db__')
+          const tName  = parts[0].replace('__table_name__', '')
+          const dbName = parts[1] || ''
           if (f.context?.table_name !== tName) return false
           if (dbName && f.context?.database_name !== dbName) return false
         } else {
@@ -103,13 +359,26 @@ export default function Findings() {
           if (fqn !== tableFilter) return false
         }
       }
-      // Rule filter
       if (ruleFilter && f.context?.rule_code !== ruleFilter) return false
+      if (instanceFilter && f.instance_id !== instanceFilter) return false
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase()
+        const inTitle = f.title?.toLowerCase().includes(q)
+        const inTable = f.context?.table_name?.toLowerCase().includes(q)
+        const inRule  = (f.context?.rule_code ?? '').toLowerCase().includes(q)
+        const inDesc  = (f.description ?? '').toLowerCase().includes(q)
+        if (!inTitle && !inTable && !inRule && !inDesc) return false
+      }
       return true
     })
+  }, [allFindings, tableFilter, ruleFilter, instanceFilter, searchQuery])
 
-    return { total: allFindings.total, findings: filtered }
-  }, [allFindings, tableFilter, ruleFilter])
+  // Reset to page 1 whenever filters change
+  useEffect(() => { setPage(1) }, [severityFilter, statusFilter, scanIdFilter, tableFilter, ruleFilter, instanceFilter, searchQuery])
+
+  const totalPages = Math.max(1, Math.ceil(filteredFindings.length / PAGE_SIZE))
+  const pagedFindings = filteredFindings.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const data = allFindings ? { total: allFindings.total, findings: filteredFindings } : undefined
 
   // ── Derived display label for active table filter ──────────────────────────
   const activeTableLabel = useMemo(() => {
@@ -121,20 +390,11 @@ export default function Findings() {
     return uniqueTables.find(t => t.fqn === tableFilter)?.table_name || tableFilter
   }, [tableFilter, uniqueTables])
 
-  // ── Mutations ──────────────────────────────────────────────────────────────
-  const updateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: any }) => findingsApi.update(id, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['findings'] })
-      queryClient.invalidateQueries({ queryKey: ['findings-stats'] })
-    },
-  })
-
   const handleSelectAll = () =>
     setSelectedFindings(
-      selectedFindings.length === data?.findings.length
+      selectedFindings.length === filteredFindings.length
         ? []
-        : data?.findings.map(f => f.id) || []
+        : filteredFindings.map(f => f.id)
     )
 
   const handleSelectFinding = (id: string) =>
@@ -149,11 +409,12 @@ export default function Findings() {
   }
 
   const clearAll = () => {
-    setSeverityFilter(''); setStatusFilter(''); setTableFilter(''); setRuleFilter(''); setScanIdFilter('')
+    setSeverityFilter(''); setStatusFilter(''); setTableFilter(''); setRuleFilter('')
+    setInstanceFilter(''); setScanIdFilter(''); setSearchQuery('')
     setSearchParams({})
   }
 
-  const anyFilter = severityFilter || statusFilter || tableFilter || ruleFilter || scanIdFilter
+  const anyFilter = severityFilter || statusFilter || tableFilter || ruleFilter || instanceFilter || scanIdFilter || searchQuery
 
   // ── Colour helpers ─────────────────────────────────────────────────────────
   const sevColor = (s: string) => ({
@@ -161,14 +422,18 @@ export default function Findings() {
     high:     'bg-orange-100 text-orange-800 border-orange-200',
     medium:   'bg-yellow-100 text-yellow-800 border-yellow-200',
     low:      'bg-blue-100 text-blue-800 border-blue-200',
-  }[s] ?? 'bg-gray-100 text-gray-800 border-gray-200')
+  }[s] ?? 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   const stColor = (s: string) => ({
-    detected:  'bg-red-50 text-red-700 border-red-200',
-    validated: 'bg-yellow-50 text-yellow-700 border-yellow-200',
-    assigned:  'bg-blue-50 text-blue-700 border-blue-200',
-    resolved:  'bg-green-50 text-green-700 border-green-200',
-  }[s] ?? 'bg-gray-50 text-gray-700 border-gray-200')
+    detected:       'bg-red-50 text-red-700 border-red-200',
+    validated:      'bg-orange-50 text-orange-700 border-orange-200',
+    in_progress:    'bg-blue-50 text-blue-700 border-blue-200',
+    resolved:       'bg-green-50 text-green-700 border-green-200',
+    false_positive: 'bg-gray-100 text-gray-500 border-gray-300',
+    wont_fix:       'bg-yellow-50 text-yellow-700 border-yellow-200',
+    closed:         'bg-gray-50 text-gray-500 border-gray-200',
+    superseded:     'bg-purple-50 text-purple-600 border-purple-200',
+  }[s] ?? 'bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   return (
     <div className="space-y-6">
@@ -176,13 +441,13 @@ export default function Findings() {
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Findings</h1>
-          <p className="mt-2 text-gray-600">
+          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 dark:text-gray-100">Findings</h1>
+          <p className="mt-2 text-gray-600 dark:text-gray-300">
             {anyFilter ? (
-              <>Showing <span className="font-semibold text-gray-900">{data?.findings.length ?? 0}</span> of{' '}
-              <span className="font-semibold text-gray-900">{allFindings?.total ?? 0}</span> quality issues</>
+              <>Showing <span className="font-semibold text-gray-900 dark:text-gray-100">{data?.findings.length ?? 0}</span> of{' '}
+              <span className="font-semibold text-gray-900 dark:text-gray-100">{allFindings?.total ?? 0}</span> quality issues</>
             ) : (
-              <><span className="font-semibold text-gray-900">{data?.total ?? 0}</span> quality issues detected</>
+              <><span className="font-semibold text-gray-900 dark:text-gray-100">{data?.total ?? 0}</span> quality issues detected</>
             )}
             {selectedFindings.length > 0 && (
               <span className="ml-2 text-primary-600 font-semibold">({selectedFindings.length} selected)</span>
@@ -199,14 +464,31 @@ export default function Findings() {
       </div>
 
       {/* ── Filters ──────────────────────────────────────────────────────────── */}
-      <div className="bg-white rounded-lg shadow p-4 space-y-3">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4 space-y-3">
         <div className="flex items-center gap-2 mb-1">
-          <Filter className="w-4 h-4 text-gray-400" />
-          <span className="text-sm font-medium text-gray-600">Filters</span>
+          <Filter className="w-4 h-4 text-gray-400 dark:text-gray-400" />
+          <span className="text-sm font-medium text-gray-600 dark:text-gray-300">Filters</span>
           {anyFilter && (
             <button onClick={clearAll}
-              className="ml-auto flex items-center gap-1 text-xs text-gray-500 hover:text-gray-800 px-2 py-1 rounded hover:bg-gray-100">
+              className="ml-auto flex items-center gap-1 text-xs text-gray-500 dark:text-gray-300 hover:text-gray-800 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700">
               <X className="w-3 h-3" /> Clear all
+            </button>
+          )}
+        </div>
+
+        {/* Search bar */}
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search by title, table, rule code, or description…"
+            className="w-full pl-9 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+          />
+          {searchQuery && (
+            <button onClick={() => setSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+              <X className="w-3.5 h-3.5" />
             </button>
           )}
         </div>
@@ -215,12 +497,12 @@ export default function Findings() {
 
           {/* Table */}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1">
               Table ({uniqueTables.length})
             </label>
-            <select value={tableFilter.startsWith('__table_name__') ? tableFilter : tableFilter}
-              onChange={e => { setTableFilter(e.target.value); setSearchParams({}) }}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+            <select value={tableFilter}
+              onChange={e => setTableFilter(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Tables</option>
               {uniqueTables.map(t => (
                 <option key={t.fqn} value={t.fqn}>{t.table_name}</option>
@@ -230,11 +512,11 @@ export default function Findings() {
 
           {/* Rule */}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1 flex items-center gap-1">
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1 flex items-center gap-1">
               <ShieldCheck className="w-3 h-3" /> Rule ({uniqueRuleCodes.length} active)
             </label>
             <select value={ruleFilter} onChange={e => setRuleFilter(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Rules</option>
               {uniqueRuleCodes.map(code => {
                 const rule = rulesData?.rules.find(r => r.code === code)
@@ -249,9 +531,9 @@ export default function Findings() {
 
           {/* Severity */}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Severity</label>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1">Severity</label>
             <select value={severityFilter} onChange={e => setSeverityFilter(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Severities</option>
               <option value="critical">Critical</option>
               <option value="high">High</option>
@@ -263,14 +545,18 @@ export default function Findings() {
 
           {/* Status */}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Status</label>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1">Status</label>
             <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Statuses</option>
               <option value="detected">Detected</option>
               <option value="validated">Validated</option>
-              <option value="assigned">Assigned</option>
+              <option value="in_progress">In Progress</option>
               <option value="resolved">Resolved</option>
+              <option value="false_positive">False Positive</option>
+              <option value="wont_fix">Won't Fix</option>
+              <option value="closed">Closed</option>
+              <option value="superseded">Superseded</option>
             </select>
           </div>
         </div>
@@ -281,13 +567,13 @@ export default function Findings() {
             {scanIdFilter && (
               <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800">
                 🔀 Workflow scan
-                <button onClick={() => { setScanIdFilter(''); setSearchParams({}) }} className="ml-1 hover:text-indigo-900"><X className="w-3 h-3" /></button>
+                <button onClick={() => setScanIdFilter('')} className="ml-1 hover:text-indigo-900"><X className="w-3 h-3" /></button>
               </span>
             )}
             {tableFilter && (
               <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium bg-primary-100 text-primary-800">
                 <Database className="w-3 h-3" /> {activeTableLabel}
-                <button onClick={() => { setTableFilter(''); setSearchParams({}) }} className="ml-1 hover:text-primary-900"><X className="w-3 h-3" /></button>
+                <button onClick={() => setTableFilter('')} className="ml-1 hover:text-primary-900"><X className="w-3 h-3" /></button>
               </span>
             )}
             {ruleFilter && (
@@ -295,6 +581,12 @@ export default function Findings() {
                 <ShieldCheck className="w-3 h-3" />
                 {rulesData?.rules.find(r => r.code === ruleFilter)?.name ?? ruleFilter}
                 <button onClick={() => setRuleFilter('')} className="ml-1 hover:text-purple-900"><X className="w-3 h-3" /></button>
+              </span>
+            )}
+            {instanceFilter && (
+              <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                <ShieldCheck className="w-3 h-3" /> Rule Library instance
+                <button onClick={() => setInstanceFilter('')} className="ml-1 hover:text-purple-900"><X className="w-3 h-3" /></button>
               </span>
             )}
             {severityFilter && (
@@ -314,139 +606,119 @@ export default function Findings() {
       </div>
 
       {/* Bulk select bar */}
-      {data?.findings && data.findings.length > 0 && (
-        <div className="bg-white rounded-lg shadow p-4 flex items-center justify-between">
+      {filteredFindings.length > 0 && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4 flex items-center justify-between">
           <label className="flex items-center cursor-pointer">
             <input type="checkbox"
-              checked={selectedFindings.length === data.findings.length}
+              checked={selectedFindings.length === filteredFindings.length && filteredFindings.length > 0}
               onChange={handleSelectAll}
-              className="w-4 h-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500" />
-            <span className="ml-2 text-sm font-medium text-gray-700">
-              Select All ({data.findings.length})
+              className="w-4 h-4 text-primary-600 border-gray-300 dark:border-gray-600 rounded focus:ring-primary-500" />
+            <span className="ml-2 text-sm font-medium text-gray-700 dark:text-gray-200">
+              Select All ({filteredFindings.length})
             </span>
           </label>
           {selectedFindings.length > 0 && (
             <div className="flex items-center gap-3">
-              <span className="text-sm text-gray-600">{selectedFindings.length} selected</span>
-              <button onClick={() => setSelectedFindings([])} className="text-sm text-gray-600 hover:text-gray-900">Clear</button>
+              <span className="text-sm text-gray-600 dark:text-gray-300">{selectedFindings.length} selected</span>
+              <button onClick={() => setSelectedFindings([])} className="text-sm text-gray-600 dark:text-gray-300 hover:text-gray-900">Clear</button>
             </div>
           )}
         </div>
       )}
 
       {/* Findings list */}
-      <div className="bg-white rounded-lg shadow overflow-hidden">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
         {isLoading ? (
           <div className="p-12 text-center">
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600 mx-auto mb-4" />
-            <p className="text-gray-500">Loading findings…</p>
+            <p className="text-gray-500 dark:text-gray-300">Loading findings…</p>
           </div>
-        ) : data?.findings.length === 0 ? (
+        ) : filteredFindings.length === 0 ? (
           <div className="p-12 text-center">
             <AlertCircle className="w-16 h-16 text-gray-300 mx-auto mb-4" />
             {anyFilter ? (
               <>
-                <p className="text-lg font-medium text-gray-900 mb-2">No findings match your filters</p>
-                <p className="text-sm text-gray-500 mb-4">Try adjusting or clearing the filters above</p>
+                <p className="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No findings match your filters</p>
+                <p className="text-sm text-gray-500 dark:text-gray-300 mb-4">Try adjusting or clearing the filters above</p>
                 <button onClick={clearAll} className="px-4 py-2 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700">
                   Clear Filters
                 </button>
               </>
             ) : (
               <>
-                <p className="text-lg font-medium text-gray-900 mb-2">No quality issues found yet</p>
-                <p className="text-sm text-gray-500 mb-4">Scan a table to discover data quality issues</p>
-                <button onClick={() => navigate('/scanner')} className="px-4 py-2 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700">
-                  Go to Scanner
+                <p className="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No quality issues found yet</p>
+                <p className="text-sm text-gray-500 dark:text-gray-300 mb-4">Scan a table to discover data quality issues</p>
+                <button onClick={() => navigate('/workflow')} className="px-4 py-2 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700">
+                  Go to Workflow
                 </button>
               </>
             )}
           </div>
         ) : (
-          <div className="divide-y divide-gray-200">
-            {data?.findings.map(finding => (
-              <div key={finding.id} className="p-6 hover:bg-gray-50 transition-colors">
-                <div className="flex items-start gap-4">
-                  <div className="flex-shrink-0 pt-1">
-                    <input type="checkbox"
-                      checked={selectedFindings.includes(finding.id)}
-                      onChange={() => handleSelectFinding(finding.id)}
-                      className="w-5 h-5 text-primary-600 border-gray-300 rounded focus:ring-primary-500 cursor-pointer" />
-                  </div>
-
-                  <div className="flex-1 min-w-0">
-                    {/* Badges row */}
-                    <div className="flex flex-wrap items-center gap-2 mb-2">
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${sevColor(finding.severity)}`}>
-                        {finding.severity.toUpperCase()}
-                      </span>
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${stColor(finding.status)}`}>
-                        {finding.status}
-                      </span>
-                      {/* Rule code chip — clickable to filter */}
-                      {finding.context?.rule_code && (
-                        <button
-                          onClick={() => setRuleFilter(finding.context.rule_code)}
-                          className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border transition-colors ${
-                            ruleFilter === finding.context.rule_code
-                              ? 'bg-purple-200 text-purple-900 border-purple-300'
-                              : 'bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100'
-                          }`}
-                          title="Filter by this rule"
-                        >
-                          <ShieldCheck className="w-3 h-3" />
-                          {rulesData?.rules.find(r => r.code === finding.context.rule_code)?.name ?? finding.context.rule_code}
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Table badge */}
-                    {finding.context?.table_name && (
-                      <div className="mb-2">
-                        <button
-                          onClick={() => setTableFilter(
-                            `${finding.context.database_name}.${finding.context.schema_name}.${finding.context.table_name}`
-                          )}
-                          className="inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700 border border-gray-300 hover:bg-gray-200 transition-colors"
-                          title="Filter by this table"
-                        >
-                          <Database className="w-3 h-3 mr-1" />
-                          {finding.context.table_name}
-                        </button>
-                      </div>
-                    )}
-
-                    <h3 className="text-base font-semibold text-gray-900 mb-1">{finding.title}</h3>
-                    <p className="text-sm text-gray-600 mb-3">{finding.description}</p>
-
-                    <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500">
-                      {finding.context?.fqn && (
-                        <span className="font-mono bg-gray-50 px-2 py-1 rounded border border-gray-200">
-                          {finding.context.fqn}
-                        </span>
-                      )}
-                      <span className="flex items-center">
-                        <span className="text-gray-400 mr-1">Detected:</span>
-                        {new Date(finding.detected_at).toLocaleString()}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="flex-shrink-0">
-                    {finding.status === 'detected' && (
-                      <button
-                        onClick={() => updateMutation.mutate({ id: finding.id, data: { status: 'validated' } })}
-                        className="px-3 py-1.5 text-sm font-medium text-primary-700 bg-primary-50 rounded-lg hover:bg-primary-100">
-                        Validate
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
+          <div className="divide-y divide-gray-200 dark:divide-gray-700">
+            {pagedFindings.map(finding => (
+              <FindingCard
+                key={finding.id}
+                finding={finding}
+                selected={selectedFindings.includes(finding.id)}
+                onSelect={() => handleSelectFinding(finding.id)}
+                onRuleFilter={setRuleFilter}
+                onTableFilter={setTableFilter}
+                ruleFilter={ruleFilter}
+                rulesData={rulesData}
+                sevColor={sevColor}
+                stColor={stColor}
+                onOpenDetail={setDetailFinding}
+              />
             ))}
           </div>
         )}
       </div>
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between bg-white dark:bg-gray-800 rounded-lg shadow px-4 py-3">
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, filteredFindings.length)} of {filteredFindings.length}
+          </p>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page === 1}
+              className="px-3 py-1.5 text-sm rounded-lg border border-gray-300 dark:border-gray-600 disabled:opacity-40 hover:bg-gray-50 dark:hover:bg-gray-700"
+            >
+              ← Prev
+            </button>
+            {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
+              // Show pages around current; always show first/last
+              let p: number
+              if (totalPages <= 7) p = i + 1
+              else if (i === 0) p = 1
+              else if (i === 6) p = totalPages
+              else p = Math.min(Math.max(page - 2 + i, 2), totalPages - 1)
+              return (
+                <button key={p} onClick={() => setPage(p)}
+                  className={`w-8 h-8 text-sm rounded-lg ${p === page
+                    ? 'bg-primary-600 text-white font-semibold'
+                    : 'border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300'}`}>
+                  {p}
+                </button>
+              )
+            })}
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page === totalPages}
+              className="px-3 py-1.5 text-sm rounded-lg border border-gray-300 dark:border-gray-600 disabled:opacity-40 hover:bg-gray-50 dark:hover:bg-gray-700"
+            >
+              Next →
+            </button>
+          </div>
+        </div>
+      )}
+
+      {detailFinding && (
+        <FindingDetailDrawer finding={detailFinding} onClose={() => setDetailFinding(null)} />
+      )}
     </div>
   )
 }

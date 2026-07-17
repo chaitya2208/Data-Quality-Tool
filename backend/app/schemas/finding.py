@@ -1,13 +1,14 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-from app.models.finding import FindingStatus
+from app.core.enums import FindingStatus
 
 
 class FindingBase(BaseModel):
     asset_id: str
     scan_id: str
     rule_id: Optional[str] = None
+    instance_id: Optional[str] = None
     title: str
     description: str
     severity: str
@@ -31,10 +32,19 @@ class FindingResponse(FindingBase):
     assigned_to: Optional[str] = None
     resolution_notes: Optional[str] = None
     detected_at: datetime
-    validated_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
     updated_at: datetime
+
+    # Incident-lifecycle fields — populated by the new scan finalizer. Older
+    # rows are backfilled at migration time; new rows always have these.
+    first_detected_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    last_scan_id: Optional[str] = None
+    reopened_count: Optional[int] = 0
+    current_fail_count: Optional[int] = None
+    current_total_count: Optional[int] = None
+    fail_history: Optional[List[Dict[str, Any]]] = None
 
     class Config:
         from_attributes = True

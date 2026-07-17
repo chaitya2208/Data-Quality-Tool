@@ -28,11 +28,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy.orm import Session
-
-from app.models.asset import Asset
-from app.models.finding import FindingStatus
-from app.models.rule import Rule, RuleCategory, RuleSeverity
+from app.services import storage
+from app.services.snowflake_session import session as sf_session
 
 import logging
 
@@ -152,66 +149,128 @@ def _normalise_type(raw_type: str) -> str:
     return (raw_type or "").split("(")[0].strip().upper()
 
 
+def _fetch_live_column_metadata(table_asset: Any) -> Dict[str, Dict[str, Any]]:
+    """Runs a real SELECT against INFORMATION_SCHEMA.COLUMNS for this table
+    and returns {COLUMN_NAME: {"data_type": ..., "is_nullable": ..., "comment": ...}}.
+
+    This is the SQL-generation replacement for the checks that used to trust
+    the cached column-asset snapshot taken at scan time (MetadataAgent's
+    earlier pass): type/nullability/comment can drift between that snapshot
+    and when these checks actually run (e.g. an ALTER TABLE landed in
+    between), so type/nullability/comment-dependent checks below re-fetch
+    live, in ONE query per table rather than per-check, instead of trusting
+    the snapshot. On query failure, returns {} — callers fall back to the
+    column asset's cached raw_metadata for that column (see _column_type_info
+    below), so one query hiccup doesn't take out every check on the table."""
+    try:
+        rows = sf_session.query(
+            f"""
+            SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COMMENT
+            FROM {table_asset.database_name}.INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '{table_asset.schema_name}'
+              AND TABLE_NAME = '{table_asset.table_name}'
+            """
+        )
+    except Exception as e:
+        logger.warning(
+            f"[DynamicRules] Live column metadata fetch failed for {table_asset.fqn}: {e}"
+        )
+        return {}
+    return {
+        r["COLUMN_NAME"]: {
+            "data_type": r.get("DATA_TYPE") or "",
+            "is_nullable": r.get("IS_NULLABLE") or "NO",
+            "comment": r.get("COMMENT"),
+        }
+        for r in rows
+    }
+
+
+def _column_type_info(col_asset: Any, live_metadata: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Live INFORMATION_SCHEMA row for this column if the fetch succeeded,
+    else the column asset's cached raw_metadata as a fallback."""
+    live = live_metadata.get(col_asset.column_name)
+    if live is not None:
+        return live
+    return col_asset.raw_metadata or {}
+
+
 def _ensure_rule(
-    db: Session,
     code: str,
     name: str,
     description: str,
-    category: RuleCategory,
-    severity: RuleSeverity,
+    category: str,
+    severity: str,
     applies_to: List[str],
-) -> Rule:
-    """
-    Return the Rule for `code`, creating it in the DB if it doesn't exist.
-    Uses flush() so the ID is available without a full commit.
-    """
-    rule = db.query(Rule).filter(Rule.code == code).first()
-    if rule:
-        return rule
+) -> Any:
+    """Return a rule-shape object for the python_handler definition keyed by
+    `code` (used as HANDLER_KEY, lowercased). Auto-creates the definition if
+    missing. Callers use the returned object like the old Rule object
+    (.severity, .code via .handler_key, .definition).
 
-    rule = Rule(
+    NOTE 2026-07-15: this used to also create a DATABASE_NAME='*' global
+    instance and return it. Globals are gone — a metadata handler now runs on
+    a table only when RuleIntelligence proposed it (with human review) as a
+    per-table instance. FindingsAgent gates run_dynamic_checks by
+    allowed_rule_codes = {handler_keys of approved per-table instances}, so a
+    dynamic check whose definition isn't proposed simply doesn't fire. The
+    returned object is a lightweight shell used only for the finding's
+    severity/code fields; no instance row is required to build a finding
+    dict (create_findings_bulk fills instance_id from the FindingsAgent side
+    when it wires the finding back to its approved instance).
+    """
+    from types import SimpleNamespace
+    handler_key = code.lower()
+    definition = storage.ensure_definition(handler_key, name, description, category, severity, applies_to)
+    return SimpleNamespace(
         code=code,
-        name=name,
-        description=description,
-        category=category,
+        handler_key=handler_key,
         severity=severity,
-        applies_to=applies_to,
-        rule_config={},
-        is_active=True,
-        status="ACTIVE",
-        owner="data-governance-team",
-        created_by="system",
-        version=1,
+        definition=definition,
     )
-    db.add(rule)
-    db.flush()
-    logger.info(f"[DynamicRules] Auto-registered new rule: {code}")
-    return rule
+
+
+def _hash(definition_id: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{definition_id}|global".encode("utf-8")).hexdigest()
 
 
 def _finding(
     asset_id: str,
     scan_id: str,
-    rule: Rule,
+    rule: Any,
     title: str,
     description: str,
     context: Dict[str, Any],
     evidence: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """Build a finding dict from a rule-shape object. instance_id is left as
+    None here — the caller (run_dynamic_checks) fills it from the
+    handler_key → approved-instance-id map so the finding wires back to a
+    per-table approved instance, not to a (no-longer-existing) global one.
+
+    Normalizes evidence to the standard contract — {fail_count, total_count,
+    sample_rows} — so the incident lifecycle can rely on those keys.
+    Dynamic checks are metadata-shape audits (no failing rows), so counts
+    default to 1/1 and sample_rows to []."""
+    ev = dict(evidence or {})
+    ev.setdefault("fail_count", 1)
+    ev.setdefault("total_count", 1)
+    ev.setdefault("sample_rows", [])
     return {
         "asset_id": asset_id,
         "scan_id": scan_id,
-        "rule_id": rule.id,
+        "instance_id": getattr(rule, "id", None),
         "title": title,
         "description": description,
-        "severity": rule.severity.value,
-        "status": FindingStatus.DETECTED,
+        "severity": rule.severity,
+        "status": "detected",
         "context": context,
-        "evidence": evidence,
+        "evidence": ev,
     }
 
 
-def _base_ctx(asset: Asset) -> Dict[str, Any]:
+def _base_ctx(asset: Any) -> Dict[str, Any]:
     return {
         "database_name": asset.database_name,
         "schema_name": asset.schema_name,
@@ -225,7 +284,7 @@ def _base_ctx(asset: Asset) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_no_primary_key(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables that have no obvious primary key column."""
     upper_cols = {c.upper() for c in column_names}
@@ -239,7 +298,6 @@ def check_no_primary_key(
         return None
 
     rule = _ensure_rule(
-        db,
         code="NO_PRIMARY_KEY_HINT",
         name="Table May Be Missing a Primary Key",
         description=(
@@ -247,8 +305,8 @@ def check_no_primary_key(
             "*_PK, *_KEY, *_SEQ) was found. Tables without a primary key risk duplicate "
             "rows and make joins, deduplication, and CDC harder."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.MEDIUM,
+        category='schema',
+        severity='medium',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -266,7 +324,7 @@ def check_no_primary_key(
 
 
 def check_missing_created_at(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables missing a row-creation timestamp column."""
     upper_cols = {c.upper() for c in column_names}
@@ -274,7 +332,6 @@ def check_missing_created_at(
         return None
 
     rule = _ensure_rule(
-        db,
         code="MISSING_CREATED_AT",
         name="Missing Row Creation Timestamp",
         description=(
@@ -282,8 +339,8 @@ def check_missing_created_at(
             "such as CREATED_AT, CREATE_DATE, or INSERT_TS. This enables auditing, "
             "incremental loads, and change tracking."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.MEDIUM,
+        category='schema',
+        severity='medium',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -301,7 +358,7 @@ def check_missing_created_at(
 
 
 def check_missing_updated_at(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables missing a last-updated timestamp column."""
     upper_cols = {c.upper() for c in column_names}
@@ -309,15 +366,14 @@ def check_missing_updated_at(
         return None
 
     rule = _ensure_rule(
-        db,
         code="MISSING_UPDATED_AT",
         name="Missing Row Updated Timestamp",
         description=(
             "Mutable tables should track the last modification time via UPDATED_AT, "
             "MODIFIED_DATE, or equivalent. Required for CDC, incremental ETL, and auditing."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.LOW,
+        category='schema',
+        severity='low',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -334,7 +390,7 @@ def check_missing_updated_at(
 
 
 def check_too_many_columns(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables that exceed the maximum column count."""
     count = len(column_names)
@@ -342,7 +398,6 @@ def check_too_many_columns(
         return None
 
     rule = _ensure_rule(
-        db,
         code="TOO_MANY_COLUMNS",
         name="Table Has Too Many Columns",
         description=(
@@ -350,8 +405,8 @@ def check_too_many_columns(
             "normalisation, merged business entities, or accumulated technical debt. "
             "Consider decomposing into focused, related tables."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.LOW,
+        category='schema',
+        severity='low',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -369,7 +424,7 @@ def check_too_many_columns(
 
 
 def check_inconsistent_naming(
-    db: Session, table_asset: Asset, column_names: List[str], scan_id: str
+    table_asset: Any, column_names: List[str], scan_id: str
 ) -> Optional[Dict]:
     """Flag tables where column names mix multiple casing styles."""
     if len(column_names) < 3:
@@ -385,7 +440,6 @@ def check_inconsistent_naming(
         return None
 
     rule = _ensure_rule(
-        db,
         code="INCONSISTENT_COLUMN_NAMING",
         name="Inconsistent Column Naming Style",
         description=(
@@ -393,8 +447,8 @@ def check_inconsistent_naming(
             "(e.g. all UPPER_SNAKE_CASE). Mixing styles makes queries harder to write "
             "and datasets harder to join."
         ),
-        category=RuleCategory.NAMING,
-        severity=RuleSeverity.LOW,
+        category='naming',
+        severity='low',
         applies_to=["table"],
     )
     ctx = {**_base_ctx(table_asset), "rule_code": rule.code}
@@ -417,7 +471,7 @@ def check_inconsistent_naming(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_pii_column(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str
 ) -> Optional[Dict]:
     """Flag columns whose names suggest PII without a masking indicator."""
     col_upper = (col_asset.column_name or "").upper()
@@ -436,7 +490,6 @@ def check_pii_column(
         return None
 
     rule = _ensure_rule(
-        db,
         code="PII_COLUMN_NO_MASKING",
         name="Potential PII Column Without Masking Policy",
         description=(
@@ -444,8 +497,8 @@ def check_pii_column(
             "(e.g. EMAIL, SSN, PHONE, PASSWORD, DOB, SALARY) should have a "
             "Snowflake Dynamic Data Masking policy applied and a PII tag attached."
         ),
-        category=RuleCategory.SECURITY,
-        severity=RuleSeverity.HIGH,
+        category='security',
+        severity='high',
         applies_to=["column"],
     )
     ctx = {
@@ -468,7 +521,7 @@ def check_pii_column(
 
 
 def check_generic_column_name(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str
 ) -> Optional[Dict]:
     """Flag columns with uninformative generic names."""
     col_upper = (col_asset.column_name or "").upper()
@@ -476,15 +529,14 @@ def check_generic_column_name(
         return None
 
     rule = _ensure_rule(
-        db,
         code="GENERIC_COLUMN_NAME",
         name="Generic / Uninformative Column Name",
         description=(
             "Column names like COL1, DATA, VALUE, FIELD, or MISC provide no semantic "
             "context. Rename them to describe what they actually store."
         ),
-        category=RuleCategory.NAMING,
-        severity=RuleSeverity.LOW,
+        category='naming',
+        severity='low',
         applies_to=["column"],
     )
     ctx = {
@@ -505,11 +557,11 @@ def check_generic_column_name(
 
 
 def check_column_type_mismatch(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str, live_metadata: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict]:
     """Flag columns whose name implies one type but are stored as another."""
     col_upper = (col_asset.column_name or "").upper()
-    raw_type = (col_asset.raw_metadata or {}).get("data_type", "") or ""
+    raw_type = _column_type_info(col_asset, live_metadata).get("data_type", "") or ""
     actual_type = _normalise_type(raw_type)
 
     for pattern, expected_types, suffix, label in NAME_TYPE_RULES:
@@ -520,8 +572,7 @@ def check_column_type_mismatch(
 
         rule_code = f"COLUMN_{suffix}"
         rule = _ensure_rule(
-            db,
-            code=rule_code,
+                code=rule_code,
             name=f"Column Type Mismatch — {label}",
             description=(
                 f"Column names matching '{pattern.pattern}' should use types such as "
@@ -529,8 +580,8 @@ def check_column_type_mismatch(
                 "Storing them as other types causes implicit conversions, silent bugs, "
                 "and join failures."
             ),
-            category=RuleCategory.SCHEMA,
-            severity=RuleSeverity.MEDIUM,
+            category='schema',
+            severity='medium',
             applies_to=["column"],
         )
         ctx = {
@@ -555,7 +606,7 @@ def check_column_type_mismatch(
 
 
 def check_fk_without_constraint(
-    db: Session, col_asset: Asset, table_name: str, scan_id: str
+    col_asset: Any, table_name: str, scan_id: str
 ) -> Optional[Dict]:
     """Flag _ID columns that look like FK references but have no constraint."""
     col_upper = (col_asset.column_name or "").upper()
@@ -570,7 +621,6 @@ def check_fk_without_constraint(
         return None
 
     rule = _ensure_rule(
-        db,
         code="FK_COLUMN_NO_CONSTRAINT",
         name="Foreign Key Column Without FK Constraint",
         description=(
@@ -578,8 +628,8 @@ def check_fk_without_constraint(
             "Snowflake does not enforce FK constraints by default — add an unenforced "
             "REFERENCES clause for documentation and data lineage tools."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.LOW,
+        category='schema',
+        severity='low',
         applies_to=["column"],
     )
     ctx = {
@@ -601,7 +651,7 @@ def check_fk_without_constraint(
 
 
 def check_nullable_id_column(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str, live_metadata: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict]:
     """Flag ID/PK columns that allow NULLs."""
     col_upper = (col_asset.column_name or "").upper()
@@ -609,12 +659,11 @@ def check_nullable_id_column(
     if not is_id:
         return None
 
-    is_nullable = (col_asset.raw_metadata or {}).get("is_nullable", "NO")
+    is_nullable = _column_type_info(col_asset, live_metadata).get("is_nullable", "NO")
     if str(is_nullable).upper() not in ("YES", "Y", "TRUE", "1"):
         return None
 
     rule = _ensure_rule(
-        db,
         code="NULLABLE_ID_COLUMN",
         name="Nullable ID / Primary Key Column",
         description=(
@@ -622,8 +671,8 @@ def check_nullable_id_column(
             "A nullable PK column breaks referential integrity and causes "
             "unexpected results in GROUP BY, JOIN, and deduplication operations."
         ),
-        category=RuleCategory.SCHEMA,
-        severity=RuleSeverity.HIGH,
+        category='schema',
+        severity='high',
         applies_to=["column"],
     )
     ctx = {
@@ -645,11 +694,11 @@ def check_nullable_id_column(
 
 
 def check_date_stored_as_varchar(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str, live_metadata: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict]:
     """Flag date/timestamp columns stored as VARCHAR/TEXT."""
     col_upper = (col_asset.column_name or "").upper()
-    raw_type = (col_asset.raw_metadata or {}).get("data_type", "") or ""
+    raw_type = _column_type_info(col_asset, live_metadata).get("data_type", "") or ""
     actual_type = _normalise_type(raw_type)
 
     date_name = re.search(
@@ -661,7 +710,6 @@ def check_date_stored_as_varchar(
         return None
 
     rule = _ensure_rule(
-        db,
         code="DATE_STORED_AS_VARCHAR",
         name="Date/Timestamp Column Stored as VARCHAR",
         description=(
@@ -669,8 +717,8 @@ def check_date_stored_as_varchar(
             "This prevents date arithmetic, sorting, filtering, and indexing from "
             "working correctly. Cast or convert to DATE or TIMESTAMP."
         ),
-        category=RuleCategory.DATA_QUALITY,
-        severity=RuleSeverity.HIGH,
+        category='data_quality',
+        severity='high',
         applies_to=["column"],
     )
     ctx = {
@@ -693,11 +741,11 @@ def check_date_stored_as_varchar(
 
 
 def check_boolean_stored_as_varchar(
-    db: Session, col_asset: Asset, scan_id: str
+    col_asset: Any, scan_id: str, live_metadata: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict]:
     """Flag boolean/flag columns stored as VARCHAR instead of BOOLEAN or a numeric type."""
     col_upper = (col_asset.column_name or "").upper()
-    raw_type = (col_asset.raw_metadata or {}).get("data_type", "") or ""
+    raw_type = _column_type_info(col_asset, live_metadata).get("data_type", "") or ""
     actual_type = _normalise_type(raw_type)
 
     # Column name must look like a boolean/flag field
@@ -712,7 +760,6 @@ def check_boolean_stored_as_varchar(
         return None
 
     rule = _ensure_rule(
-        db,
         code="BOOLEAN_STORED_AS_VARCHAR",
         name="Boolean/Flag Column Stored as VARCHAR",
         description=(
@@ -720,8 +767,8 @@ def check_boolean_stored_as_varchar(
             "IS_, _YN) are stored as VARCHAR. This allows invalid values (e.g. 'maybe', "
             "'3') and prevents efficient filtering. Use BOOLEAN or a small integer type."
         ),
-        category=RuleCategory.DATA_QUALITY,
-        severity=RuleSeverity.MEDIUM,
+        category='data_quality',
+        severity='medium',
         applies_to=["column"],
     )
     ctx = {
@@ -746,41 +793,73 @@ def check_boolean_stored_as_varchar(
 # Public entry point called by RuleEngine
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Mapping of dynamic check function → rule code it produces
-# Used to skip checks the classifier decided not to run
+# Mapping of dynamic check function → rule code it produces.
+# Trimmed 2026-07-15: only the 5 kept metadata handlers dispatch here. The
+# other check_* functions further down in this file (check_missing_created_at,
+# check_too_many_columns, check_inconsistent_naming, check_generic_column_name,
+# check_column_type_mismatch, check_fk_without_constraint,
+# check_missing_updated_at) are intentionally NOT wired up — their definitions
+# are gone from the library, so allowed_rule_codes would never include them.
+# Kept as dead code rather than deleted to preserve blame history; revive by
+# adding back to these dicts and re-seeding the definition.
 _TABLE_CHECK_CODES = {
     check_no_primary_key:       "NO_PRIMARY_KEY_HINT",
-    check_missing_created_at:   "MISSING_CREATED_AT",
-    check_missing_updated_at:   "MISSING_UPDATED_AT",
-    check_too_many_columns:     "TOO_MANY_COLUMNS",
-    check_inconsistent_naming:  "INCONSISTENT_COLUMN_NAMING",
 }
 
 _COLUMN_CHECK_CODES = {
-    check_pii_column:              "PII_COLUMN_NO_MASKING",
-    check_generic_column_name:     "GENERIC_COLUMN_NAME",
-    check_column_type_mismatch:    "COLUMN_TYPE_MISMATCH",   # covers all subtypes
-    check_nullable_id_column:      "NULLABLE_ID_COLUMN",
-    check_date_stored_as_varchar:  "DATE_STORED_AS_VARCHAR",
+    check_pii_column:                "PII_COLUMN_NO_MASKING",
+    check_nullable_id_column:        "NULLABLE_ID_COLUMN",
+    check_date_stored_as_varchar:    "DATE_STORED_AS_VARCHAR",
     check_boolean_stored_as_varchar: "BOOLEAN_STORED_AS_VARCHAR",
-    check_fk_without_constraint:   "FK_COLUMN_NO_CONSTRAINT",
 }
+
+# Every python_handler HANDLER_KEY actually served by this module (lower-cased,
+# matching RULE_DEFINITIONS.HANDLER_KEY) — table + column codes, plus the
+# per-subtype codes check_column_type_mismatch can emit (COLUMN_ID_WRONG_TYPE,
+# COLUMN_DATE_WRONG_TYPE, etc., seeded individually in rule_engine.py's
+# initialize_default_rules but all produced by the one _NAME_TYPE_RULES loop
+# above). RuleEngine imports this so execute_rules() can skip these instances
+# instead of attempting (and warning on) a Python-object dispatch that only
+# ever covers 3 keys — these are executed via run_dynamic_checks() instead.
+DYNAMIC_RULE_HANDLER_KEYS = frozenset(
+    code.lower() for code in {**_TABLE_CHECK_CODES, **_COLUMN_CHECK_CODES}.values()
+)
 
 
 def run_dynamic_checks(
-    db: Session,
-    table_asset: Asset,
-    column_assets: List[Asset],
+    table_asset: Any,
+    column_assets: List[Any],
     scan_id: str,
     allowed_rule_codes=None,  # Optional[Set[str]] — from RuleClassifierAgent
+    instance_id_by_handler_key: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Run dynamic checks for a table and its columns.
     If allowed_rule_codes is given, only runs checks whose rule code is in that set.
     Returns finding dicts (not yet persisted) and commits any newly registered Rule rows.
+
+    instance_id_by_handler_key: {handler_key_lower: instance_id} for the
+    per-table approved instances of these dynamic checks. Findings emitted
+    here are stamped with the matching instance_id so they wire up to the
+    approved instance in RULE_INSTANCES (and thus into RULE_EXECUTIONS via
+    FindingsAgent._log_executions). Without this map, findings would have
+    instance_id=None and the execution log wouldn't tie them back to the
+    approved instance. See FindingsAgent for how the map is built.
     """
     findings: List[Dict[str, Any]] = []
     col_names = [a.column_name for a in column_assets if a.column_name]
+    instance_id_by_handler_key = instance_id_by_handler_key or {}
+
+    # Live INFORMATION_SCHEMA.COLUMNS read for this table — ONE query, reused
+    # by every type/nullability-dependent check below, instead of trusting
+    # each column asset's cached raw_metadata from MetadataAgent's earlier
+    # scan pass (which can drift if an ALTER TABLE landed in between).
+    live_metadata = _fetch_live_column_metadata(table_asset)
+
+    _NEEDS_LIVE_METADATA = {
+        check_column_type_mismatch, check_nullable_id_column,
+        check_date_stored_as_varchar, check_boolean_stored_as_varchar,
+    }
 
     def _allowed(code: str) -> bool:
         if allowed_rule_codes is None:
@@ -798,7 +877,7 @@ def run_dynamic_checks(
         if not _allowed(rule_code):
             logger.debug(f"[DynamicRules] Skipping {rule_code} (classifier decision)")
             continue
-        result = fn(db, table_asset, col_names, scan_id)
+        result = fn(table_asset, col_names, scan_id)
         if result:
             findings.append(result)
 
@@ -808,14 +887,38 @@ def run_dynamic_checks(
             if not _allowed(rule_code):
                 continue
             if fn is check_fk_without_constraint:
-                result = fn(db, col_asset, table_asset.table_name or "", scan_id)
+                result = fn(col_asset, table_asset.table_name or "", scan_id)
+            elif fn in _NEEDS_LIVE_METADATA:
+                result = fn(col_asset, scan_id, live_metadata)
             else:
-                result = fn(db, col_asset, scan_id)
+                result = fn(col_asset, scan_id)
             if result:
                 findings.append(result)
 
-    # Commit auto-registered Rule rows
-    db.commit()
+    # Wire each finding to its approved per-table instance. context.rule_code
+    # holds the upper-cased HANDLER_KEY (see _base_ctx callers), which we
+    # lower-case to look up in the caller-supplied map. Findings whose
+    # handler has no approved instance for this table are dropped — globals
+    # are gone, so a dynamic finding without a matching approved instance is
+    # orphaned and would show up with instance_id=None (unjoinable to any
+    # rule) if we let it through.
+    #
+    # Runs unconditionally now (not gated on `if instance_id_by_handler_key`):
+    # if no handlers were approved, the map is empty and every finding gets
+    # dropped, which is correct. The old gate skipped this pass entirely on
+    # an empty map, letting orphan findings survive.
+    for f in findings:
+        ctx = f.get("context") or {}
+        handler_key = (ctx.get("rule_code") or "").lower()
+        iid = instance_id_by_handler_key.get(handler_key)
+        if iid:
+            f["instance_id"] = iid
+        elif not f.get("instance_id"):
+            logger.debug(
+                f"[DynamicRules] Finding for handler_key={handler_key!r} has no matching "
+                "approved instance — dropping (not in allowed_instance_ids)."
+            )
+    findings = [f for f in findings if f.get("instance_id")]
 
     logger.info(
         f"[DynamicRules] {table_asset.fqn}: {len(findings)} dynamic findings"

@@ -1,7 +1,7 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-from app.models.scan import ScanStatus, ScanType
+from app.core.enums import ScanStatus, ScanType
 
 
 class ScanBase(BaseModel):

@@ -6,18 +6,20 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Data Quality Platform"
     API_V1_STR: str = "/api/v1"
 
-    # Database
-    DATABASE_URL: str
-
     # Snowflake
     SNOWFLAKE_ACCOUNT: str
     SNOWFLAKE_USER: str
     SNOWFLAKE_PASSWORD: Optional[str] = None
     SNOWFLAKE_WAREHOUSE: str
-    SNOWFLAKE_DATABASE: Optional[str] = None
+    SNOWFLAKE_DATABASE: str = "PLAYGROUND_DB"
     SNOWFLAKE_SCHEMA: Optional[str] = None
     SNOWFLAKE_ROLE: Optional[str] = None
     SNOWFLAKE_AUTH_METHOD: str = "externalbrowser"  # externalbrowser or password
+
+    # App storage — all app-owned tables (assets/scans/findings/rules/etc.)
+    # live in this one schema inside SNOWFLAKE_DATABASE, separate from the
+    # schemas holding the source data being scanned.
+    SNOWFLAKE_APP_SCHEMA: str = "DQ_APP"
 
     # Security
     SECRET_KEY: str
@@ -28,6 +30,10 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        # Ignore unrelated keys that may linger in .env (e.g. a legacy
+        # DATABASE_URL from the pre-Snowflake SQLite era) instead of failing
+        # startup. All app state now lives in Snowflake (DQ_APP), not SQLite.
+        extra = "ignore"
 
 
 settings = Settings()

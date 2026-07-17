@@ -10,8 +10,10 @@ Design:
 """
 import threading
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict
+
+from app.services import storage
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +23,18 @@ _lock: threading.Lock = threading.Lock()
 _active_timers: Dict[str, threading.Timer] = {}  # run_id → Timer
 
 
-def schedule(run_id: str, delay: float = AUTO_VERIFY_INTERVAL_SECONDS) -> None:
+def schedule(run_id: str, delay: float = None) -> None:
     """
-    Schedule an auto-verify for run_id after `delay` seconds.
+    Schedule an auto-verify for run_id after `delay` seconds. When `delay` is
+    omitted, use the configured interval (Settings → auto_verify_interval_min).
     Cancels any existing timer for this run first.
     """
+    if delay is None:
+        try:
+            from app.services import settings_service
+            delay = settings_service.get_auto_verify_interval_seconds()
+        except Exception:
+            delay = AUTO_VERIFY_INTERVAL_SECONDS
     cancel(run_id)
     timer = threading.Timer(delay, _fire, args=[run_id])
     timer.daemon = True
@@ -46,67 +55,51 @@ def cancel(run_id: str) -> None:
 
 def _fire(run_id: str) -> None:
     """Run verification, then re-schedule if run is still awaiting_fixes."""
-    from app.core.database import SessionLocal
-    from app.models.agent_run import AgentRun, AgentTask, AgentRunStatus, AgentTaskStatus
-
     with _lock:
         _active_timers.pop(run_id, None)  # remove expired entry
 
-    db = SessionLocal()
     try:
-        run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
-        if not run or run.status != AgentRunStatus.AWAITING_FIXES:
+        run = storage.get_agent_run(run_id)
+        if not run or run.status != "awaiting_fixes":
             logger.debug(f"[AutoVerify] Run {run_id} no longer awaiting_fixes, stopping")
             return
 
-        task = db.query(AgentTask).filter(
-            AgentTask.run_id == run_id,
-            AgentTask.agent_name == "verification_agent",
-        ).first()
+        task = storage.get_agent_task(run_id, "verification_agent")
         if not task:
             return
 
         logger.info(f"[AutoVerify] Running auto-verification for run {run_id}")
-        task.status = AgentTaskStatus.RUNNING
-        task.started_at = datetime.utcnow()
-        db.commit()
+        storage.update_agent_task(task.id, status="running", started_at=datetime.utcnow())
 
         from app.services.agents.verification_agent import VerificationAgent
-        result = VerificationAgent(db).run(run, task)
+        result = VerificationAgent().run(run, task)
 
-        task.status = AgentTaskStatus.COMPLETED
-        task.completed_at = datetime.utcnow()
-        task.output = {**result, "auto_verified": True}
-        db.commit()
+        # Always mark the task completed with the latest result. The UI
+        # (AgentWorkflow) derives an amber "Partial" state from
+        # output.remaining > 0 — so a completed task with remaining findings
+        # renders as partial, not green.
+        storage.update_agent_task(
+            task.id, status="completed", completed_at=datetime.utcnow(),
+            output={**result, "auto_verified": True},
+        )
 
         if result.get("fully_resolved"):
-            run.status = AgentRunStatus.COMPLETED
-            run.completed_at = datetime.utcnow()
-            db.commit()
+            storage.update_agent_run(run_id, status="completed", completed_at=datetime.utcnow())
             logger.info(f"[AutoVerify] Run {run_id} fully resolved — marked COMPLETED")
         else:
             logger.info(
                 f"[AutoVerify] Run {run_id}: {result['resolved']}/{result['total_findings']} resolved, "
                 f"{result['remaining']} remaining — rescheduling"
             )
-            # Re-schedule for next cycle
             schedule(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
 
     except Exception as e:
         logger.error(f"[AutoVerify] Failed for run {run_id}: {e}")
-        db2 = SessionLocal()
         try:
-            t = db2.query(AgentTask).filter(
-                AgentTask.run_id == run_id,
-                AgentTask.agent_name == "verification_agent",
-            ).first()
-            if t and t.status.value == "running":
-                t.status = AgentTaskStatus.FAILED
-                t.error_message = str(e)[:1024]
-                db2.commit()
-        finally:
-            db2.close()
+            t = storage.get_agent_task(run_id, "verification_agent")
+            if t and t.status == "running":
+                storage.update_agent_task(t.id, status="failed", error_message=str(e)[:1024])
+        except Exception:
+            pass
         # Still re-schedule even on failure so it keeps trying
         schedule(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
-    finally:
-        db.close()

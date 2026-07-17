@@ -1,13 +1,14 @@
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 from datetime import datetime
-from app.models.agent_run import AgentRunStatus, AgentTaskStatus
+from app.core.enums import AgentRunStatus, AgentTaskStatus
 
 
 class AgentRunCreateRequest(BaseModel):
     database: str
     schema_name: str
     table: str
+    connection_id: Optional[str] = None
 
 
 class AgentBatchCreateRequest(BaseModel):
@@ -17,11 +18,15 @@ class AgentBatchCreateRequest(BaseModel):
       - scope="table"    : requires database, schema_name, table
       - scope="schema"   : requires database, schema_name  (all tables in schema)
       - scope="database" : requires database               (all tables, all schemas)
+    When workflow_template_id is provided the run uses the saved rule patterns
+    directly — rule intelligence is skipped and no rule review pause occurs.
     """
     scope: str  # "table" | "schema" | "database"
     database: str
     schema_name: Optional[str] = None
     table: Optional[str] = None
+    connection_id: Optional[str] = None
+    workflow_template_id: Optional[str] = None
 
 
 class AgentTaskResponse(BaseModel):
@@ -41,6 +46,7 @@ class AgentTaskResponse(BaseModel):
 
 class AgentRunResponse(BaseModel):
     id: str
+    connection_id: Optional[str] = None
     batch_id: Optional[str] = None
     batch_index: int = 0
     database: str
@@ -51,10 +57,12 @@ class AgentRunResponse(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     findings_count: int = 0
-    ai_rules_count: int = 0
-    rule_review_state: Optional[Dict[str, Any]] = None
+    ai_rules_count: int = 0  # approved instances after review
+    ai_rules_proposed: int = 0  # new definitions proposed by AI before review
+    instance_review_state: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
     created_at: datetime
+    schedule_id: Optional[str] = None  # set when the run was fired by a schedule
     tasks: List[AgentTaskResponse] = []
 
     class Config:
@@ -62,24 +70,33 @@ class AgentRunResponse(BaseModel):
 
 
 class RuleReviewEntry(BaseModel):
-    """A single rule entry in the review state (active or skipped)."""
-    code: str
+    """A single instance entry in the review state (active or skipped)."""
+    instance_id: str
+    definition_id: str
     name: str
     description: str
     severity: str
     original_severity: str = ""
     reason: str = ""
-    is_ai_generated: bool = False
-    category: str = "data_quality"
-    applies_to: List[str] = []
+    is_new_instance: bool = False
+    is_new_definition: bool = False
+    source: str = "llm"  # "existing" | "llm" | "deterministic"
+    scope: str = "table"
+    target_config: Dict[str, Any] = {}
     violated: bool = False
-    ai_violation_evidence: str = ""
+    violation_evidence: str = ""
 
 
 class RuleReviewRequest(BaseModel):
     """Payload for POST /runs/{id}/review-rules."""
     active: List[RuleReviewEntry]
     skipped: List[RuleReviewEntry]
+
+
+class BulkInstanceActionRequest(BaseModel):
+    """Payload for POST /runs/{id}/review-rules/bulk-approve|bulk-reject."""
+    instance_ids: List[str]
+    reason: Optional[str] = None  # used by bulk-reject
 
 
 class AgentRunListResponse(BaseModel):
@@ -98,12 +115,12 @@ class AgentBatchResponse(BaseModel):
 
 
 class AgentRuleSuggestion(BaseModel):
-    rule_id: str
-    code: str
+    instance_id: str
+    definition_id: str
     name: str
     description: str
     category: str
     severity: str
-    applies_to: List[str]
+    scope: str
     rationale: str
-    rule_status: str  # actual status: pending / active / rejected / disabled
+    instance_status: str  # pending / active / rejected / disabled

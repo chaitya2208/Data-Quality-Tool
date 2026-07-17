@@ -59,7 +59,7 @@ class SnowflakeConnectionPool:
         else:
             raise ValueError(f"Unsupported authentication method: {auth_method}")
 
-        return snowflake.connector.connect(**conn_params)
+        return snowflake.connector.connect(**conn_params, insecure_mode=True)
 
     def _is_connection_alive(self):
         """Check if connection is still alive"""
@@ -98,7 +98,7 @@ class SnowflakeConnectionPool:
         else:
             conn_params["password"] = settings.SNOWFLAKE_PASSWORD
 
-        return snowflake.connector.connect(**conn_params)
+        return snowflake.connector.connect(**conn_params, insecure_mode=True)
 
     def close(self):
         """Close the pool connection"""

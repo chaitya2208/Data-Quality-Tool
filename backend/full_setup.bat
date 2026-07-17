@@ -5,7 +5,7 @@ echo ==========================================
 echo.
 
 REM Step 1: Python Environment
-echo [Step 1/4] Setting up Python environment...
+echo [Step 1/3] Setting up Python environment...
 if not exist venv (
     python -m venv venv
     if %errorlevel% neq 0 (
@@ -25,23 +25,8 @@ if %errorlevel% neq 0 (
 echo    Done!
 echo.
 
-REM Step 2: PostgreSQL
-echo [Step 2/4] Starting PostgreSQL...
-docker ps >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERROR: Docker is not running
-    echo Please start Docker Desktop and run this script again
-    exit /b 1
-)
-
-docker-compose up -d
-echo    Waiting for PostgreSQL to be ready...
-timeout /t 5 /nobreak >nul
-echo    Done!
-echo.
-
-REM Step 3: Database Setup
-echo [Step 3/4] Initializing database...
+REM Step 2: Database Setup (creates the app schema + tables in Snowflake)
+echo [Step 2/3] Initializing database...
 python setup_db.py
 if %errorlevel% neq 0 (
     echo ERROR: Failed to initialize database
@@ -50,8 +35,8 @@ if %errorlevel% neq 0 (
 echo    Done!
 echo.
 
-REM Step 4: Test Snowflake Connection
-echo [Step 4/4] Testing Snowflake SSO connection...
+REM Step 3: Test Snowflake Connection
+echo [Step 3/3] Testing Snowflake SSO connection...
 echo    Your browser will open for SSO authentication...
 echo.
 python test_sso.py

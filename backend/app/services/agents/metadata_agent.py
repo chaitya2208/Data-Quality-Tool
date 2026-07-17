@@ -1,8 +1,5 @@
 import logging
-from typing import Tuple, List
-from sqlalchemy.orm import Session
-from app.models.asset import Asset
-from app.models.scan import Scan
+from typing import Tuple, List, Any
 from app.services.scan_service import ScanService
 
 logger = logging.getLogger(__name__)
@@ -14,13 +11,14 @@ class MetadataAgent:
     Does NOT run rules — that is RulesAgent's job.
     """
 
-    def __init__(self, db: Session):
-        self.db = db
-        self.service = ScanService(db)
+    def __init__(self):
+        self.service = ScanService()
 
-    def run(self, database: str, schema: str, table: str) -> Tuple[Scan, Asset, List[Asset]]:
+    def run(self, database: str, schema: str, table: str, connection_id: str = None) -> Tuple[Any, Any, List[Any]]:
         logger.info(f"[MetadataAgent] Starting for {database}.{schema}.{table}")
-        scan, table_asset, column_assets = self.service.scan_metadata_only(database, schema, table)
+        scan, table_asset, column_assets = self.service.scan_metadata_only(
+            database, schema, table, connection_id=connection_id
+        )
         logger.info(
             f"[MetadataAgent] Done — asset {table_asset.fqn}, {len(column_assets)} columns"
         )

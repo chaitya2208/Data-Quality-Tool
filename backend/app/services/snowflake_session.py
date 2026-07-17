@@ -15,6 +15,42 @@ import snowflake.connector
 from snowflake.connector import DictCursor
 from app.core.config import settings
 import logging
+import ssl
+import os
+
+# Corporate proxy intercepts HTTPS (including S3 result-batch downloads) with
+# its own cert. insecure_mode=True on connect() covers the Snowflake API call
+# but not the result-batch S3 fetches which go through the vendored urllib3.
+# Patch the full SSL chain here so every download in this process skips
+# cert verification — acceptable since insecure_mode is already on.
+os.environ.setdefault("PYTHONHTTPSVERIFY", "0")
+ssl._create_default_https_context = ssl._create_unverified_context  # stdlib path
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Also silence the warning from Snowflake's bundled copy of urllib3
+try:
+    import snowflake.connector.vendored.urllib3 as _sf_urllib3
+    _sf_urllib3.disable_warnings(_sf_urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+# Patch Snowflake's vendored pyopenssl — the S3 result-batch downloader uses
+# this path and it bypasses the stdlib ssl._create_default_https_context hook.
+try:
+    import snowflake.connector.vendored.urllib3.contrib.pyopenssl as _sf_pyopenssl
+    _orig_wrap = _sf_pyopenssl.PyOpenSSLContext.wrap_socket
+    def _insecure_wrap(self, *args, **kwargs):
+        try:
+            from OpenSSL import SSL as _SSL
+            self._ctx.set_verify(_SSL.VERIFY_NONE, lambda *a: True)
+        except Exception:
+            pass
+        return _orig_wrap(self, *args, **kwargs)
+    _sf_pyopenssl.PyOpenSSLContext.wrap_socket = _insecure_wrap
+except Exception as _e:
+    logging.getLogger(__name__).debug(f"pyopenssl patch skipped: {_e}")
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +90,18 @@ class SnowflakeSession:
         }
         if settings.SNOWFLAKE_ROLE:
             params["role"] = settings.SNOWFLAKE_ROLE
-        if settings.SNOWFLAKE_DATABASE:
-            params["database"] = settings.SNOWFLAKE_DATABASE
+        # A blank SNOWFLAKE_DATABASE in .env overrides the config default with
+        # an empty string, which leaves the session with no current database —
+        # then storage.py's unqualified table names (ASSETS, RULES, ...) fail
+        # with "does not have a current database". Fall back to the default so
+        # the app boots even if .env has the key set empty.
+        database = settings.SNOWFLAKE_DATABASE or "PLAYGROUND_DB"
+        params["database"] = database
+        # Default schema = app storage schema, so storage.py's unqualified
+        # table names (ASSETS, RULES, ...) resolve without prefixing every
+        # query. Source-table queries always use fully-qualified
+        # database.schema.table names, so they're unaffected by this.
+        params["schema"] = settings.SNOWFLAKE_APP_SCHEMA or "DQ_APP"
 
         auth = getattr(settings, "SNOWFLAKE_AUTH_METHOD", "externalbrowser")
         if auth.lower() == "externalbrowser":
@@ -63,11 +109,11 @@ class SnowflakeSession:
         else:
             params["password"] = settings.SNOWFLAKE_PASSWORD
 
-        self._connection = snowflake.connector.connect(**params)
+        self._connection = snowflake.connector.connect(**params, insecure_mode=True, login_timeout=120)
         logger.info("Snowflake connection established.")
 
     def get_connection(self):
-        if not self._connection or not self._is_alive():
+        if not self._connection:
             self.connect()
         return self._connection
 
@@ -84,13 +130,71 @@ class SnowflakeSession:
     # Read queries (use shared connection directly)
     # ─────────────────────────────────────────────
 
-    def query(self, sql: str) -> List[Dict[str, Any]]:
+    def query(
+        self,
+        sql: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run a read query on the shared connection. `timeout`, when given, is
+        a server-side statement timeout in seconds — Snowflake cancels the
+        query if it runs longer, which bounds the blast radius of an expensive
+        ad-hoc SELECT (e.g. an AI-authored draft_sql with an accidental
+        cartesian join) instead of letting it saturate the warehouse."""
         conn = self.get_connection()
-        cur = conn.cursor(DictCursor)
-        cur.execute(sql)
-        rows = cur.fetchall()
-        cur.close()
-        return rows
+        try:
+            cur = conn.cursor(DictCursor)
+            try:
+                if timeout is not None:
+                    cur.execute(sql, params or {}, timeout=timeout)
+                else:
+                    cur.execute(sql, params or {})
+                return cur.fetchall()
+            finally:
+                cur.close()
+        except snowflake.connector.errors.OperationalError:
+            # Connection dropped since the last call (idle timeout, network
+            # blip) — reconnect once and retry rather than pre-checking
+            # liveness on every call, which doubled round trips.
+            logger.warning("Snowflake connection dropped — reconnecting and retrying query.")
+            self._connection = None
+            conn = self.get_connection()
+            cur = conn.cursor(DictCursor)
+            try:
+                if timeout is not None:
+                    cur.execute(sql, params or {}, timeout=timeout)
+                else:
+                    cur.execute(sql, params or {})
+                return cur.fetchall()
+            finally:
+                cur.close()
+
+    def execute(self, sql: str, params: Optional[Dict[str, Any]] = None) -> int:
+        """
+        Run one INSERT/UPDATE/DELETE (or any non-SELECT) statement with bind
+        parameters, on the shared app-storage connection. Returns rowcount.
+        Not used for scanned-source-table execution — that path is
+        execute_with_context() below, which switches role/warehouse first.
+        """
+        with self._exec_lock:
+            conn = self.get_connection()
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute(sql, params or {})
+                    return cur.rowcount
+                finally:
+                    cur.close()
+            except snowflake.connector.errors.OperationalError:
+                logger.warning("Snowflake connection dropped — reconnecting and retrying execute.")
+                self._connection = None
+                conn = self.get_connection()
+                cur = conn.cursor()
+                try:
+                    cur.execute(sql, params or {})
+                    return cur.rowcount
+                finally:
+                    cur.close()
 
     def describe_table(self, database: str, schema: str, table: str) -> List[Dict[str, Any]]:
         """
@@ -149,17 +253,17 @@ class SnowflakeSession:
             orig_wh   = state.get("W") or state.get("w") or settings.SNOWFLAKE_WAREHOUSE
 
             try:
-                logger.info(f"USE ROLE {role}")
+                logger.debug(f"USE ROLE {role}")
                 cur.execute(f"USE ROLE {role}")
-                logger.info(f"USE WAREHOUSE {warehouse}")
+                logger.debug(f"USE WAREHOUSE {warehouse}")
                 cur.execute(f"USE WAREHOUSE {warehouse}")
                 clean_sql = _sanitize_sql(sql)
-                logger.info(f"Executing SQL: {clean_sql[:300]}")
+                logger.info(f"Executing SQL as {role}/{warehouse}: {clean_sql[:300]}")
                 # Execute each statement individually — execute_string has known
                 # parsing issues with multi-statement DDL+DML batches in Snowflake
                 statements = [s.strip() for s in clean_sql.split(";") if s.strip()]
                 for stmt in statements:
-                    logger.info(f"  Running statement: {stmt[:150]}")
+                    logger.debug(f"  Running statement: {stmt[:150]}")
                     cur.execute(stmt)
             finally:
                 # Always restore — even if sql raises
