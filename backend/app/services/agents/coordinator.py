@@ -250,6 +250,23 @@ class WorkflowCoordinator:
             logger.warning(f"[Coordinator] Profiling failed: {profile_result['error']}, continuing with no deterministic facts")
         profiler_result = profile_result["facts"] or {}
 
+        # ── Anomaly substrate: persist metric snapshots + refresh baselines ──
+        # Best-effort — never blocks the scan. Feeds AnomalyProposalAgent
+        # once sample_count >= 14 (see metric_snapshots.py).
+        if profiler_result and table_asset is not None:
+            try:
+                from app.services.metric_snapshots import record_metric_snapshots
+                record_metric_snapshots(
+                    scan_id=scan.id,
+                    asset_id=table_asset.id,
+                    database_name=run.database,
+                    schema_name=run.schema_name,
+                    table_name=run.table,
+                    facts=profiler_result,
+                )
+            except Exception as e:
+                logger.warning(f"[Coordinator] Metric snapshot capture failed: {e}")
+
         # ── Sweep stale pending proposals from prior runs ─────────────────────
         # A pending instance from an earlier run that was never approved
         # clutters this scan's review UI and confuses Claude (he sees the
@@ -733,6 +750,24 @@ class WorkflowCoordinator:
             self._mark_run_failed(str(e), advance=False)  # already advanced at review
             return
 
+        # ── Anomaly proposals sweep ──────────────────────────────────────
+        # After findings finalize, propose new anomaly rules for any
+        # baselines that just crossed the 14-sample maturity gate. On an
+        # agentic run these land as pending RULE_INSTANCES (inline review);
+        # on a scheduled run they go to PENDING_PROPOSALS + a notification.
+        # Best-effort — never blocks the run.
+        try:
+            from app.services.agents.anomaly_proposal_agent import run_for_scan as _run_anomaly
+            summary = _run_anomaly(run, table_asset, scan.id)
+            if summary.get("proposed"):
+                logger.info(
+                    f"[Coordinator] AnomalyProposalAgent proposed "
+                    f"{summary['proposed']} rule(s) "
+                    f"(scheduled={summary.get('scheduled', False)})"
+                )
+        except Exception as e:
+            logger.warning(f"[Coordinator] AnomalyProposalAgent failed: {e}")
+
         # Transition to awaiting_fixes immediately — before explanation agent so
         # the UI banner appears without waiting for Claude explanation calls.
         run = storage.update_agent_run(self.run_id, status="awaiting_fixes")
@@ -926,6 +961,29 @@ class WorkflowCoordinator:
             f"{len(skipped_patterns)} skipped on {table_asset.fqn}"
         )
 
+        # Anomaly substrate on template runs (scheduled) — capture snapshots
+        # before findings so anomaly rules approved on this template see
+        # fresh data. Best-effort; never blocks the scan.
+        try:
+            from app.services.agents.profiling_agent import ProfilingAgent
+            from app.services.metric_snapshots import record_metric_snapshots
+            prof = ProfilingAgent(None).run(
+                run.database, run.schema_name, run.table, run.connection_id,
+            )
+            facts = {
+                "column_stats":         prof.get("column_stats", {}),
+                "pk_shaped_candidates": prof.get("pk_shaped_candidates", []),
+                "freshness_signals":    prof.get("freshness_signals", []),
+                "closed_set_columns":   prof.get("closed_set_columns", {}),
+            }
+            record_metric_snapshots(
+                scan_id=scan.id, asset_id=table_asset.id,
+                database_name=run.database, schema_name=run.schema_name,
+                table_name=run.table, facts=facts,
+            )
+        except Exception as _snap_err:
+            logger.warning(f"[Coordinator] Template-path metric snapshot failed: {_snap_err}")
+
         # Findings
         findings_task = self._get_task("findings_agent")
         self._start_task(findings_task)
@@ -953,6 +1011,18 @@ class WorkflowCoordinator:
             self._skip_tasks(["verification_agent"])
             self._mark_run_failed(str(e), advance=False)
             return
+
+        # Anomaly proposals sweep (template/scheduled path)
+        try:
+            from app.services.agents.anomaly_proposal_agent import run_for_scan as _run_anomaly
+            summary = _run_anomaly(run, table_asset, scan.id)
+            if summary.get("proposed"):
+                logger.info(
+                    f"[Coordinator] AnomalyProposalAgent (template path) proposed "
+                    f"{summary['proposed']} rule(s)"
+                )
+        except Exception as _ap_err:
+            logger.warning(f"[Coordinator] AnomalyProposalAgent (template path) failed: {_ap_err}")
 
         storage.update_agent_run(
             self.run_id, status="awaiting_fixes", completed_at=datetime.utcnow()

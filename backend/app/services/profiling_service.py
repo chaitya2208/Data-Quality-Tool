@@ -319,7 +319,7 @@ def _jsonable(value: Any) -> Any:
         # keep integers as int, else float
         return int(value) if value == value.to_integral_value() else float(value)
     if isinstance(value, datetime.datetime):
-        return value.isoformat() + 'Z'
+        return value.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     if isinstance(value, (datetime.date, datetime.time)):
         return value.isoformat()
     return value

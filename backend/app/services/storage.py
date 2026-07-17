@@ -50,7 +50,7 @@ def _sha256(text: str) -> str:
 
 def _json_default(value: Any) -> Any:
     if isinstance(value, datetime.datetime):
-        return value.isoformat() + 'Z'
+        return value.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     if isinstance(value, (datetime.date, datetime.time)):
         return value.isoformat()
     if isinstance(value, decimal.Decimal):
@@ -849,12 +849,16 @@ def ensure_template_definition(
     description: str,
     category: str,
     severity: str,
+    allowed_scopes: Optional[list[str]] = None,
 ) -> SimpleNamespace:
     """Return the canonical sql_template definition for `template_shape`,
     auto-creating it (as system/active) if missing. Mirrors ensure_definition
-    but for the 8 sql_template shapes — called by initialize_default_rules so
+    but for the sql_template shapes — called by initialize_default_rules so
     they survive any full DB wipe and are always available for RuleIntelligence
-    to find via get_definition_by_template_shape."""
+    to find via get_definition_by_template_shape.
+
+    allowed_scopes defaults to ["column"] for the 8 canonical shapes;
+    anomaly shapes at table level pass ["table"]."""
     existing = get_definition_by_template_shape(template_shape)
     if not existing:
         existing = create_definition(
@@ -864,7 +868,7 @@ def ensure_template_definition(
             check_kind="sql_template",
             template_shape=template_shape,
             default_severity=severity,
-            allowed_scopes=["column"],
+            allowed_scopes=allowed_scopes or ["column"],
             source="system",
             status="active",
             owner="data-governance-team",
@@ -2637,7 +2641,7 @@ def apply_finding_update(
         raise ValueError(f"Finding not found: {finding_id}")
     hist = _bump_fail_history(existing.fail_history, {
         "scan_id": scan_id,
-        "at": datetime.datetime.utcnow().isoformat() + 'Z',
+        "at": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
         "fail_count": int(fail_count),
         "total_count": int(total_count),
     })
@@ -2695,7 +2699,7 @@ def reopen_finding(
         raise ValueError(f"Finding not found: {finding_id}")
     hist = _bump_fail_history(existing.fail_history, {
         "scan_id": scan_id,
-        "at": datetime.datetime.utcnow().isoformat() + 'Z',
+        "at": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
         "fail_count": int(fail_count),
         "total_count": int(total_count),
         "event": "reopened",
@@ -2738,7 +2742,7 @@ def create_finding_with_lifecycle(
     finding_id = _new_id()
     hist = [{
         "scan_id": scan_id,
-        "at": datetime.datetime.utcnow().isoformat() + 'Z',
+        "at": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
         "fail_count": int(fail_count),
         "total_count": int(total_count),
     }]
@@ -2853,3 +2857,104 @@ def list_mutes(
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     rows = sf_session.query(f"SELECT * FROM MUTES {where_sql} ORDER BY CREATED_AT DESC", params)
     return [_mute_from_row(r) for r in rows]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAINTENANCE_PROPOSALS — MaintenanceAgent-generated suggestions to pause/
+# retire stale or flapping rule instances. Reviewed in a queue UI, same
+# shape as anomaly proposals.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _maintenance_proposal_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        instance_id=row["INSTANCE_ID"],
+        action=row["ACTION"],
+        reason=row.get("REASON"),
+        evidence=_parse_json(row.get("EVIDENCE")) or {},
+        status=row["STATUS"],
+        decision_reason=row.get("DECISION_REASON"),
+        decided_by=row.get("DECIDED_BY"),
+        decided_at=row.get("DECIDED_AT"),
+        created_at=row["CREATED_AT"],
+    )
+
+
+def create_maintenance_proposal(
+    instance_id: str, action: str, reason: str,
+    evidence: Optional[dict] = None,
+) -> SimpleNamespace:
+    proposal_id = _new_id()
+    sf_session.execute(
+        """
+        INSERT INTO MAINTENANCE_PROPOSALS
+            (ID, INSTANCE_ID, ACTION, REASON, EVIDENCE, STATUS)
+        SELECT %(id)s, %(iid)s, %(action)s, %(reason)s,
+               PARSE_JSON(%(evidence)s), 'pending'
+        """,
+        {"id": proposal_id, "iid": instance_id, "action": action,
+         "reason": (reason or "")[:2000],
+         "evidence": _json_or_null(evidence or {})},
+    )
+    rows = sf_session.query(
+        "SELECT * FROM MAINTENANCE_PROPOSALS WHERE ID = %(id)s",
+        {"id": proposal_id},
+    )
+    return _maintenance_proposal_from_row(rows[0])
+
+
+def get_maintenance_proposal(proposal_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM MAINTENANCE_PROPOSALS WHERE ID = %(id)s",
+        {"id": proposal_id},
+    )
+    return _maintenance_proposal_from_row(rows[0]) if rows else None
+
+
+def list_maintenance_proposals(
+    status: Optional[str] = "pending", limit: int = 500,
+) -> list[SimpleNamespace]:
+    where, params = [], {"limit": max(1, min(limit, 1000))}
+    if status:
+        where.append("STATUS = %(status)s"); params["status"] = status
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    rows = sf_session.query(
+        f"""
+        SELECT * FROM MAINTENANCE_PROPOSALS {where_sql}
+        ORDER BY CREATED_AT DESC LIMIT %(limit)s
+        """,
+        params,
+    )
+    return [_maintenance_proposal_from_row(r) for r in rows]
+
+
+def has_pending_maintenance_proposal(instance_id: str, action: str) -> bool:
+    rows = sf_session.query(
+        """
+        SELECT ID FROM MAINTENANCE_PROPOSALS
+        WHERE INSTANCE_ID = %(iid)s AND ACTION = %(action)s
+          AND STATUS = 'pending'
+        LIMIT 1
+        """,
+        {"iid": instance_id, "action": action},
+    )
+    return bool(rows)
+
+
+def decide_maintenance_proposal(
+    proposal_id: str, status: str,
+    decided_by: Optional[str] = None, reason: Optional[str] = None,
+) -> None:
+    sf_session.execute(
+        """
+        UPDATE MAINTENANCE_PROPOSALS
+        SET STATUS = %(status)s,
+            DECIDED_BY = %(by)s,
+            DECIDED_AT = CURRENT_TIMESTAMP(),
+            DECISION_REASON = %(reason)s
+        WHERE ID = %(id)s
+        """,
+        {"id": proposal_id, "status": status,
+         "by": decided_by or "user",
+         "reason": (reason or "")[:2000] if reason else None},
+    )

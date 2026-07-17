@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock, Bell } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
@@ -12,7 +12,57 @@ import SettingsPage from './pages/Settings'
 import SavedWorkflows from './pages/SavedWorkflows'
 import Schedules from './pages/Schedules'
 import RunHistory from './pages/RunHistory'
+import Notifications from './pages/Notifications'
 import { useConnection } from './ConnectionContext'
+import { notificationsApi } from './api/client'
+
+function NotificationsBell() {
+  const [unread, setUnread] = useState(0)
+  useEffect(() => {
+    let cancelled = false
+    let failures = 0
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
+
+    async function poll() {
+      try {
+        const r = await notificationsApi.unreadCount()
+        if (!cancelled) {
+          setUnread(r.data.unread)
+          failures = 0
+        }
+      } catch {
+        // Back off on failure — a Snowflake auth loss or backend
+        // hiccup shouldn't have the bell hammering /unread-count
+        // every minute (each 500 also triggers an SSO retry on the
+        // backend). Doubles up to a 10-min ceiling; resets on success.
+        failures = Math.min(failures + 1, 6)
+      }
+      if (!cancelled) {
+        const nextMs = failures === 0 ? 60_000 : Math.min(60_000 * (2 ** failures), 600_000)
+        timeoutId = setTimeout(poll, nextMs)
+      }
+    }
+    poll()
+    return () => {
+      cancelled = true
+      if (timeoutId) clearTimeout(timeoutId)
+    }
+  }, [])
+  return (
+    <Link
+      to="/notifications"
+      className="relative inline-flex items-center justify-center w-9 h-9 rounded-lg text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+      aria-label="Notifications"
+    >
+      <Bell className="w-5 h-5" />
+      {unread > 0 && (
+        <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold inline-flex items-center justify-center">
+          {unread > 99 ? '99+' : unread}
+        </span>
+      )}
+    </Link>
+  )
+}
 
 function App() {
   const location = useLocation()
@@ -136,8 +186,12 @@ function App() {
             <Database className="w-5 h-5 text-primary-600" />
             <span className="text-base font-semibold text-gray-900 dark:text-gray-100">Data Quality</span>
           </div>
-          {/* Current page name on mobile */}
-          <div className="w-8" /> {/* spacer to center title */}
+          <NotificationsBell />
+        </div>
+
+        {/* Desktop top bar — just the bell, right-aligned */}
+        <div className="hidden lg:flex items-center justify-end h-12 px-6 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 sticky top-0 z-10">
+          <NotificationsBell />
         </div>
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8">
@@ -153,6 +207,7 @@ function App() {
             <Route path="/saved-workflows" element={<SavedWorkflows />}/>
             <Route path="/schedules"       element={<Schedules />}     />
             <Route path="/settings"        element={<SettingsPage />}  />
+            <Route path="/notifications"   element={<Notifications />} />
           </Routes>
         </main>
       </div>

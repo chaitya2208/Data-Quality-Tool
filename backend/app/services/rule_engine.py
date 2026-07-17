@@ -238,7 +238,10 @@ class RuleEngine:
         instance_rationale = (getattr(instance, "rationale", "") or "").strip()
         detail = instance_rationale or (definition.description or "").strip()
         template_shape = getattr(definition, "template_shape", "") or ""
-        is_aggregate = int(total) == 1 and template_shape in ("freshness", "row_count_min", "row_count_max")
+        is_aggregate = int(total) == 1 and template_shape in (
+            "freshness", "row_count_min", "row_count_max",
+            "metric_anomaly", "metric_relative_change", "category_disappeared",
+        )
 
         # Fetch a small sample of failing rows for the finding UI drill-down.
         # Uses the same predicate as the count SQL so numbers + samples agree.
@@ -509,6 +512,35 @@ def initialize_default_rules() -> None:
 
     for shape, name, description, category, severity in template_rules:
         storage.ensure_template_definition(shape, name, description, category, severity)
+
+    # ── Anomaly Tier A ──────────────────────────────────────────────────
+    # These read the app's METRIC_SNAPSHOTS / METRIC_BASELINES rather than
+    # the target table's data. RuleIntelligence / AnomalyProposalAgent
+    # creates instances of these once a baseline has >= 14 samples.
+    anomaly_template_rules = [
+        ("metric_anomaly",
+         "Metric Anomaly (MAD)",
+         "A tracked metric — row count, null percentage, distinct count, "
+         "freshness lag, etc. — deviated from its rolling-30d baseline by "
+         "more than the configured number of median absolute deviations.",
+         "anomaly", "medium", ["table"]),
+        ("metric_relative_change",
+         "Metric Relative Change",
+         "A tracked metric changed by more than the configured percentage "
+         "since the previous scan — complements MAD-based detection for "
+         "sudden jumps or drops that a noisy baseline would hide.",
+         "anomaly", "medium", ["table"]),
+        ("category_disappeared",
+         "Category Disappeared",
+         "A value that consistently appeared in a low-cardinality column "
+         "over the baseline window is missing from the latest scan — often "
+         "signals an upstream source that stopped producing rows.",
+         "anomaly", "medium", ["column"]),
+    ]
+    for shape, name, description, category, severity, scopes in anomaly_template_rules:
+        storage.ensure_template_definition(
+            shape, name, description, category, severity, allowed_scopes=scopes,
+        )
 
     logger.info(
         f"Default rules initialized — {len(default_rules)} metadata-audit + "

@@ -792,6 +792,94 @@ export interface AgentBatch {
   runs: AgentRun[];
 }
 
+// ── Notifications inbox + Anomaly proposals ──────────────────────────────
+
+export interface Notification {
+  id: string;
+  kind: string;
+  title: string;
+  body: string | null;
+  ref_table: string | null;
+  ref_id: string | null;
+  severity: string | null;
+  read_at: string | null;
+  created_at: string | null;
+}
+
+export const notificationsApi = {
+  list: (params?: { unread_only?: boolean; limit?: number }) =>
+    api.get<{ items: Notification[] }>('/notifications', { params }),
+  unreadCount: () => api.get<{ unread: number }>('/notifications/unread-count'),
+  markRead: (id: string) => api.post(`/notifications/${id}/read`),
+  markAllRead: () => api.post('/notifications/read-all'),
+};
+
+export interface PendingProposal {
+  id: string;
+  kind: string;
+  asset_id: string | null;
+  database_name: string | null;
+  schema_name: string | null;
+  table_name: string | null;
+  column_name: string | null;
+  template_shape: string | null;
+  metric_name: string | null;
+  target_config: Record<string, any> | null;
+  threshold_config: Record<string, any> | null;
+  severity: string | null;
+  rationale: string | null;
+  status: 'pending' | 'approved' | 'rejected' | 'superseded';
+  source_run_id: string | null;
+  source_scan_id: string | null;
+  schedule_id: string | null;
+  decision_reason: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
+  created_at: string | null;
+  instance_id: string | null;
+}
+
+export const proposalsApi = {
+  listPending: (limit = 100) => api.get<{ items: PendingProposal[] }>('/proposals/pending', { params: { limit } }),
+  get: (id: string) => api.get<PendingProposal>(`/proposals/${id}`),
+  approve: (id: string, decidedBy?: string) =>
+    api.post<{ ok: boolean; instance_id: string }>(`/proposals/${id}/approve`, { decided_by: decidedBy }),
+  reject: (id: string, reason?: string, decidedBy?: string) =>
+    api.post<{ ok: boolean }>(`/proposals/${id}/reject`, { reason, decided_by: decidedBy }),
+};
+
+export interface MaintenanceProposal {
+  id: string;
+  instance_id: string;
+  action: 'retire_candidate' | 'flapping' | 'superseded' | 'obsolete_target' | string;
+  reason: string | null;
+  evidence: Record<string, any> | null;
+  status: 'pending' | 'approved' | 'dismissed';
+  decision_reason: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
+  created_at: string | null;
+  instance_summary: {
+    id: string;
+    database_name: string;
+    schema_name: string;
+    table_name: string;
+    severity: string | null;
+    status: string | null;
+    definition_name: string | null;
+    definition_id: string | null;
+  } | null;
+}
+
+export const maintenanceApi = {
+  listPending: (limit = 200) => api.get<{ items: MaintenanceProposal[] }>('/maintenance/pending', { params: { limit } }),
+  approve: (id: string, decidedBy?: string) =>
+    api.post<{ ok: boolean; instance_id: string; new_status: string }>(`/maintenance/${id}/approve`, { decided_by: decidedBy }),
+  dismiss: (id: string, reason?: string, decidedBy?: string) =>
+    api.post<{ ok: boolean }>(`/maintenance/${id}/dismiss`, { reason, decided_by: decidedBy }),
+  runSweep: () => api.post<{ scanned: number; proposals_created: number; by_action: Record<string, number> }>('/maintenance/run'),
+};
+
 export const agentRunsApi = {
   start: (data: { database: string; schema_name: string; table: string; connection_id?: string | null }) =>
     api.post<AgentRun>('/agent/runs', data),

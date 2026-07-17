@@ -1,0 +1,223 @@
+"""Pending anomaly-rule proposals API.
+
+Proposals originate from AnomalyProposalAgent on scheduled runs and land
+in PENDING_PROPOSALS with STATUS='pending'. This router exposes list /
+approve / reject actions. Approval materialises a RULE_INSTANCES row and
+flips the proposal to 'approved'; rejection captures a reason (used later
+by the memo path to suppress re-proposal).
+"""
+from __future__ import annotations
+
+import json
+import logging
+from typing import Optional, Dict, Any
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.services import storage
+from app.services.snowflake_session import session as sf
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+class ProposalOut(BaseModel):
+    id: str
+    kind: str
+    asset_id: Optional[str] = None
+    database_name: Optional[str] = None
+    schema_name: Optional[str] = None
+    table_name: Optional[str] = None
+    column_name: Optional[str] = None
+    template_shape: Optional[str] = None
+    metric_name: Optional[str] = None
+    target_config: Optional[Dict[str, Any]] = None
+    threshold_config: Optional[Dict[str, Any]] = None
+    severity: Optional[str] = None
+    rationale: Optional[str] = None
+    status: str
+    source_run_id: Optional[str] = None
+    source_scan_id: Optional[str] = None
+    schedule_id: Optional[str] = None
+    decision_reason: Optional[str] = None
+    decided_by: Optional[str] = None
+    decided_at: Optional[str] = None
+    created_at: Optional[str] = None
+    instance_id: Optional[str] = None
+
+
+def _parse_json(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, (dict, list)):
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return None
+
+
+def _row_to_out(r: dict) -> ProposalOut:
+    return ProposalOut(
+        id=r["ID"], kind=r["KIND"],
+        asset_id=r.get("ASSET_ID"),
+        database_name=r.get("DATABASE_NAME"),
+        schema_name=r.get("SCHEMA_NAME"),
+        table_name=r.get("TABLE_NAME"),
+        column_name=r.get("COLUMN_NAME"),
+        template_shape=r.get("TEMPLATE_SHAPE"),
+        metric_name=r.get("METRIC_NAME"),
+        target_config=_parse_json(r.get("TARGET_CONFIG")),
+        threshold_config=_parse_json(r.get("THRESHOLD_CONFIG")),
+        severity=r.get("SEVERITY"),
+        rationale=r.get("RATIONALE"),
+        status=r["STATUS"],
+        source_run_id=r.get("SOURCE_RUN_ID"),
+        source_scan_id=r.get("SOURCE_SCAN_ID"),
+        schedule_id=r.get("SCHEDULE_ID"),
+        decision_reason=r.get("DECISION_REASON"),
+        decided_by=r.get("DECIDED_BY"),
+        decided_at=str(r["DECIDED_AT"]) if r.get("DECIDED_AT") else None,
+        created_at=str(r["CREATED_AT"]) if r.get("CREATED_AT") else None,
+        instance_id=r.get("INSTANCE_ID"),
+    )
+
+
+def _get_proposal(proposal_id: str) -> Optional[dict]:
+    rows = sf.query(
+        "SELECT * FROM PENDING_PROPOSALS WHERE ID = %(id)s",
+        {"id": proposal_id},
+    )
+    return rows[0] if rows else None
+
+
+@router.get("/pending")
+def list_pending(limit: int = 100):
+    rows = sf.query(
+        """
+        SELECT * FROM PENDING_PROPOSALS
+        WHERE STATUS = 'pending'
+        ORDER BY CREATED_AT DESC
+        LIMIT %(limit)s
+        """,
+        {"limit": max(1, min(limit, 500))},
+    )
+    return {"items": [_row_to_out(r).model_dump() for r in rows]}
+
+
+@router.get("/{proposal_id}")
+def get_proposal(proposal_id: str):
+    row = _get_proposal(proposal_id)
+    if not row:
+        raise HTTPException(404, f"Proposal {proposal_id} not found")
+    return _row_to_out(row).model_dump()
+
+
+class ApproveIn(BaseModel):
+    decided_by: Optional[str] = None
+
+
+@router.post("/{proposal_id}/approve")
+def approve_proposal(proposal_id: str, body: ApproveIn):
+    row = _get_proposal(proposal_id)
+    if not row:
+        raise HTTPException(404, f"Proposal {proposal_id} not found")
+    if row["STATUS"] != "pending":
+        raise HTTPException(409, f"Proposal already {row['STATUS']}")
+
+    target_config = _parse_json(row.get("TARGET_CONFIG")) or {}
+    threshold_config = _parse_json(row.get("THRESHOLD_CONFIG")) or {}
+    template_shape = row.get("TEMPLATE_SHAPE")
+    if not template_shape:
+        raise HTTPException(400, "Proposal is missing template_shape")
+
+    definition = storage.get_definition_by_template_shape(template_shape)
+    if not definition:
+        raise HTTPException(400, f"No rule definition for shape {template_shape}")
+
+    table_asset = None
+    if row.get("ASSET_ID"):
+        table_asset = storage.get_asset(row["ASSET_ID"])
+    if table_asset is None:
+        raise HTTPException(400, "Asset referenced by proposal not found")
+
+    try:
+        from app.services import rule_sql_templates
+        rule_sql = rule_sql_templates.render_template(
+            template_shape,
+            table_asset.database_name, table_asset.schema_name, table_asset.table_name,
+            target_config, threshold_config,
+        )
+    except Exception as e:
+        raise HTTPException(400, f"Could not render rule SQL: {e}")
+
+    scope = "column" if row.get("COLUMN_NAME") else "table"
+    fingerprint = storage._sha256(
+        f"anomaly|{definition.id}|{table_asset.id}|{json.dumps(target_config, sort_keys=True)}"
+    )
+    existing = storage.get_instance_by_fingerprint(fingerprint)
+    if existing:
+        instance = existing
+    else:
+        instance = storage.create_instance(
+            definition_id=definition.id,
+            scope=scope,
+            database_name=table_asset.database_name,
+            schema_name=table_asset.schema_name,
+            table_name=table_asset.table_name,
+            fingerprint=fingerprint,
+            severity=row.get("SEVERITY") or definition.default_severity or "medium",
+            target_config=target_config,
+            threshold_config=threshold_config,
+            rule_sql=rule_sql,
+            rationale=row.get("RATIONALE"),
+            status="active",
+            is_active=True,
+            owner="anomaly_proposal_agent",
+            created_by=body.decided_by or "user",
+            source_run_id=row.get("SOURCE_RUN_ID"),
+        )
+        storage.approve_instance(instance.id, approved_by=body.decided_by or "user")
+
+    sf.execute(
+        """
+        UPDATE PENDING_PROPOSALS
+        SET STATUS = 'approved',
+            DECIDED_BY = %(by)s,
+            DECIDED_AT = CURRENT_TIMESTAMP(),
+            INSTANCE_ID = %(iid)s
+        WHERE ID = %(id)s
+        """,
+        {"id": proposal_id, "by": body.decided_by or "user", "iid": instance.id},
+    )
+    return {"ok": True, "instance_id": instance.id}
+
+
+class RejectIn(BaseModel):
+    reason: Optional[str] = None
+    decided_by: Optional[str] = None
+
+
+@router.post("/{proposal_id}/reject")
+def reject_proposal(proposal_id: str, body: RejectIn):
+    row = _get_proposal(proposal_id)
+    if not row:
+        raise HTTPException(404, f"Proposal {proposal_id} not found")
+    if row["STATUS"] != "pending":
+        raise HTTPException(409, f"Proposal already {row['STATUS']}")
+    sf.execute(
+        """
+        UPDATE PENDING_PROPOSALS
+        SET STATUS = 'rejected',
+            DECIDED_BY = %(by)s,
+            DECIDED_AT = CURRENT_TIMESTAMP(),
+            DECISION_REASON = %(reason)s
+        WHERE ID = %(id)s
+        """,
+        {"id": proposal_id,
+         "by": body.decided_by or "user",
+         "reason": (body.reason or "")[:2000]},
+    )
+    return {"ok": True}

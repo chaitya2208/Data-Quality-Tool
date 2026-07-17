@@ -49,6 +49,8 @@ class RuleCategory(str, enum.Enum):
     DATA_QUALITY  = "data_quality"
     SECURITY      = "security"
     PERFORMANCE   = "performance"
+    FRESHNESS     = "freshness"
+    ANOMALY       = "anomaly"
 
 
 class RuleStatus(str, enum.Enum):

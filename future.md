@@ -785,3 +785,31 @@ anomaly-detection Tier A work above rather than build standalone:
 
 **Skip as standalone features** — the rest of the AI's list overlaps
 what's already computed (see "already covered" above).
+
+---
+
+## String-quality rule templates (2026-07-17, deferred)
+
+Snowflake Enterprise offers built-in DMFs for string quality checks. We
+don't depend on them (Enterprise-only, ties us to Snowflake's scheduler)
+but the 3 checks they cover that we lack are worth adding as first-class
+rule templates in `rule_sql_templates.py` + RuleIntelligence proposals:
+
+- **CASE_FORMAT_VIOLATION** — flag values that are not consistently
+  all-upper, all-lower, or title-case. SQL: count rows where
+  `col <> UPPER(col) AND col <> LOWER(col) AND col <> INITCAP(col)`.
+- **UNTRIMMED_STRING** — flag values with leading/trailing whitespace.
+  SQL: `col <> TRIM(col)`.
+- **SPECIAL_CHARACTER** — flag values containing characters outside
+  `[A-Za-z0-9 ]`. SQL: `REGEXP_LIKE(col, '.*[^A-Za-z0-9 ].*')`.
+- **INVALID_JSON** — flag non-NULL string values that are not valid JSON.
+  SQL: `TRY_PARSE_JSON(col) IS NULL AND col IS NOT NULL`.
+- **INVALID_NUMERIC_TYPE_CAST** — flag string columns that should be
+  numeric but contain non-parseable values.
+  SQL: `TRY_TO_NUMBER(col) IS NULL AND col IS NOT NULL`.
+
+Everything else in Snowflake's DMF catalogue (NULL%, DUPLICATE_COUNT,
+ROW_COUNT, FRESHNESS, STDDEV, quantiles, SCHEMA_CHANGE_COUNT) is already
+covered by existing rule templates or schema drift detection. Do NOT add
+a DMF integration — it requires Enterprise Edition and replicates work
+we've already done in plain SQL.

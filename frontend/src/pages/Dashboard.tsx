@@ -437,7 +437,7 @@ function healthTone(score: number | null | undefined): string {
 
 function fmtDaysAgo(iso: string | null | undefined): string {
   if (!iso) return '—'
-  const normalized = iso.replace(' ', 'T').replace(/Z?$/, 'Z')
+  const normalized = iso.replace(' ', 'T').replace(/([+-]\d{2}:\d{2}|Z)$/, '') + 'Z'
   const ms = new Date(normalized).getTime()
   if (isNaN(ms)) return '—'
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000))

@@ -179,6 +179,155 @@ def freshness_sql(
     )
 
 
+def _app_fqn(table: str) -> str:
+    """Fully-qualify a DQ_APP table for anomaly checks.
+
+    Anomaly template SQL queries METRIC_SNAPSHOTS / METRIC_BASELINES,
+    which live in the app's own schema, not the target table's data
+    source. Even when the rule executes against a Snowflake source
+    connection, we hit those tables through their fully-qualified path
+    so the query works regardless of the connection's current
+    database/schema.
+    """
+    from app.core.config import settings
+    db = settings.SNOWFLAKE_DATABASE
+    sch = settings.SNOWFLAKE_APP_SCHEMA or "DQ_APP"
+    return f"{_safe_identifier(db)}.{_safe_identifier(sch)}.{_safe_identifier(table)}"
+
+
+def metric_anomaly_sql(
+    asset_id: str,
+    metric_name: str,
+    column_name: Optional[str] = None,
+    deviations: float = 3.0,
+) -> str:
+    """Deviation-based anomaly check: flags when the latest snapshot value
+    for (asset, column, metric) is more than `deviations` MADs from the
+    stored baseline median.
+
+    Returns (1, 1) on breach, (0, 1) otherwise so the finding shape mirrors
+    the metadata-shape contract (fail_count=1, total_count=1, sample_rows=[])
+    the frontend already renders correctly.
+
+    Baseline maturity (SAMPLE_COUNT >= 14) is enforced by
+    AnomalyProposalAgent at proposal time, so we don't re-gate here — if
+    a rule instance exists, the baseline was mature when it was approved.
+    """
+    snap = _app_fqn("METRIC_SNAPSHOTS")
+    base = _app_fqn("METRIC_BASELINES")
+    asset_lit = str(asset_id).replace("'", "''")
+    metric_lit = str(metric_name).replace("'", "''")
+    dev = float(deviations)
+    col_pred = (f"COLUMN_NAME = '{str(column_name).replace(chr(39), chr(39) * 2)}'"
+                if column_name else "COLUMN_NAME IS NULL")
+    return (
+        "WITH latest AS (\n"
+        "  SELECT METRIC_VALUE\n"
+        f"  FROM {snap}\n"
+        f"  WHERE ASSET_ID = '{asset_lit}' AND METRIC_NAME = '{metric_lit}' AND {col_pred}\n"
+        "  ORDER BY CAPTURED_AT DESC LIMIT 1\n"
+        "), baseline AS (\n"
+        "  SELECT MEDIAN_VALUE, MAD_VALUE\n"
+        f"  FROM {base}\n"
+        f"  WHERE ASSET_ID = '{asset_lit}' AND METRIC_NAME = '{metric_lit}' AND {col_pred}\n"
+        "  ORDER BY UPDATED_AT DESC LIMIT 1\n"
+        ")\n"
+        "SELECT\n"
+        "  CASE\n"
+        "    WHEN (SELECT MAD_VALUE FROM baseline) IS NULL THEN 0\n"
+        "    WHEN (SELECT METRIC_VALUE FROM latest) IS NULL THEN 0\n"
+        "    WHEN (SELECT MAD_VALUE FROM baseline) = 0\n"
+        "         AND (SELECT METRIC_VALUE FROM latest) = (SELECT MEDIAN_VALUE FROM baseline) THEN 0\n"
+        "    WHEN (SELECT MAD_VALUE FROM baseline) = 0 THEN 1\n"
+        "    WHEN ABS((SELECT METRIC_VALUE FROM latest) - (SELECT MEDIAN_VALUE FROM baseline))\n"
+        f"         / (SELECT MAD_VALUE FROM baseline) > {dev} THEN 1\n"
+        "    ELSE 0\n"
+        "  END AS FAILED_COUNT,\n"
+        "  1 AS TOTAL_COUNT"
+    )
+
+
+def metric_relative_change_sql(
+    asset_id: str,
+    metric_name: str,
+    column_name: Optional[str] = None,
+    max_pct_change: float = 25.0,
+) -> str:
+    """Percentage-change anomaly: flags when the latest snapshot differs
+    from the previous snapshot for the same (asset, column, metric) by
+    more than `max_pct_change` percent. Complements MAD-based detection
+    for cases where the baseline is noisy but a sudden jump/drop still
+    matters."""
+    snap = _app_fqn("METRIC_SNAPSHOTS")
+    asset_lit = str(asset_id).replace("'", "''")
+    metric_lit = str(metric_name).replace("'", "''")
+    pct = float(max_pct_change)
+    col_pred = (f"COLUMN_NAME = '{str(column_name).replace(chr(39), chr(39) * 2)}'"
+                if column_name else "COLUMN_NAME IS NULL")
+    return (
+        "WITH ranked AS (\n"
+        "  SELECT METRIC_VALUE, ROW_NUMBER() OVER (ORDER BY CAPTURED_AT DESC) AS RN\n"
+        f"  FROM {snap}\n"
+        f"  WHERE ASSET_ID = '{asset_lit}' AND METRIC_NAME = '{metric_lit}' AND {col_pred}\n"
+        "), latest AS (SELECT METRIC_VALUE AS V FROM ranked WHERE RN = 1),\n"
+        "prev   AS (SELECT METRIC_VALUE AS V FROM ranked WHERE RN = 2)\n"
+        "SELECT\n"
+        "  CASE\n"
+        "    WHEN (SELECT V FROM prev) IS NULL THEN 0\n"
+        "    WHEN (SELECT V FROM latest) IS NULL THEN 0\n"
+        "    WHEN (SELECT V FROM prev) = 0 AND (SELECT V FROM latest) = 0 THEN 0\n"
+        "    WHEN (SELECT V FROM prev) = 0 THEN 1\n"
+        "    WHEN ABS((SELECT V FROM latest) - (SELECT V FROM prev)) * 100.0\n"
+        f"         / ABS((SELECT V FROM prev)) > {pct} THEN 1\n"
+        "    ELSE 0\n"
+        "  END AS FAILED_COUNT,\n"
+        "  1 AS TOTAL_COUNT"
+    )
+
+
+def category_disappeared_sql(
+    asset_id: str,
+    column_name: str,
+) -> str:
+    """Set-membership drop: flags when a value present in the baseline's
+    OBSERVED_SET is missing from the latest snapshot's observed values.
+
+    Both sides are stored under metric_name='observed_categories' — the
+    latest snapshot's METRIC_META.values is compared against the baseline's
+    OBSERVED_SET (union across the rolling window). Returns (1, 1) if any
+    baseline value is absent from the latest observation.
+    """
+    snap = _app_fqn("METRIC_SNAPSHOTS")
+    base = _app_fqn("METRIC_BASELINES")
+    asset_lit = str(asset_id).replace("'", "''")
+    col_lit = str(column_name).replace("'", "''")
+    return (
+        "WITH latest AS (\n"
+        "  SELECT METRIC_META\n"
+        f"  FROM {snap}\n"
+        f"  WHERE ASSET_ID = '{asset_lit}' AND METRIC_NAME = 'observed_categories'\n"
+        f"    AND COLUMN_NAME = '{col_lit}'\n"
+        "  ORDER BY CAPTURED_AT DESC LIMIT 1\n"
+        "), baseline AS (\n"
+        "  SELECT OBSERVED_SET\n"
+        f"  FROM {base}\n"
+        f"  WHERE ASSET_ID = '{asset_lit}' AND METRIC_NAME = 'observed_categories'\n"
+        f"    AND COLUMN_NAME = '{col_lit}'\n"
+        "  ORDER BY UPDATED_AT DESC LIMIT 1\n"
+        "), missing AS (\n"
+        "  SELECT B.VALUE::STRING AS V\n"
+        "  FROM baseline, LATERAL FLATTEN(input => OBSERVED_SET) B\n"
+        "  WHERE B.VALUE::STRING NOT IN (\n"
+        "    SELECT L.VALUE::STRING\n"
+        "    FROM latest, LATERAL FLATTEN(input => METRIC_META:values) L\n"
+        "  )\n"
+        ")\n"
+        "SELECT\n"
+        "  CASE WHEN EXISTS (SELECT 1 FROM missing) THEN 1 ELSE 0 END AS FAILED_COUNT,\n"
+        "  1 AS TOTAL_COUNT"
+    )
+
+
 def referential_integrity_sql(
     database_name: str, schema_name: str, table_name: str, column_name: str,
     ref_database: str, ref_schema: str, ref_table: str, ref_column: str,
@@ -221,6 +370,19 @@ TEMPLATE_SHAPES = {
     "duplicate_key":           {"fn": duplicate_key_sql,           "scope": "multi_column", "params": []},
     "referential_integrity":   {"fn": referential_integrity_sql,   "scope": "cross_table",
                                  "params": ["ref_database", "ref_schema", "ref_table", "ref_column"]},
+    # ── Anomaly Tier A shapes ──────────────────────────────────────────
+    # These read the app's own METRIC_SNAPSHOTS / METRIC_BASELINES rather
+    # than the target table's data, so they use scope="anomaly" — the
+    # render path passes asset_id + metric_name (+ optional column) from
+    # target_config instead of the target FQN.
+    "metric_anomaly":          {"fn": metric_anomaly_sql,          "scope": "anomaly",
+                                 "params": ["metric_name"],
+                                 "optional_params": ["deviations"]},
+    "metric_relative_change":  {"fn": metric_relative_change_sql,  "scope": "anomaly",
+                                 "params": ["metric_name"],
+                                 "optional_params": ["max_pct_change"]},
+    "category_disappeared":    {"fn": category_disappeared_sql,    "scope": "anomaly_column",
+                                 "params": []},
 }
 
 
@@ -386,5 +548,24 @@ def render_template(
         column = target_config["column"]
         kwargs = {k: target_config[k] for k in spec["params"]}
         return spec["fn"](database_name, schema_name, table_name, column, **kwargs)
+
+    if spec["scope"] == "anomaly":
+        # target_config: {asset_id, metric_name, column?}
+        # threshold_config: {deviations?} or {max_pct_change?}
+        kwargs = {"asset_id": target_config["asset_id"],
+                  "metric_name": target_config["metric_name"]}
+        if target_config.get("column"):
+            kwargs["column_name"] = target_config["column"]
+        for k in spec.get("optional_params", []):
+            if threshold_config.get(k) is not None:
+                kwargs[k] = threshold_config[k]
+        return spec["fn"](**kwargs)
+
+    if spec["scope"] == "anomaly_column":
+        # target_config: {asset_id, column}
+        return spec["fn"](
+            asset_id=target_config["asset_id"],
+            column_name=target_config["column"],
+        )
 
     raise ValueError(f"Unhandled template scope: {spec['scope']!r}")

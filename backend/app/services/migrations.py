@@ -181,6 +181,105 @@ _MIGRATIONS = [
          CREATED_AT  TIMESTAMP_TZ(9) NOT NULL DEFAULT CURRENT_TIMESTAMP()
      )
      """),
+    # ── Anomaly Detection Tier A ─────────────────────────────────────────
+    # Per-scan longitudinal metric captures + rolling MAD baselines. Feeds
+    # metric_anomaly / metric_relative_change / category_disappeared rule
+    # shapes and RuleIntelligence auto-proposal once sample_count >= 14.
+    ("create_metric_snapshots",
+     """
+     CREATE TABLE IF NOT EXISTS METRIC_SNAPSHOTS (
+         ID              VARCHAR(36) NOT NULL PRIMARY KEY,
+         SCAN_ID         VARCHAR(36) NOT NULL,
+         ASSET_ID        VARCHAR(36) NOT NULL,
+         DATABASE_NAME   VARCHAR(255),
+         SCHEMA_NAME     VARCHAR(255),
+         TABLE_NAME      VARCHAR(255),
+         COLUMN_NAME     VARCHAR(255),
+         METRIC_NAME     VARCHAR(100) NOT NULL,
+         METRIC_VALUE    FLOAT,
+         METRIC_META     VARIANT,
+         CAPTURED_AT     TIMESTAMP_TZ(9) DEFAULT CURRENT_TIMESTAMP()
+     )
+     """),
+    ("create_metric_baselines",
+     """
+     CREATE TABLE IF NOT EXISTS METRIC_BASELINES (
+         ID              VARCHAR(36) NOT NULL PRIMARY KEY,
+         ASSET_ID        VARCHAR(36) NOT NULL,
+         COLUMN_NAME     VARCHAR(255),
+         METRIC_NAME     VARCHAR(100) NOT NULL,
+         MEDIAN_VALUE    FLOAT,
+         MAD_VALUE       FLOAT,
+         SAMPLE_COUNT    NUMBER(38,0) DEFAULT 0,
+         OBSERVED_SET    VARIANT,
+         WINDOW_START    TIMESTAMP_TZ(9),
+         WINDOW_END      TIMESTAMP_TZ(9),
+         UPDATED_AT      TIMESTAMP_TZ(9) DEFAULT CURRENT_TIMESTAMP()
+     )
+     """),
+    # Anomaly proposals surfaced from scheduled runs (agentic runs use the
+    # normal inline RULE_INSTANCES flow with status='pending'). Each row is
+    # an actionable proposal a user can approve/reject via the notifications
+    # inbox. Status: pending | approved | rejected | superseded.
+    ("create_pending_proposals",
+     """
+     CREATE TABLE IF NOT EXISTS PENDING_PROPOSALS (
+         ID               VARCHAR(36) NOT NULL PRIMARY KEY,
+         KIND             VARCHAR(50) NOT NULL,
+         ASSET_ID         VARCHAR(36),
+         DATABASE_NAME    VARCHAR(255),
+         SCHEMA_NAME      VARCHAR(255),
+         TABLE_NAME       VARCHAR(255),
+         COLUMN_NAME      VARCHAR(255),
+         TEMPLATE_SHAPE   VARCHAR(100),
+         METRIC_NAME      VARCHAR(100),
+         TARGET_CONFIG    VARIANT,
+         THRESHOLD_CONFIG VARIANT,
+         SEVERITY         VARCHAR(20),
+         RATIONALE        VARCHAR(2000),
+         EVIDENCE         VARIANT,
+         STATUS           VARCHAR(20) DEFAULT 'pending',
+         SOURCE_RUN_ID    VARCHAR(36),
+         SOURCE_SCAN_ID   VARCHAR(36),
+         SCHEDULE_ID      VARCHAR(36),
+         DECISION_REASON  VARCHAR(2000),
+         DECIDED_BY       VARCHAR(255),
+         DECIDED_AT       TIMESTAMP_TZ(9),
+         CREATED_AT       TIMESTAMP_TZ(9) DEFAULT CURRENT_TIMESTAMP(),
+         INSTANCE_ID      VARCHAR(36)
+     )
+     """),
+    # Dashboard notifications inbox. Points at a resource (proposal, finding,
+    # etc.) via KIND + REF_ID so the same inbox can hold future event types.
+    ("create_notifications",
+     """
+     CREATE TABLE IF NOT EXISTS NOTIFICATIONS (
+         ID           VARCHAR(36) NOT NULL PRIMARY KEY,
+         KIND         VARCHAR(50) NOT NULL,
+         TITLE        VARCHAR(500) NOT NULL,
+         BODY         VARCHAR(2000),
+         REF_TABLE    VARCHAR(100),
+         REF_ID       VARCHAR(36),
+         SEVERITY     VARCHAR(20),
+         READ_AT      TIMESTAMP_TZ(9),
+         CREATED_AT   TIMESTAMP_TZ(9) DEFAULT CURRENT_TIMESTAMP()
+     )
+     """),
+    ("create_maintenance_proposals",
+     """
+     CREATE TABLE IF NOT EXISTS MAINTENANCE_PROPOSALS (
+         ID               VARCHAR(36) NOT NULL PRIMARY KEY,
+         INSTANCE_ID      VARCHAR(36) NOT NULL,
+         ACTION           VARCHAR(30) NOT NULL,
+         REASON           VARCHAR(2000),
+         EVIDENCE         VARIANT,
+         STATUS           VARCHAR(20) DEFAULT 'pending',
+         DECISION_REASON  VARCHAR(2000),
+         DECIDED_BY       VARCHAR(255),
+         DECIDED_AT       TIMESTAMP_TZ(9),
+         CREATED_AT       TIMESTAMP_TZ(9) DEFAULT CURRENT_TIMESTAMP()
+     )
+     """),
     (
         "create_rule_intelligence_search",
         # Cortex Search — requires CORTEX_USER privilege.
@@ -191,7 +290,7 @@ _MIGRATIONS = [
         CREATE OR REPLACE CORTEX SEARCH SERVICE RULE_INTELLIGENCE_SEARCH
             ON THINKING
             ATTRIBUTES TABLE_FQN, TABLE_TYPE, APPROVED_COUNT, REJECTED_COUNT
-            WAREHOUSE = COMPUTE_WH
+            WAREHOUSE = {warehouse}
             TARGET_LAG = '1 hour'
             AS (
                 SELECT
@@ -211,9 +310,18 @@ _MIGRATIONS = [
 
 
 def run_migrations() -> None:
+    # Interpolate connection-scoped settings (warehouse) into templated
+    # migrations so we don't hardcode a warehouse name that may not exist
+    # for the current role.
+    from app.core.config import settings
+    warehouse = (settings.SNOWFLAKE_WAREHOUSE or "").strip() or "COMPUTE_WH"
     for name, sql in _MIGRATIONS:
         try:
-            sf_session.execute(sql.strip())
+            rendered = sql.strip().format(warehouse=warehouse) if "{warehouse}" in sql else sql.strip()
+        except Exception:
+            rendered = sql.strip()
+        try:
+            sf_session.execute(rendered)
             logger.info(f"[Migrations] {name}: ok")
         except Exception as e:
             logger.warning(f"[Migrations] {name}: skipped — {e}")

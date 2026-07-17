@@ -46,7 +46,10 @@ function fmtScore(score: number | null): string {
 
 function fmtDaysAgo(iso: string | null): string | null {
   if (!iso) return null
-  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
+  const normalized = iso.replace(' ', 'T').replace(/([+-]\d{2}:\d{2}|Z)$/, '') + 'Z'
+  const ms = new Date(normalized).getTime()
+  if (isNaN(ms)) return null
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
   if (s < 3600)  return 'today'
   if (s < 86400) return `${Math.round(s / 3600)}h`
   return `${Math.round(s / 86400)}d`
@@ -54,7 +57,9 @@ function fmtDaysAgo(iso: string | null): string | null {
 
 function fmtRelTime(iso: string | null): string {
   if (!iso) return '—'
-  const then = new Date(iso).getTime()
+  const normalized = iso.replace(' ', 'T').replace(/([+-]\d{2}:\d{2}|Z)$/, '') + 'Z'
+  const then = new Date(normalized).getTime()
+  if (isNaN(then)) return '—'
   const now = Date.now()
   const s = Math.max(0, Math.round((now - then) / 1000))
   if (s < 60)      return `${s}s ago`

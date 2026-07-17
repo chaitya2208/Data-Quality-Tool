@@ -167,7 +167,7 @@ def get_fleet_overview(connection_id: Optional[str] = None, days: int = 30, top_
             "pass_rate": pass_rate,
             "open_findings": open_by_table.get(key, 0),
             "flapping": flap_by_table.get(key, 0),
-            "oldest_open_at": oldest_by_table.get(key).isoformat() + 'Z' if oldest_by_table.get(key) else None,
+            "oldest_open_at": oldest_by_table.get(key).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z' if oldest_by_table.get(key) else None,
         })
     # Worst first: most open incidents, then lowest pass-rate.
     tables.sort(key=lambda t: (
@@ -181,7 +181,7 @@ def get_fleet_overview(connection_id: Optional[str] = None, days: int = 30, top_
         "overall_health_score": overall_health,
         "fleet_open_findings": fleet_open,
         "fleet_flapping_findings": fleet_flap,
-        "fleet_oldest_open_at": fleet_oldest_open_at.isoformat() + 'Z' if fleet_oldest_open_at else None,
+        "fleet_oldest_open_at": fleet_oldest_open_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z' if fleet_oldest_open_at else None,
         "trend": trend,
         "tables": tables[:top_n],
         "tables_total": len(tables),
@@ -267,17 +267,17 @@ def get_table_health(database: str, schema: str, table: str):
             "columns": cols,
             "owner": inst.owner,
             "latest_status": latest.status if latest else None,
-            "last_executed_at": latest.executed_at.isoformat() + 'Z' if latest and latest.executed_at else None,
+            "last_executed_at": latest.executed_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z' if latest and latest.executed_at else None,
             "pass_count": passes,
             "fail_count": fails,
             "error_count": errors,
             "total_runs": total,
             "pass_rate": pass_rate,
             "history": [
-                {"status": e.status, "at": e.executed_at.isoformat() + 'Z' if e.executed_at else None}
+                {"status": e.status, "at": e.executed_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z' if e.executed_at else None}
                 for e in history
             ],
-            "first_detected_at": first_detected_at.isoformat() + 'Z' if first_detected_at else None,
+            "first_detected_at": first_detected_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z' if first_detected_at else None,
             "reopened_count": reopened_count,
             "current_fail_count": current_fail_count,
             "current_total_count": current_total_count,
@@ -310,7 +310,7 @@ def get_table_health(database: str, schema: str, table: str):
         "rules_passing": sum(1 for r in rules_out if r["latest_status"] == "passed"),
         "rules_unrun":   sum(1 for r in rules_out if r["latest_status"] is None),
         "open_findings": open_findings_count,
-        "last_run_at": last_run_at.isoformat() + 'Z' if last_run_at else None,
+        "last_run_at": last_run_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z' if last_run_at else None,
         "column_status": column_worst,  # {column_name: "green"|"amber"|"red"|"gray"}
         "rules": rules_out,
     }
