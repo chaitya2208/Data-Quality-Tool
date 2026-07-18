@@ -1,20 +1,19 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ruleLibraryApi, rulesApi } from '../api/client'
+import RuleChatPanel from './RuleChatPanel'
 import { fmtIST } from '../utils/dates'
-import type { RuleDefinition, RuleInstance, RuleCreatePayload, GeneratedRule, Rule } from '../api/client'
+import type { RuleDefinition, RuleInstance, Rule } from '../api/client'
 import {
   ShieldCheck, FileText, Database, Tag, Filter, Search, X,
   ArrowLeft, ChevronDown, ChevronRight, Code2, Sparkles, Layers,
   CheckCircle2, XCircle, AlertTriangle, Clock, Hash, GitBranch,
-  ToggleLeft, ToggleRight, Plus, ExternalLink, Loader2, RefreshCw,
+  ToggleLeft, ToggleRight, Plus, ExternalLink, Loader2,
 } from 'lucide-react'
 
 // ── Constants (mirrors Rules.tsx's palette so both pages feel like one system) ─
 
-const CATEGORIES = ['documentation', 'ownership', 'schema', 'naming', 'data_quality', 'security', 'performance']
-const ASSET_TYPES = ['table', 'column', 'schema', 'database']
 
 const CATEGORY_COLORS: Record<string, string> = {
   security: 'bg-red-100 text-red-800 border-red-200',
@@ -55,13 +54,6 @@ function cap(s: string) {
   return s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
 }
 
-const emptyForm = (): RuleCreatePayload => ({
-  code: '', name: '', description: '',
-  category: 'schema', severity: 'medium',
-  applies_to: ['table'], rule_config: {},
-  is_active: false,   // starts pending/inactive
-  owner: '', created_by: '', jira_ticket: '',
-})
 
 function formatTarget(scope: string, targetConfig: Record<string, any>): string {
   if (scope === 'column' && targetConfig.column) return `column: ${targetConfig.column}`
@@ -526,19 +518,12 @@ function PendingReviewSection() {
 
 // ── Definitions view ──────────────────────────────────────────────────────────
 
-function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }) {
+function DefinitionsView({ onSelect, highlightId }: { onSelect: (d: RuleDefinition) => void; highlightId?: string | null }) {
   const [categoryFilter, setCategoryFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
   const [search, setSearch] = useState('')
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
-  const [showModal, setShowModal] = useState(false)
-  const [form, setForm] = useState<RuleCreatePayload>(emptyForm())
-  const [formError, setFormError] = useState('')
-  // AI generation state
-  const [aiPrompt, setAiPrompt] = useState('')
-  const [aiOwner, setAiOwner] = useState('')
-  const [generated, setGenerated] = useState<GeneratedRule | null>(null)
-  const [aiStep, setAiStep] = useState<'prompt' | 'preview'>('prompt')
+  const [showChatPanel, setShowChatPanel] = useState(false)
   const queryClient = useQueryClient()
 
   const { data, isLoading } = useQuery({
@@ -547,65 +532,19 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
     staleTime: 30_000,
   })
 
+  // Scroll highlighted definition into view once data loads
+  useEffect(() => {
+    if (!highlightId || !data) return
+    const el = document.getElementById(`def-${highlightId}`)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }, [highlightId, data])
+
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['rule-definitions'] })
     queryClient.invalidateQueries({ queryKey: ['rules-stats'] })
-  }
-
-  const resetModal = () => {
-    setShowModal(false)
-    setForm(emptyForm())
-    setFormError('')
-    setGenerated(null)
-    setAiPrompt('')
-    setAiOwner('')
-    setAiStep('prompt')
-  }
-
-  const createMutation = useMutation({
-    mutationFn: (payload: RuleCreatePayload) => rulesApi.create(payload),
-    onSuccess: () => { invalidate(); resetModal() },
-    onError: (err: any) => setFormError(err?.response?.data?.detail || 'Failed to create rule'),
-  })
-
-  const generateMutation = useMutation({
-    mutationFn: () => rulesApi.generate(aiPrompt, aiOwner).then(r => r.data),
-    onSuccess: (result) => {
-      setGenerated(result)
-      setAiStep('preview')
-      // Pre-fill the form with generated values so user can still edit
-      setForm({
-        code: result.code,
-        name: result.name,
-        description: result.description,
-        category: result.category,
-        severity: result.severity,
-        applies_to: result.applies_to,
-        owner: aiOwner,
-        created_by: '',
-        jira_ticket: '',
-        rule_config: {},
-        is_active: false,
-      })
-    },
-  })
-
-  const toggleAppliesTo = (type: string) =>
-    setForm(f => ({
-      ...f,
-      applies_to: f.applies_to.includes(type)
-        ? f.applies_to.filter(t => t !== type)
-        : [...f.applies_to, type],
-    }))
-
-  const handleCreate = () => {
-    if (!form.code.trim()) return setFormError('Rule code is required')
-    if (!form.name.trim()) return setFormError('Rule name is required')
-    if (!form.description.trim()) return setFormError('Description is required')
-    if (!form.owner.trim()) return setFormError('Owner is required')
-    if (form.applies_to.length === 0) return setFormError('Select at least one asset type')
-    const codeClean = form.code.trim().toUpperCase().replace(/\s+/g, '_')
-    createMutation.mutate({ ...form, code: codeClean })
+    queryClient.invalidateQueries({ queryKey: ['rules-pending'] })
   }
 
   // Categories actually present in the library, not the full fixed enum —
@@ -652,7 +591,7 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
           </p>
         </div>
         <button
-          onClick={() => { setShowModal(true); setFormError('') }}
+          onClick={() => setShowChatPanel(true)}
           className="flex items-center gap-2 px-4 py-2.5 bg-primary-600 text-white font-medium rounded-lg hover:bg-primary-700 transition-colors flex-shrink-0"
         >
           <Plus className="w-4 h-4" /> Add Rule
@@ -739,8 +678,9 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
                 .map(d => (
                   <div
                     key={d.id}
+                    id={`def-${d.id}`}
                     onClick={() => onSelect(d)}
-                    className="px-6 py-4 flex items-start gap-4 hover:bg-gray-50 dark:hover:bg-gray-700/40 cursor-pointer transition-colors"
+                    className={`px-6 py-4 flex items-start gap-4 hover:bg-gray-50 dark:hover:bg-gray-700/40 cursor-pointer transition-colors ${highlightId === d.id ? 'ring-2 ring-inset ring-primary-500 bg-primary-100 dark:bg-primary-900/60' : ''}`}
                   >
                     <div className="mt-0.5"><DefinitionToggle definition={d} /></div>
                     <div className="flex-1 min-w-0">
@@ -777,261 +717,11 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
         })
       )}
 
-      {/* ── Add Rule Modal (AI-powered, ported from the old Rules.tsx) ────────── */}
-      {showModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden">
-
-            {/* Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-gradient-to-r from-primary-50 to-purple-50 dark:from-gray-800 dark:to-gray-800">
-              <div>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100 flex items-center gap-2">
-                  <Sparkles className="w-5 h-5 text-purple-500" />
-                  {aiStep === 'prompt' ? 'Add Rule with AI' : 'Review AI-Generated Rule'}
-                </h2>
-                <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">
-                  {aiStep === 'prompt'
-                    ? 'Describe what you want in plain English — Claude will create the rule structure'
-                    : 'Edit any field, then submit for approval'}
-                </p>
-              </div>
-              <button onClick={resetModal} className="text-gray-400 dark:text-gray-400 hover:text-gray-600 p-1 rounded">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="px-6 py-5 space-y-4 max-h-[75vh] overflow-y-auto">
-
-              {/* ── Step 1: Prompt ── */}
-              {aiStep === 'prompt' && (
-                <>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                      Describe the rule you want
-                    </label>
-                    <textarea
-                      rows={4}
-                      value={aiPrompt}
-                      onChange={e => setAiPrompt(e.target.value)}
-                      placeholder={
-                        "Examples:\n" +
-                        "• Customer ID should never be null in the orders table\n" +
-                        "• Status column should only have values: PENDING, ACTIVE, CLOSED\n" +
-                        "• Every fact table should have a created_date column"
-                      }
-                      className="w-full px-3 py-2.5 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none"
-                    />
-                    <p className="text-xs text-gray-400 dark:text-gray-400 mt-1">
-                      Be as specific as you like — column names, allowed values, business context all help.
-                    </p>
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-1">
-                      Your name / team <span className="text-gray-400 dark:text-gray-400 text-xs font-normal">(owner of this rule)</span>
-                    </label>
-                    <input
-                      type="text"
-                      value={aiOwner}
-                      onChange={e => setAiOwner(e.target.value)}
-                      placeholder="e.g. data-governance-team or your name"
-                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
-                    />
-                  </div>
-
-                  {generateMutation.isError && (
-                    <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-800 dark:text-red-300">
-                      {(generateMutation.error as any)?.response?.data?.detail || 'AI generation failed. Try again.'}
-                    </div>
-                  )}
-                </>
-              )}
-
-              {/* ── Step 2: Preview + edit ── */}
-              {aiStep === 'preview' && generated && (
-                <>
-                  {/* Duplicate warning — shown when AI or similarity check finds a match */}
-                  {generated.duplicate_of && (
-                    <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-lg px-4 py-3 flex items-start gap-2">
-                      <span className="text-amber-500 text-base flex-shrink-0">⚠️</span>
-                      <div>
-                        <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">Similar rule already exists</p>
-                        <p className="text-xs text-amber-800 dark:text-amber-300 mt-0.5">
-                          <span className="font-mono font-bold">{generated.duplicate_of.code}</span>
-                          {' — '}{generated.duplicate_of.name}
-                        </p>
-                        <p className="text-xs text-amber-700 dark:text-amber-400 mt-1">
-                          Review the existing rule before submitting. If your requirement is genuinely different, edit the fields below and proceed.
-                        </p>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* AI rationale banner */}
-                  <div className="bg-purple-50 dark:bg-purple-950/40 border border-purple-100 dark:border-purple-800 rounded-lg px-4 py-3">
-                    <p className="text-xs text-purple-800 dark:text-purple-300">
-                      <span className="font-semibold">AI Rationale: </span>{generated.rationale}
-                    </p>
-                  </div>
-
-                  {formError && (
-                    <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-800 dark:text-red-300">{formError}</div>
-                  )}
-
-                  {/* Code */}
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
-                      Rule Code
-                    </label>
-                    <input type="text"
-                      value={form.code}
-                      onChange={e => setForm(f => ({ ...f, code: e.target.value.toUpperCase().replace(/\s+/g, '_') }))}
-                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
-                    />
-                  </div>
-
-                  {/* Name */}
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
-                      Name
-                    </label>
-                    <input type="text"
-                      value={form.name}
-                      onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
-                    />
-                  </div>
-
-                  {/* Description */}
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
-                      Description
-                    </label>
-                    <textarea rows={3}
-                      value={form.description}
-                      onChange={e => setForm(f => ({ ...f, description: e.target.value }))}
-                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary-500"
-                    />
-                  </div>
-
-                  {/* Category + Severity */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">Category</label>
-                      <select value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))}
-                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500">
-                        {CATEGORIES.map(c => <option key={c} value={c}>{cap(c)}</option>)}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">Severity</label>
-                      <select value={form.severity} onChange={e => setForm(f => ({ ...f, severity: e.target.value }))}
-                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500">
-                        {Object.keys(SEVERITY_COLORS).map(s => <option key={s} value={s}>{cap(s)}</option>)}
-                      </select>
-                    </div>
-                  </div>
-
-                  {/* Applies to */}
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">Applies To</label>
-                    <div className="flex gap-2">
-                      {ASSET_TYPES.map(t => (
-                        <button key={t} type="button" onClick={() => toggleAppliesTo(t)}
-                          className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
-                            form.applies_to.includes(t)
-                              ? 'bg-primary-600 text-white border-primary-600'
-                              : 'bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600 hover:border-primary-400'
-                          }`}>{t}</button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Owner + Jira */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
-                        Owner <span className="text-red-500">*</span>
-                      </label>
-                      <input type="text" placeholder="team or person"
-                        value={form.owner ?? ''}
-                        onChange={e => setForm(f => ({ ...f, owner: e.target.value }))}
-                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
-                        Jira Ticket
-                      </label>
-                      <input type="text" placeholder="e.g. DQ-123"
-                        value={form.jira_ticket ?? ''}
-                        onChange={e => setForm(f => ({ ...f, jira_ticket: e.target.value }))}
-                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
-                      />
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
-
-            {/* Footer */}
-            <div className="flex items-center justify-between px-6 py-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
-              {aiStep === 'prompt' ? (
-                <>
-                  <p className="text-xs text-gray-400 dark:text-gray-400 flex items-center gap-1">
-                    <Sparkles className="w-3.5 h-3.5 text-purple-400" /> Powered by Claude
-                  </p>
-                  <div className="flex gap-3">
-                    <button
-                      onClick={() => { setShowModal(false); setAiPrompt(''); setAiOwner(''); setAiStep('prompt') }}
-                      className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/40"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={() => generateMutation.mutate()}
-                      disabled={!aiPrompt.trim() || generateMutation.isPending}
-                      className="flex items-center gap-2 px-5 py-2 text-sm font-medium text-white bg-purple-600 rounded-lg hover:bg-purple-700 disabled:opacity-50"
-                    >
-                      {generateMutation.isPending
-                        ? <><Loader2 className="w-4 h-4 animate-spin" />Generating...</>
-                        : <><Sparkles className="w-4 h-4" />Generate Rule</>
-                      }
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <button
-                    onClick={() => { setAiStep('prompt'); setGenerated(null); setFormError('') }}
-                    className="flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5" /> Regenerate
-                  </button>
-                  <div className="flex gap-3">
-                    <button
-                      onClick={resetModal}
-                      className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/40"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={handleCreate}
-                      disabled={createMutation.isPending}
-                      className="flex items-center gap-2 px-5 py-2 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 disabled:opacity-50"
-                    >
-                      {createMutation.isPending
-                        ? <><Loader2 className="w-4 h-4 animate-spin" />Submitting...</>
-                        : <><CheckCircle2 className="w-4 h-4" />Submit for Approval</>
-                      }
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      <RuleChatPanel
+        isOpen={showChatPanel}
+        onClose={() => setShowChatPanel(false)}
+        onRuleCreated={invalidate}
+      />
     </div>
   )
 }
@@ -1040,13 +730,23 @@ function DefinitionsView({ onSelect }: { onSelect: (d: RuleDefinition) => void }
 
 export default function RuleLibrary() {
   const [selectedDefinition, setSelectedDefinition] = useState<RuleDefinition | null>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const highlightId = searchParams.get('highlight')
+
+  // When navigated to with ?highlight=<id>, clear the param after a moment
+  useEffect(() => {
+    if (highlightId) {
+      const t = setTimeout(() => setSearchParams({}, { replace: true }), 3000)
+      return () => clearTimeout(t)
+    }
+  }, [highlightId, setSearchParams])
 
   return (
     <div className="space-y-6">
       {selectedDefinition ? (
         <InstancesView definition={selectedDefinition} onBack={() => setSelectedDefinition(null)} />
       ) : (
-        <DefinitionsView onSelect={setSelectedDefinition} />
+        <DefinitionsView onSelect={setSelectedDefinition} highlightId={highlightId} />
       )}
     </div>
   )

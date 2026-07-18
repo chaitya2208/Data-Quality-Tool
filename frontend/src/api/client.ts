@@ -157,6 +157,36 @@ export interface GeneratedRule {
   duplicate_of: { code: string; name: string } | null;
 }
 
+export interface ReferencedRule {
+  definition_id: string;
+  code: string;
+  name: string;
+  category: string;
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  proposed_rule?: GeneratedRule;
+  referenced_rules?: ReferencedRule[];
+}
+
+export interface ChatSession {
+  id: string;
+  title: string | null;
+  messages: ChatMessage[];
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatTurnResponse {
+  message: string;
+  proposed_rule: GeneratedRule | null;
+  is_ready: boolean;
+  referenced_rules: ReferencedRule[];
+}
+
 export const rulesApi = {
   list: (params?: { is_active?: boolean; category?: string; severity?: string; status?: string }) =>
     api.get<{ total: number; rules: Rule[] }>('/rules', { params }),
@@ -173,6 +203,17 @@ export const rulesApi = {
     api.post<Rule>(`/rules/${id}/reject`, { reason }),
   generate: (prompt: string, owner?: string) =>
     api.post<GeneratedRule>('/rules/generate', { prompt, owner }),
+  chat: (messages: { role: string; content: string }[], session_id?: string) =>
+    api.post<ChatTurnResponse>('/rules/chat', { messages, session_id }),
+};
+
+export const ruleChatSessionsApi = {
+  list: () => api.get<{ sessions: ChatSession[] }>('/rules/chat/sessions'),
+  create: (title?: string) => api.post<ChatSession>('/rules/chat/sessions', { title }),
+  get: (id: string) => api.get<ChatSession>(`/rules/chat/sessions/${id}`),
+  update: (id: string, messages: ChatMessage[], title?: string) =>
+    api.put<ChatSession>(`/rules/chat/sessions/${id}`, { messages, title }),
+  delete: (id: string) => api.delete(`/rules/chat/sessions/${id}`),
 };
 
 // ── Rule Library: Definitions / Instances / Executions ────────────────────────

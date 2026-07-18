@@ -441,6 +441,298 @@ Convert this requirement into a data quality rule. Respond with JSON only."""
     return GeneratedRule(**parsed)
 
 
+# ── Rule chat (Copilot-style side panel) ─────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    role: str    # "user" | "assistant"
+    content: str
+
+class RuleChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    session_id: Optional[str] = None   # when set, auto-save after generating response
+
+class RuleChatResponse(BaseModel):
+    message: str
+    proposed_rule: Optional[GeneratedRule] = None
+    is_ready: bool = False
+    referenced_rules: List[Dict] = []
+
+class ReferencedRule(BaseModel):
+    definition_id: str
+    code: str
+    name: str
+    category: str
+
+# Chat session CRUD models
+class ChatSessionResponse(BaseModel):
+    id: str
+    title: Optional[str]
+    messages: List[dict]
+    created_by: Optional[str]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+class ChatSessionListResponse(BaseModel):
+    sessions: List[ChatSessionResponse]
+
+class CreateSessionRequest(BaseModel):
+    title: Optional[str] = None
+
+class UpdateSessionRequest(BaseModel):
+    messages: List[dict]
+    title: Optional[str] = None
+
+
+def _session_to_response(s) -> ChatSessionResponse:
+    return ChatSessionResponse(
+        id=s.id,
+        title=s.title,
+        messages=s.messages,
+        created_by=s.created_by,
+        created_at=str(s.created_at) if s.created_at else None,
+        updated_at=str(s.updated_at) if s.updated_at else None,
+    )
+
+
+@router.get("/chat/sessions", response_model=ChatSessionListResponse)
+def list_chat_sessions():
+    user = (sf_session.get_cached_context() or {}).get("user")
+    sessions = storage.list_rule_chats(created_by=user)
+    return ChatSessionListResponse(sessions=[_session_to_response(s) for s in sessions])
+
+
+@router.post("/chat/sessions", response_model=ChatSessionResponse, status_code=201)
+def create_chat_session(req: CreateSessionRequest):
+    user = (sf_session.get_cached_context() or {}).get("user")
+    session = storage.create_rule_chat(title=req.title, messages=[], created_by=user)
+    return _session_to_response(session)
+
+
+@router.get("/chat/sessions/{session_id}", response_model=ChatSessionResponse)
+def get_chat_session(session_id: str):
+    session = storage.get_rule_chat(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    return _session_to_response(session)
+
+
+@router.put("/chat/sessions/{session_id}", response_model=ChatSessionResponse)
+def update_chat_session(session_id: str, req: UpdateSessionRequest):
+    session = storage.get_rule_chat(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    updated = storage.update_rule_chat(session_id, messages=req.messages, title=req.title)
+    return _session_to_response(updated)
+
+
+@router.delete("/chat/sessions/{session_id}", status_code=204)
+def delete_chat_session(session_id: str):
+    session = storage.get_rule_chat(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    storage.delete_rule_chat(session_id)
+    return None
+
+
+def _build_rule_context_for_ai() -> str:
+    """Build a rich rule context string for the AI system prompt."""
+    try:
+        _, rules = storage.list_rules_view(limit=5000)
+        findings_by_def = storage.get_findings_count_per_definition()
+        top_assets = storage.get_top_assets_per_definition(top_n=3)
+        # Build a map from handler_key.upper() → definition_id for ref resolution
+        # (rules in list_rules_view carry rule_config.definition_id)
+        lines = []
+        seen_def_ids: set = set()
+        for r in rules:
+            def_id = (r.rule_config or {}).get("definition_id", "")
+            if def_id in seen_def_ids:
+                continue
+            seen_def_ids.add(def_id)
+            finding_cnt = findings_by_def.get(def_id, 0)
+            assets = top_assets.get(def_id, [])
+            asset_str = ", ".join(f"{fqn} ({cnt})" for fqn, cnt in assets) if assets else "none"
+            lines.append(
+                f"- {r.code} | {r.category} | severity:{r.severity} | {finding_cnt} findings"
+                f"\n  Assets: {asset_str}"
+                f"\n  Desc: {(r.description or '')[:120]}"
+                f"\n  def_id: {def_id}"
+            )
+        return "\n".join(lines) or "  (none yet)"
+    except Exception as e:
+        logger.warning(f"[RuleChat] Could not build rule context: {e}")
+        return "  (unavailable)"
+
+
+def _extract_rule_refs(text: str, rules_by_code: dict) -> tuple:
+    """
+    Find all {\"ref\": \"CODE\", ...} blocks in text, resolve them to ReferencedRule objects,
+    and return (clean_text, referenced_rules_list).
+    """
+    ref_pattern = re.compile(r'\{"ref"\s*:\s*"([^"]+)"[^}]*\}')
+    refs = []
+    seen_codes: set = set()
+    for match in ref_pattern.finditer(text):
+        code = match.group(1).upper()
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+        rule = rules_by_code.get(code)
+        if rule:
+            def_id = (rule.rule_config or {}).get("definition_id", "")
+            refs.append({
+                "definition_id": def_id,
+                "code": code,
+                "name": rule.name,
+                "category": rule.category,
+            })
+    clean = ref_pattern.sub("", text).strip()
+    return clean, refs
+
+
+_CHAT_SYSTEM = """You are a Snowflake data quality rule expert helping a user define a new data quality rule via conversation.
+
+RESPONSE STYLE (strictly follow these):
+• Use short bullet points (•) — NOT paragraphs. Max 3-4 bullets per turn.
+• Ask exactly ONE clarifying question per turn, not multiple.
+• Keep each message under 120 words total.
+• Be direct and specific — no filler phrases.
+
+When mentioning an existing rule, output a reference tag exactly like this (the UI renders it as a clickable card):
+{"ref": "RULE_CODE", "name": "Rule Name", "definition_id": "..."}
+
+ALWAYS return valid JSON with this exact shape (no markdown, no prose outside JSON):
+{
+  "message": "Your reply with bullet points and any ref tags inline",
+  "is_ready": false,
+  "proposed_rule": null
+}
+
+When you have enough information, set is_ready=true and populate proposed_rule:
+{
+  "message": "Here is the rule I've drafted:",
+  "is_ready": true,
+  "proposed_rule": {
+    "code": "UPPER_SNAKE_CASE (max 50 chars)",
+    "name": "Short name (max 60 chars)",
+    "description": "1-3 sentence description",
+    "category": "data_quality|schema|naming|security|ownership|documentation|performance",
+    "severity": "critical|high|medium|low|info",
+    "applies_to": ["table"] or ["column"] or ["table","column"],
+    "rationale": "1-2 sentence rationale",
+    "duplicate_of": null
+  }
+}
+
+Rules for code: UPPER_SNAKE_CASE, max 50 chars, specific (e.g. NO_NULL_CUSTOMER_ID).
+Do NOT propose a rule that duplicates an existing one — reference it with a ref tag instead.
+"""
+
+
+@router.post("/chat", response_model=RuleChatResponse)
+def rule_chat(request: RuleChatRequest):
+    """
+    Conversational rule creation. Accepts a full message history, returns the next
+    assistant turn. When Claude is confident it sets is_ready=True with proposed_rule.
+    If session_id is provided, auto-saves the updated conversation to RULE_CHATS.
+    """
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
+
+    rule_context = _build_rule_context_for_ai()
+    system = _CHAT_SYSTEM + f"\n\nEXISTING RULES (with live findings data — do NOT duplicate):\n{rule_context}"
+
+    _, existing_rules = storage.list_rules_view(limit=5000)
+    rules_by_code = {r.code.upper(): r for r in existing_rules}
+
+    messages_payload = [{"role": m.role, "content": m.content} for m in request.messages]
+    transcript = "\n".join(
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+        for m in messages_payload
+    )
+    prompt = f"Conversation so far:\n{transcript}\n\nNow respond as the assistant."
+
+    try:
+        raw = ask_claude(prompt, system=system, max_tokens=1024)
+    except Exception as e:
+        logger.error(f"[RuleChat] Claude call failed: {e}")
+        raise HTTPException(status_code=503, detail=f"AI chat failed: {str(e)}")
+
+    parsed = None
+    for pattern in [r"```(?:json)?\s*(\{.*?\})\s*```", r"\{[\s\S]*\}"]:
+        match = re.search(pattern, raw, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(1) if "```" in pattern else match.group(0))
+                if "message" in parsed:
+                    break
+            except Exception:
+                continue
+
+    if not parsed or "message" not in parsed:
+        logger.error(f"[RuleChat] Bad response: {raw[:300]}")
+        return RuleChatResponse(message="I had trouble formatting my response. Could you rephrase?")
+
+    clean_message, refs = _extract_rule_refs(parsed["message"], rules_by_code)
+
+    proposed = None
+    if parsed.get("is_ready") and parsed.get("proposed_rule"):
+        pr = parsed["proposed_rule"]
+        pr["code"] = re.sub(r"[^A-Z0-9_]", "_", (pr.get("code") or "").upper().strip())[:50]
+        valid_cats = {"naming", "documentation", "ownership", "schema", "data_quality", "security", "performance"}
+        valid_sevs = {"critical", "high", "medium", "low", "info"}
+        if pr.get("category") not in valid_cats:
+            pr["category"] = "data_quality"
+        if pr.get("severity") not in valid_sevs:
+            pr["severity"] = "medium"
+        if not isinstance(pr.get("applies_to"), list):
+            pr["applies_to"] = ["table"]
+        pr.setdefault("rationale", "")
+        pr["duplicate_of"] = None
+        exact_def = storage.get_definition_by_handler_key(pr["code"].lower())
+        if exact_def:
+            pr["duplicate_of"] = {"code": pr["code"], "name": exact_def.name}
+        else:
+            similar = _find_similar_rule(pr.get("name", ""), pr.get("description", ""))
+            if similar:
+                pr["duplicate_of"] = {"code": similar.code, "name": similar.name}
+        proposed = GeneratedRule(**pr)
+
+    response = RuleChatResponse(
+        message=clean_message,
+        proposed_rule=proposed,
+        is_ready=bool(parsed.get("is_ready")) and proposed is not None,
+        referenced_rules=refs,
+    )
+
+    # Auto-save if a session_id was provided
+    if request.session_id:
+        try:
+            session = storage.get_rule_chat(request.session_id)
+            if session is not None:
+                import json as _json
+                existing_msgs = list(session.messages)
+                # Append the new user message(s) not already in DB + the assistant reply
+                # (client sends full history; just save it wholesale)
+                new_msgs = [{"role": m.role, "content": m.content} for m in request.messages]
+                new_msgs.append({
+                    "role": "assistant",
+                    "content": clean_message,
+                    "referenced_rules": refs,
+                    "proposed_rule": proposed.dict() if proposed else None,
+                })
+                title = session.title
+                if not title and new_msgs:
+                    first_user = next((m["content"] for m in new_msgs if m["role"] == "user"), None)
+                    if first_user:
+                        title = first_user[:60]
+                storage.update_rule_chat(request.session_id, messages=new_msgs, title=title)
+        except Exception as save_err:
+            logger.warning(f"[RuleChat] Auto-save failed: {save_err}")
+
+    return response
+
+
 # ── Initialize defaults ───────────────────────────────────────────────────────
 
 @router.post("/initialize")

@@ -306,6 +306,20 @@ _MIGRATIONS = [
             )
         """,
     ),
+    (
+        "create_rule_chats",
+        """
+        CREATE TABLE IF NOT EXISTS RULE_CHATS (
+            ID          VARCHAR(36)   NOT NULL,
+            TITLE       VARCHAR(255),
+            MESSAGES    VARIANT       NOT NULL,
+            CREATED_BY  VARCHAR(255),
+            CREATED_AT  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            UPDATED_AT  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            PRIMARY KEY (ID)
+        )
+        """,
+    ),
 ]
 
 

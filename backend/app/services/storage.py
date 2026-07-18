@@ -1844,6 +1844,116 @@ def delete_connection(connection_id: str) -> None:
     sf_session.execute("DELETE FROM CONNECTIONS WHERE ID = %(id)s", {"id": connection_id})
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# RULE_CHATS  — persistent conversation sessions for the AI rule chat panel
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _chat_from_row(row: dict) -> SimpleNamespace:
+    raw = row.get("MESSAGES")
+    if isinstance(raw, str):
+        try:
+            import json as _json
+            messages = _json.loads(raw)
+        except Exception:
+            messages = []
+    elif isinstance(raw, list):
+        messages = raw
+    else:
+        messages = []
+    return SimpleNamespace(
+        id=row["ID"],
+        title=row.get("TITLE"),
+        messages=messages,
+        created_by=row.get("CREATED_BY"),
+        created_at=row.get("CREATED_AT"),
+        updated_at=row.get("UPDATED_AT"),
+    )
+
+
+def create_rule_chat(title: Optional[str], messages: list, created_by: Optional[str] = None) -> SimpleNamespace:
+    import json as _json
+    chat_id = _new_id()
+    sf_session.execute(
+        """
+        INSERT INTO RULE_CHATS (ID, TITLE, MESSAGES, CREATED_BY)
+        SELECT %(id)s, %(title)s, PARSE_JSON(%(messages)s), %(created_by)s
+        """,
+        {"id": chat_id, "title": title, "messages": _json.dumps(messages), "created_by": created_by},
+    )
+    rows = sf_session.query("SELECT * FROM RULE_CHATS WHERE ID = %(id)s", {"id": chat_id})
+    return _chat_from_row(rows[0])
+
+
+def get_rule_chat(chat_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query("SELECT * FROM RULE_CHATS WHERE ID = %(id)s", {"id": chat_id})
+    return _chat_from_row(rows[0]) if rows else None
+
+
+def list_rule_chats(created_by: Optional[str] = None, limit: int = 50) -> list:
+    if created_by:
+        rows = sf_session.query(
+            "SELECT * FROM RULE_CHATS WHERE UPPER(CREATED_BY) = UPPER(%(u)s) ORDER BY UPDATED_AT DESC LIMIT %(lim)s",
+            {"u": created_by, "lim": limit},
+        )
+    else:
+        rows = sf_session.query(
+            "SELECT * FROM RULE_CHATS ORDER BY UPDATED_AT DESC LIMIT %(lim)s",
+            {"lim": limit},
+        )
+    return [_chat_from_row(r) for r in rows]
+
+
+def update_rule_chat(chat_id: str, messages: list, title: Optional[str] = None) -> Optional[SimpleNamespace]:
+    import json as _json
+    sets = ["MESSAGES = PARSE_JSON(%(messages)s)", "UPDATED_AT = CURRENT_TIMESTAMP()"]
+    params: dict = {"id": chat_id, "messages": _json.dumps(messages)}
+    if title is not None:
+        sets.append("TITLE = %(title)s")
+        params["title"] = title
+    sf_session.execute(f"UPDATE RULE_CHATS SET {', '.join(sets)} WHERE ID = %(id)s", params)
+    return get_rule_chat(chat_id)
+
+
+def delete_rule_chat(chat_id: str) -> None:
+    sf_session.execute("DELETE FROM RULE_CHATS WHERE ID = %(id)s", {"id": chat_id})
+
+
+def get_findings_count_per_definition() -> dict:
+    rows = sf_session.query(
+        """
+        SELECT ri.DEFINITION_ID, COUNT(f.ID) AS CNT
+        FROM RULE_INSTANCES ri
+        JOIN FINDINGS f ON f.INSTANCE_ID = ri.ID
+        WHERE f.STATUS <> 'superseded'
+        GROUP BY ri.DEFINITION_ID
+        """
+    )
+    return {r["DEFINITION_ID"]: r["CNT"] for r in rows}
+
+
+def get_top_assets_per_definition(top_n: int = 3) -> dict:
+    """Returns {definition_id: [(asset_fqn, count), ...]} for the top-N assets per rule."""
+    rows = sf_session.query(
+        """
+        SELECT ri.DEFINITION_ID, a.FQN, COUNT(f.ID) AS CNT
+        FROM RULE_INSTANCES ri
+        JOIN FINDINGS f ON f.INSTANCE_ID = ri.ID
+        JOIN ASSETS a   ON a.ID = f.ASSET_ID
+        WHERE f.STATUS <> 'superseded'
+        GROUP BY ri.DEFINITION_ID, a.FQN
+        ORDER BY ri.DEFINITION_ID, CNT DESC
+        """
+    )
+    result: dict = {}
+    for r in rows:
+        def_id = r["DEFINITION_ID"]
+        if def_id not in result:
+            result[def_id] = []
+        if len(result[def_id]) < top_n:
+            result[def_id].append((r["FQN"], r["CNT"]))
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # APP_SETTINGS  (ported from old app/models/app_setting.py)
 # "KEY"/"VALUE" are reserved words -> quoted. VALUE is VARIANT (holds a
