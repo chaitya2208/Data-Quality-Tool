@@ -320,6 +320,83 @@ _MIGRATIONS = [
         )
         """,
     ),
+    # ── Data Lineage ─────────────────────────────────────────────────────
+    # Persistent edge cache for the Lineage page. Populated per-database by
+    # POST /api/v1/lineage/refresh via SNOWFLAKE.CORE.GET_LINEAGE (preferred)
+    # or ACCOUNT_USAGE.OBJECT_DEPENDENCIES (fallback). Refresh path mirrors
+    # RELATIONSHIP_CATALOG: atomic delete-scope + multi-row INSERT SELECT.
+    (
+        "create_lineage_edges",
+        """
+        CREATE TABLE IF NOT EXISTS LINEAGE_EDGES (
+            ID                  VARCHAR(36)   NOT NULL PRIMARY KEY,
+            CONNECTION_ID       VARCHAR(36)   NOT NULL,
+            SOURCE_DATABASE     VARCHAR(255)  NOT NULL,
+            SOURCE_SCHEMA       VARCHAR(255)  NOT NULL,
+            SOURCE_TABLE        VARCHAR(255)  NOT NULL,
+            SOURCE_FQN          VARCHAR(500)  NOT NULL,
+            SOURCE_KIND         VARCHAR(50),
+            TARGET_DATABASE     VARCHAR(255)  NOT NULL,
+            TARGET_SCHEMA       VARCHAR(255)  NOT NULL,
+            TARGET_TABLE        VARCHAR(255)  NOT NULL,
+            TARGET_FQN          VARCHAR(500)  NOT NULL,
+            TARGET_KIND         VARCHAR(50),
+            EDGE_TYPE           VARCHAR(30),
+            DISCOVERY_SOURCE    VARCHAR(30),
+            EVIDENCE            VARIANT,
+            FIRST_DISCOVERED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            LAST_SEEN_AT        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+        """,
+    ),
+    (
+        "create_lineage_refresh_state",
+        """
+        CREATE TABLE IF NOT EXISTS LINEAGE_REFRESH_STATE (
+            CONNECTION_ID          VARCHAR(36)   NOT NULL,
+            DATABASE_NAME          VARCHAR(255)  NOT NULL,
+            LAST_REFRESHED_AT      TIMESTAMP_NTZ,
+            LAST_STATUS            VARCHAR(20),
+            LAST_ERROR             VARCHAR(2000),
+            EDGE_COUNT             NUMBER(38,0) DEFAULT 0,
+            DISCOVERY_METHOD_USED  VARCHAR(30),
+            PARTIAL_FAILURES       VARIANT,
+            PRIMARY KEY (CONNECTION_ID, DATABASE_NAME)
+        )
+        """,
+    ),
+    (
+        "create_lineage_capability_cache",
+        """
+        CREATE TABLE IF NOT EXISTS LINEAGE_CAPABILITY_CACHE (
+            CONNECTION_ID         VARCHAR(36)  NOT NULL PRIMARY KEY,
+            GET_LINEAGE_AVAILABLE BOOLEAN,
+            PROBED_AT             TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            PROBE_ERROR           VARCHAR(2000)
+        )
+        """,
+    ),
+    # Full Snowflake catalog snapshot — every database / schema / table
+    # (regardless of whether it was ever scanned) so the lineage page can show
+    # the complete nested picture. Populated by POST /lineage/index-catalog.
+    (
+        "create_lineage_catalog",
+        """
+        CREATE TABLE IF NOT EXISTS LINEAGE_CATALOG (
+            ID              VARCHAR(36)   NOT NULL PRIMARY KEY,
+            CONNECTION_ID   VARCHAR(36)   NOT NULL,
+            DATABASE_NAME   VARCHAR(255)  NOT NULL,
+            SCHEMA_NAME     VARCHAR(255),
+            TABLE_NAME      VARCHAR(255),
+            OBJECT_KIND     VARCHAR(50)   NOT NULL,   -- database | schema | table | view | dynamic_table | materialized_view | external_table | stage
+            FQN             VARCHAR(500),
+            ROW_COUNT       NUMBER(38,0),
+            SIZE_BYTES      NUMBER(38,0),
+            COMMENT         VARCHAR(2000),
+            INDEXED_AT      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+        """,
+    ),
 ]
 
 

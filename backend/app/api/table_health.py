@@ -13,11 +13,9 @@ from typing import Optional
 from collections import defaultdict
 from app.services import storage
 from app.services.snowflake_session import session as sf_session
+from app.services.storage import SEVERITY_WEIGHT, HISTORY_LIMIT
 
 router = APIRouter()
-
-SEVERITY_WEIGHT = {"critical": 5, "high": 3, "medium": 2, "low": 1, "info": 1}
-HISTORY_LIMIT = 20  # last N executions per instance for pass-rate + sparkline
 
 
 def _columns_for_instance(inst) -> list[str]:

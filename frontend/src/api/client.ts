@@ -501,6 +501,135 @@ export const tableHealthApi = {
     api.get<FleetOverview>('/table-health/fleet/overview', { params }),
 };
 
+// ── Lineage ────────────────────────────────────────────────────────────────
+
+export type LineageNodeKind =
+  | 'database' | 'schema' | 'table' | 'view'
+  | 'materialized_view' | 'dynamic_table' | 'stage' | 'external_location'
+  | 'external_table' | 'iceberg_table' | 'semantic_view';
+
+export type LineageEdgeType =
+  | 'view_dep' | 'materialized_view' | 'dynamic_table'
+  | 'copy_into' | 'data_flow' | 'ctas' | 'insert_merge';
+
+export interface LineageNode {
+  id: string;
+  label: string;
+  kind: LineageNodeKind;
+  parent_id?: string | null;
+  database?: string;
+  schema?: string;
+  table?: string;
+  asset_id?: string | null;
+  row_count?: number | null;
+  size_bytes?: number | null;
+  last_scanned_at?: string | null;
+  health_score?: number | null;
+  open_findings?: number;
+  rules_run?: number;
+  // Aggregate containers
+  table_count?: number;
+  schema_count?: number;
+  open_findings_total?: number;
+  avg_health_score?: number | null;
+  // Table drill-down
+  depth?: number;
+  is_focus?: boolean;
+  is_external?: boolean;
+}
+
+export interface LineageEdge {
+  id: string;
+  source: string;
+  target: string;
+  edge_type?: LineageEdgeType | null;
+  discovery_source?: 'get_lineage' | 'object_dependencies' | null;
+  count?: number;
+}
+
+export interface LineageDatabaseCard {
+  database: string;
+  schema_count: number;
+  table_count: number;
+  edge_count: number;
+  avg_health_score: number | null;
+  last_refreshed_at: string | null;
+  discovery_method_used: string | null;
+  last_status: string | null;
+}
+
+export interface LineageGraph {
+  available: boolean;
+  reason?: 'no_connection' | 'postgres_unsupported' | null;
+  nodes: LineageNode[];
+  edges: LineageEdge[];
+  databases?: LineageDatabaseCard[];
+  last_refreshed_at: string | null;
+  discovery_method: 'get_lineage' | 'object_dependencies' | null;
+  focus_fqn?: string;
+  hops?: number;
+}
+
+export interface LineageRefreshResult {
+  status: 'ok' | 'partial' | 'error';
+  edge_count: number;
+  method_used: 'get_lineage' | 'object_dependencies' | null;
+  partial_failures: string[];
+  error: string | null;
+}
+
+export interface LineageStatus {
+  available: boolean;
+  reason?: 'no_connection' | 'postgres_unsupported' | null;
+  databases: Array<{
+    database: string;
+    last_refreshed_at: string | null;
+    last_status: string | null;
+    edge_count: number;
+    discovery_method_used: string | null;
+    last_error: string | null;
+  }>;
+  capability: {
+    get_lineage_available: boolean | null;
+    probed_at: string | null;
+    probe_error: string | null;
+  } | null;
+}
+
+export interface WorkflowHighlight {
+  origin: { database: string; schema: string; table: string } | null;
+  nodes: Array<{ database: string; schema: string; table: string; fqn: string }>;
+  unmatched_targets: Array<{ database: string; schema: string; table: string; fqn: string }>;
+}
+
+export const lineageApi = {
+  status: (connection_id?: string | null) =>
+    api.get<LineageStatus>('/lineage/status', { params: { connection_id: connection_id ?? undefined } }),
+  allDatabases: (connection_id?: string | null) =>
+    api.get<LineageGraph>('/lineage/graph', { params: { connection_id: connection_id ?? undefined } }),
+  database: (database: string, connection_id?: string | null) =>
+    api.get<LineageGraph>(`/lineage/graph/${database}`, { params: { connection_id: connection_id ?? undefined } }),
+  schema: (database: string, schema: string, connection_id?: string | null) =>
+    api.get<LineageGraph>(`/lineage/graph/${database}/${schema}`, { params: { connection_id: connection_id ?? undefined } }),
+  table: (database: string, schema: string, table: string, hops = 3, connection_id?: string | null) =>
+    api.get<LineageGraph>(`/lineage/table/${database}/${schema}/${table}`, {
+      params: { hops, connection_id: connection_id ?? undefined },
+    }),
+  refresh: (database: string, connection_id?: string | null) =>
+    api.post<LineageRefreshResult>(`/lineage/refresh/${database}`, null, {
+      params: { connection_id: connection_id ?? undefined },
+    }),
+  indexCatalog: (connection_id?: string | null) =>
+    api.post<{ databases: Array<{ database: string; objects: number; status: string; error?: string }>; total_databases: number }>(
+      '/lineage/index-catalog', null,
+      { params: { connection_id: connection_id ?? undefined } },
+    ),
+  workflowHighlight: (workflow_id: string, connection_id?: string | null) =>
+    api.get<WorkflowHighlight>(`/lineage/workflow-highlight/${workflow_id}`, {
+      params: { connection_id: connection_id ?? undefined },
+    }),
+};
+
 // AI API
 export interface AIRecommendation {
   finding_id: string;
@@ -942,6 +1071,16 @@ export const agentRunsApi = {
     api.post(`/agent/runs/${id}/run-pipeline`),
   verify: (id: string) =>
     api.post(`/agent/runs/${id}/verify`),
-  saveAsWorkflow: (id: string, data: { label: string; description?: string; created_by?: string }) =>
+  saveAsWorkflow: (id: string, data: {
+    label: string;
+    description?: string;
+    created_by?: string;
+    // Optional subset filters — when present, the backend saves only rules
+    // whose definition_id / instance_id is in the list. Used by the
+    // completed-run "Rules used" review panel so the user can uncheck rules
+    // they don't want in the saved template.
+    definition_ids?: string[];
+    instance_ids?: string[];
+  }) =>
     api.post<WorkflowTemplate>(`/agent/runs/${id}/save-as-workflow`, data),
 };

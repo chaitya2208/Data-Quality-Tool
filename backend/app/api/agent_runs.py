@@ -424,8 +424,22 @@ def save_run_as_workflow(run_id: str, request: dict):
             seen_ids.add(inst.id)
             instances.append(inst)
 
+    # Optional user-picked filter — save only the checked rules from the
+    # completed-run review panel. Accepts either definition_ids or
+    # instance_ids; if neither is present, save everything (current behavior).
+    picked_definition_ids = set(request.get("definition_ids") or [])
+    picked_instance_ids = set(request.get("instance_ids") or [])
+    def _keep(inst) -> bool:
+        if picked_instance_ids and inst.id not in picked_instance_ids:
+            return False
+        if picked_definition_ids and inst.definition_id not in picked_definition_ids:
+            return False
+        return True
+
     patterns = []
     for inst in instances:
+        if not _keep(inst):
+            continue
         definition = storage.get_definition(inst.definition_id)
         patterns.append({
             "definition_id":   inst.definition_id,
@@ -441,7 +455,11 @@ def save_run_as_workflow(run_id: str, request: dict):
     if not patterns:
         raise HTTPException(
             status_code=400,
-            detail="No active rules found for this run's table to save as a workflow.",
+            detail=(
+                "No matching rules to save. Uncheck fewer rules, or clear the filter."
+                if (picked_definition_ids or picked_instance_ids)
+                else "No active rules found for this run's table to save as a workflow."
+            ),
         )
 
     w = storage.create_workflow(

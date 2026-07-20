@@ -114,18 +114,18 @@ class ToggleDefinitionRequest(BaseModel):
 
 @router.patch("/definitions/{definition_id}", response_model=RuleDefinitionResponse)
 def toggle_rule_definition(definition_id: str, body: ToggleDefinitionRequest):
-    """Enable/disable a check concept — gates every instance under this
-    definition at execution time (see RuleEngine.get_active_instances),
-    not just this one row. Only active/disabled definitions are toggleable;
-    a proposed definition must be approved via Agent Workflow review first."""
+    """Enable/disable a check concept. This CASCADES to every RULE_INSTANCES
+    row under this definition — flipping their IS_ACTIVE + STATUS in one
+    atomic pass so subsequent scans immediately stop (or start) firing them.
+    Only active/disabled definitions are toggleable; a proposed definition
+    must be approved via Agent Workflow review first."""
     definition = storage.get_definition(definition_id)
     if not definition:
         raise HTTPException(status_code=404, detail="Rule definition not found")
     if definition.status not in ("active", "disabled"):
         raise HTTPException(status_code=400,
                             detail=f"Only active/disabled definitions can be toggled (current: {definition.status})")
-    new_status = "active" if body.is_active else "disabled"
-    storage.update_definition(definition_id, status=new_status)
+    storage.set_definition_active_state(definition_id, body.is_active)
     definition = storage.get_definition(definition_id)
     definition.instance_count = storage.get_real_instance_counts().get(definition_id, 0)
     return definition

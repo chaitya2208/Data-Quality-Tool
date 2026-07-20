@@ -768,12 +768,29 @@ class WorkflowCoordinator:
         except Exception as e:
             logger.warning(f"[Coordinator] AnomalyProposalAgent failed: {e}")
 
-        # Transition to awaiting_fixes immediately — before explanation agent so
-        # the UI banner appears without waiting for Claude explanation calls.
-        run = storage.update_agent_run(self.run_id, status="awaiting_fixes")
+        # Decide the next run status. Three cases:
+        #  1) findings == 0 AND rules_executed > 0 → 'completed'.
+        #     Rules ran clean, nothing to fix — no reason to sit in
+        #     awaiting_fixes waiting for a verify pass. The Save + rules-
+        #     used panel still renders on completed runs.
+        #  2) rules_executed == 0 (no approved rules) → 'awaiting_fixes'.
+        #     The user still has the option of activating rules from the
+        #     Rule Library and hitting Verify to see if they raise anything.
+        #  3) findings > 0 → 'awaiting_fixes' (unchanged).
+        rules_executed = len(approved_instance_ids)
+        findings_count = len(findings)
+        if findings_count == 0 and rules_executed > 0:
+            next_status = "completed"
+            run = storage.update_agent_run(
+                self.run_id, status=next_status, completed_at=datetime.utcnow(),
+            )
+        else:
+            next_status = "awaiting_fixes"
+            run = storage.update_agent_run(self.run_id, status=next_status)
         logger.info(
             f"[Coordinator] Run {self.run_id} — pipeline complete. "
-            f"{run.findings_count} findings, {run.ai_rules_count} AI rules persisted."
+            f"{run.findings_count} findings, {run.ai_rules_count} AI rules persisted. "
+            f"status={next_status} rules_executed={rules_executed}"
         )
 
         # ── Findings Explanation Agent (background) ───────────────────────────
@@ -797,9 +814,13 @@ class WorkflowCoordinator:
                     logger.warning(f"[Coordinator] FindingsExplanationAgent failed (non-fatal): {_exp_err}")
             threading.Thread(target=_run_explanation, daemon=True).start()
 
-        # Start background auto-verification (every 5 min while awaiting fixes)
-        from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
-        schedule_verify(run.id)
+        # Start background auto-verification only if the run is still
+        # awaiting fixes. A run that already auto-completed (findings==0)
+        # has nothing to verify — the scheduler's first fire would just
+        # find status='completed' and no-op, but skipping saves the timer.
+        if next_status == "awaiting_fixes":
+            from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
+            schedule_verify(run.id)
         # Note: batch already advanced when this run reached rule review — do not
         # advance again here, or a table could be skipped.
 

@@ -1104,12 +1104,52 @@ def get_rule_view(instance_id: str) -> Optional[SimpleNamespace]:
 def list_active_instances_for_scope(scope: str) -> list[SimpleNamespace]:
     """Active instances with a given scope ('table' | 'column' | ...), globally
     (DATABASE_NAME='*') or for a specific target — callers filter further by
-    database/schema/table as needed."""
+    database/schema/table as needed.
+
+    Guard: an instance is only returned if BOTH the instance is active AND its
+    parent definition is 'active'. This prevents a stale IS_ACTIVE=TRUE row
+    from firing after the definition was disabled in the Rule Library — the
+    definition toggle also cascades to instances (see
+    set_definition_active_state), but this join is a belt-and-suspenders check
+    so scan paths that read instances directly never execute a disabled rule."""
     rows = sf_session.query(
-        "SELECT * FROM RULE_INSTANCES WHERE IS_ACTIVE = TRUE AND SCOPE = %(scope)s",
+        """
+        SELECT I.*
+        FROM RULE_INSTANCES I
+        JOIN RULE_DEFINITIONS D ON D.ID = I.DEFINITION_ID
+        WHERE I.IS_ACTIVE = TRUE
+          AND I.SCOPE = %(scope)s
+          AND D.STATUS = 'active'
+        """,
         {"scope": scope},
     )
     return [_instance_from_row(r) for r in rows]
+
+
+def set_definition_active_state(definition_id: str, is_active: bool) -> None:
+    """Toggle a rule definition and CASCADE the new state to every child
+    RULE_INSTANCES row. Both columns (IS_ACTIVE + STATUS) are kept in sync on
+    each side so subsequent scans respect the toggle immediately."""
+    new_def_status = "active" if is_active else "disabled"
+    new_inst_status = "active" if is_active else "disabled"
+    # Definition row
+    sf_session.execute(
+        """
+        UPDATE RULE_DEFINITIONS
+        SET STATUS = %(s)s, UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE ID = %(id)s
+        """,
+        {"id": definition_id, "s": new_def_status},
+    )
+    # Cascade to every child instance so the scan-time filter picks it up.
+    sf_session.execute(
+        """
+        UPDATE RULE_INSTANCES
+        SET IS_ACTIVE = %(a)s, STATUS = %(s)s, UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE DEFINITION_ID = %(id)s
+        """,
+        {"id": definition_id, "a": is_active, "s": new_inst_status},
+    )
 
 
 def create_instance(
@@ -3072,3 +3112,498 @@ def decide_maintenance_proposal(
          "by": decided_by or "user",
          "reason": (reason or "")[:2000] if reason else None},
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Health scoring constants — shared between /table-health (per-table) and
+# /lineage (batched, per-schema). Keep in one place so the two aggregations
+# can never drift.
+# ═══════════════════════════════════════════════════════════════════════════
+
+SEVERITY_WEIGHT = {"critical": 5, "high": 3, "medium": 2, "low": 1, "info": 1}
+HISTORY_LIMIT = 20  # last N executions per instance for pass-rate
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LINEAGE — edge cache + refresh state + capability probe cache.
+# Mirrors the RELATIONSHIP_CATALOG pattern (delete-scope + multi-row INSERT
+# SELECT). Populated by app.services.lineage.refresh_database.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _edge_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        connection_id=row["CONNECTION_ID"],
+        source_database=row["SOURCE_DATABASE"],
+        source_schema=row["SOURCE_SCHEMA"],
+        source_table=row["SOURCE_TABLE"],
+        source_fqn=row["SOURCE_FQN"],
+        source_kind=row.get("SOURCE_KIND"),
+        target_database=row["TARGET_DATABASE"],
+        target_schema=row["TARGET_SCHEMA"],
+        target_table=row["TARGET_TABLE"],
+        target_fqn=row["TARGET_FQN"],
+        target_kind=row.get("TARGET_KIND"),
+        edge_type=row.get("EDGE_TYPE"),
+        discovery_source=row.get("DISCOVERY_SOURCE"),
+        evidence=_parse_json(row.get("EVIDENCE")),
+        first_discovered_at=row.get("FIRST_DISCOVERED_AT"),
+        last_seen_at=row.get("LAST_SEEN_AT"),
+    )
+
+
+def list_lineage_edges(
+    connection_id: str,
+    database_name: Optional[str] = None,
+    schema_name: Optional[str] = None,
+    table_name: Optional[str] = None,
+) -> list[SimpleNamespace]:
+    """List edges scoped to a connection. When a table is passed, returns
+    edges where the table is EITHER source or target (single-table drill-down
+    needs both directions). Otherwise applies AND-filtering on the source
+    side only — schema/database filters mean 'edges originating in this
+    scope', which is what the schema/DB-level graphs want."""
+    where = ["CONNECTION_ID = %(cid)s"]
+    params: Dict[str, Any] = {"cid": connection_id}
+
+    if table_name:
+        where.append(
+            "((SOURCE_DATABASE = %(db)s AND SOURCE_SCHEMA = %(sc)s AND SOURCE_TABLE = %(tb)s)"
+            " OR (TARGET_DATABASE = %(db)s AND TARGET_SCHEMA = %(sc)s AND TARGET_TABLE = %(tb)s))"
+        )
+        params["db"] = database_name
+        params["sc"] = schema_name
+        params["tb"] = table_name
+    else:
+        if database_name:
+            where.append("(SOURCE_DATABASE = %(db)s OR TARGET_DATABASE = %(db)s)")
+            params["db"] = database_name
+        if schema_name:
+            where.append("(SOURCE_SCHEMA = %(sc)s OR TARGET_SCHEMA = %(sc)s)")
+            params["sc"] = schema_name
+
+    rows = sf_session.query(
+        f"SELECT * FROM LINEAGE_EDGES WHERE {' AND '.join(where)} ORDER BY SOURCE_FQN, TARGET_FQN",
+        params,
+    )
+    return [_edge_from_row(r) for r in rows]
+
+
+def replace_lineage_edges_for_database(
+    connection_id: str,
+    database_name: str,
+    rows: list[dict],
+) -> int:
+    """Atomic replace: DELETE all edges for (connection, database) on either
+    side, then one multi-row INSERT ... SELECT ... UNION ALL. Mirrors
+    replace_relationships. Each row dict may carry: source_database,
+    source_schema, source_table, source_fqn, source_kind, target_database,
+    target_schema, target_table, target_fqn, target_kind, edge_type,
+    discovery_source, evidence."""
+    sf_session.execute(
+        """
+        DELETE FROM LINEAGE_EDGES
+        WHERE CONNECTION_ID = %(cid)s
+          AND (SOURCE_DATABASE = %(db)s OR TARGET_DATABASE = %(db)s)
+        """,
+        {"cid": connection_id, "db": database_name},
+    )
+    if not rows:
+        return 0
+
+    select_clauses = []
+    params: Dict[str, Any] = {"cid": connection_id}
+    for i, r in enumerate(rows):
+        select_clauses.append(
+            f"SELECT %(id{i})s, %(cid)s, "
+            f"%(sdb{i})s, %(ssc{i})s, %(stb{i})s, %(sfq{i})s, %(sk{i})s, "
+            f"%(tdb{i})s, %(tsc{i})s, %(ttb{i})s, %(tfq{i})s, %(tk{i})s, "
+            f"%(et{i})s, %(ds{i})s, PARSE_JSON(%(ev{i})s), "
+            f"CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()"
+        )
+        params[f"id{i}"]  = _new_id()
+        params[f"sdb{i}"] = r.get("source_database")
+        params[f"ssc{i}"] = r.get("source_schema")
+        params[f"stb{i}"] = r.get("source_table")
+        params[f"sfq{i}"] = r.get("source_fqn")
+        params[f"sk{i}"]  = r.get("source_kind")
+        params[f"tdb{i}"] = r.get("target_database")
+        params[f"tsc{i}"] = r.get("target_schema")
+        params[f"ttb{i}"] = r.get("target_table")
+        params[f"tfq{i}"] = r.get("target_fqn")
+        params[f"tk{i}"]  = r.get("target_kind")
+        params[f"et{i}"]  = r.get("edge_type")
+        params[f"ds{i}"]  = r.get("discovery_source")
+        params[f"ev{i}"]  = _json_or_null(r.get("evidence"))
+
+    sf_session.execute(
+        f"""
+        INSERT INTO LINEAGE_EDGES
+            (ID, CONNECTION_ID,
+             SOURCE_DATABASE, SOURCE_SCHEMA, SOURCE_TABLE, SOURCE_FQN, SOURCE_KIND,
+             TARGET_DATABASE, TARGET_SCHEMA, TARGET_TABLE, TARGET_FQN, TARGET_KIND,
+             EDGE_TYPE, DISCOVERY_SOURCE, EVIDENCE,
+             FIRST_DISCOVERED_AT, LAST_SEEN_AT)
+        {' UNION ALL '.join(select_clauses)}
+        """,
+        params,
+    )
+    return len(rows)
+
+
+# ── Refresh state ─────────────────────────────────────────────────────────
+
+def _refresh_state_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        connection_id=row["CONNECTION_ID"],
+        database_name=row["DATABASE_NAME"],
+        last_refreshed_at=row.get("LAST_REFRESHED_AT"),
+        last_status=row.get("LAST_STATUS"),
+        last_error=row.get("LAST_ERROR"),
+        edge_count=row.get("EDGE_COUNT") or 0,
+        discovery_method_used=row.get("DISCOVERY_METHOD_USED"),
+        partial_failures=_parse_json(row.get("PARTIAL_FAILURES")) or [],
+    )
+
+
+def get_refresh_state(connection_id: str, database_name: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query(
+        """
+        SELECT * FROM LINEAGE_REFRESH_STATE
+        WHERE CONNECTION_ID = %(cid)s AND DATABASE_NAME = %(db)s
+        """,
+        {"cid": connection_id, "db": database_name},
+    )
+    return _refresh_state_from_row(rows[0]) if rows else None
+
+
+def list_refresh_states(connection_id: str) -> list[SimpleNamespace]:
+    rows = sf_session.query(
+        """
+        SELECT * FROM LINEAGE_REFRESH_STATE
+        WHERE CONNECTION_ID = %(cid)s
+        ORDER BY LAST_REFRESHED_AT DESC NULLS LAST
+        """,
+        {"cid": connection_id},
+    )
+    return [_refresh_state_from_row(r) for r in rows]
+
+
+def upsert_refresh_state(
+    connection_id: str,
+    database_name: str,
+    status: str,
+    edge_count: int,
+    method_used: Optional[str],
+    error: Optional[str] = None,
+    partial_failures: Optional[list] = None,
+) -> None:
+    """MERGE by (connection_id, database_name). Snowflake accepts MERGE with
+    PARSE_JSON in the SELECT sub-query the same way our INSERT ... SELECT
+    pattern does."""
+    sf_session.execute(
+        """
+        MERGE INTO LINEAGE_REFRESH_STATE t USING (
+            SELECT %(cid)s AS CONNECTION_ID, %(db)s AS DATABASE_NAME,
+                   %(status)s AS LAST_STATUS, %(ec)s AS EDGE_COUNT,
+                   %(m)s AS DISCOVERY_METHOD_USED, %(err)s AS LAST_ERROR,
+                   PARSE_JSON(%(pf)s) AS PARTIAL_FAILURES
+        ) s
+        ON t.CONNECTION_ID = s.CONNECTION_ID AND t.DATABASE_NAME = s.DATABASE_NAME
+        WHEN MATCHED THEN UPDATE SET
+            LAST_REFRESHED_AT = CURRENT_TIMESTAMP(),
+            LAST_STATUS = s.LAST_STATUS,
+            EDGE_COUNT = s.EDGE_COUNT,
+            DISCOVERY_METHOD_USED = s.DISCOVERY_METHOD_USED,
+            LAST_ERROR = s.LAST_ERROR,
+            PARTIAL_FAILURES = s.PARTIAL_FAILURES
+        WHEN NOT MATCHED THEN INSERT
+            (CONNECTION_ID, DATABASE_NAME, LAST_REFRESHED_AT, LAST_STATUS,
+             EDGE_COUNT, DISCOVERY_METHOD_USED, LAST_ERROR, PARTIAL_FAILURES)
+            VALUES
+            (s.CONNECTION_ID, s.DATABASE_NAME, CURRENT_TIMESTAMP(), s.LAST_STATUS,
+             s.EDGE_COUNT, s.DISCOVERY_METHOD_USED, s.LAST_ERROR, s.PARTIAL_FAILURES)
+        """,
+        {
+            "cid": connection_id, "db": database_name,
+            "status": status, "ec": edge_count, "m": method_used,
+            "err": (error or "")[:2000] if error else None,
+            "pf": _json_or_null(partial_failures or []),
+        },
+    )
+
+
+# ── Capability cache (GET_LINEAGE availability probe) ─────────────────────
+
+def _capability_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        connection_id=row["CONNECTION_ID"],
+        get_lineage_available=row.get("GET_LINEAGE_AVAILABLE"),
+        probed_at=row.get("PROBED_AT"),
+        probe_error=row.get("PROBE_ERROR"),
+    )
+
+
+def get_lineage_capability(connection_id: str) -> Optional[SimpleNamespace]:
+    rows = sf_session.query(
+        "SELECT * FROM LINEAGE_CAPABILITY_CACHE WHERE CONNECTION_ID = %(cid)s",
+        {"cid": connection_id},
+    )
+    return _capability_from_row(rows[0]) if rows else None
+
+
+def set_lineage_capability(
+    connection_id: str, available: bool, error: Optional[str] = None,
+) -> None:
+    sf_session.execute(
+        """
+        MERGE INTO LINEAGE_CAPABILITY_CACHE t USING (
+            SELECT %(cid)s AS CONNECTION_ID, %(av)s AS GET_LINEAGE_AVAILABLE,
+                   %(err)s AS PROBE_ERROR
+        ) s
+        ON t.CONNECTION_ID = s.CONNECTION_ID
+        WHEN MATCHED THEN UPDATE SET
+            GET_LINEAGE_AVAILABLE = s.GET_LINEAGE_AVAILABLE,
+            PROBED_AT = CURRENT_TIMESTAMP(),
+            PROBE_ERROR = s.PROBE_ERROR
+        WHEN NOT MATCHED THEN INSERT
+            (CONNECTION_ID, GET_LINEAGE_AVAILABLE, PROBED_AT, PROBE_ERROR)
+            VALUES (s.CONNECTION_ID, s.GET_LINEAGE_AVAILABLE, CURRENT_TIMESTAMP(), s.PROBE_ERROR)
+        """,
+        {"cid": connection_id, "av": bool(available),
+         "err": (error or "")[:2000] if error else None},
+    )
+
+
+# ── Batched overlay counts (used by /lineage/graph/{db}/{schema}) ─────────
+
+def count_open_findings_by_asset(asset_ids: list[str]) -> Dict[str, int]:
+    """One aggregate query returning {asset_id: open_finding_count} for a set
+    of asset ids. Powers the red-circle badge on lineage table nodes without
+    N per-node round-trips."""
+    if not asset_ids:
+        return {}
+    in_open = ", ".join(f"'{s}'" for s in _LIFECYCLE_OPEN)
+    placeholders = ", ".join(f"%(a{n})s" for n in range(len(asset_ids)))
+    params = {f"a{n}": aid for n, aid in enumerate(asset_ids)}
+    rows = sf_session.query(
+        f"""
+        SELECT ASSET_ID, COUNT(*) AS CT
+        FROM FINDINGS
+        WHERE ASSET_ID IN ({placeholders}) AND STATUS IN ({in_open})
+        GROUP BY ASSET_ID
+        """,
+        params,
+    )
+    return {r["ASSET_ID"]: int(r["CT"] or 0) for r in rows}
+
+
+def count_rules_run_by_table(
+    database_name: str, schema_name: Optional[str] = None,
+) -> Dict[tuple, int]:
+    """{(db, schema, table): rule_execution_count} across the given scope.
+    Joins RULE_EXECUTIONS × RULE_INSTANCES (only active instances) so counts
+    reflect rules currently in effect."""
+    where = ["I.DATABASE_NAME = %(db)s", "I.IS_ACTIVE = TRUE"]
+    params: Dict[str, Any] = {"db": database_name}
+    if schema_name:
+        where.append("I.SCHEMA_NAME = %(sc)s")
+        params["sc"] = schema_name
+    rows = sf_session.query(
+        f"""
+        SELECT I.DATABASE_NAME AS DB, I.SCHEMA_NAME AS SC, I.TABLE_NAME AS TB,
+               COUNT(E.ID) AS CT
+        FROM RULE_EXECUTIONS E
+        JOIN RULE_INSTANCES I ON I.ID = E.INSTANCE_ID
+        WHERE {' AND '.join(where)}
+        GROUP BY I.DATABASE_NAME, I.SCHEMA_NAME, I.TABLE_NAME
+        """,
+        params,
+    )
+    return {(r["DB"], r["SC"], r["TB"]): int(r["CT"] or 0) for r in rows}
+
+
+def batch_health_scores(
+    database_name: str, schema_name: Optional[str] = None,
+) -> Dict[tuple, Optional[float]]:
+    """Severity-weighted pass-rate per (db, schema, table) computed in one
+    Snowflake round-trip. Formula matches api/table_health.py::get_table_health
+    exactly (see SEVERITY_WEIGHT + HISTORY_LIMIT above): for each active
+    instance, take pass_rate over the last HISTORY_LIMIT executions, then
+    weight by severity and average across the table's instances.
+
+    Returns {(db, sc, tb): score in [0.0, 1.0]}. Tables with no runs are
+    absent from the returned dict (frontend treats absent as null/grey)."""
+    where = ["I.DATABASE_NAME = %(db)s", "I.IS_ACTIVE = TRUE"]
+    params: Dict[str, Any] = {"db": database_name, "hist": HISTORY_LIMIT}
+    if schema_name:
+        where.append("I.SCHEMA_NAME = %(sc)s")
+        params["sc"] = schema_name
+
+    # Per-instance pass-rate over last HISTORY_LIMIT executions, then average
+    # weighted by SEVERITY_WEIGHT for the containing table. All in one query.
+    weight_case = " ".join(
+        f"WHEN '{sev}' THEN {w}" for sev, w in SEVERITY_WEIGHT.items()
+    )
+    rows = sf_session.query(
+        f"""
+        WITH RECENT AS (
+            SELECT E.INSTANCE_ID, E.STATUS,
+                   ROW_NUMBER() OVER (PARTITION BY E.INSTANCE_ID ORDER BY E.EXECUTED_AT DESC) AS RN
+            FROM RULE_EXECUTIONS E
+            JOIN RULE_INSTANCES I ON I.ID = E.INSTANCE_ID
+            WHERE {' AND '.join(where)}
+        ),
+        PER_INSTANCE AS (
+            SELECT R.INSTANCE_ID,
+                   SUM(CASE WHEN R.STATUS = 'passed' THEN 1 ELSE 0 END) AS P,
+                   SUM(CASE WHEN R.STATUS IN ('passed','failed','error') THEN 1 ELSE 0 END) AS T
+            FROM RECENT R
+            WHERE R.RN <= %(hist)s
+            GROUP BY R.INSTANCE_ID
+        )
+        SELECT I.DATABASE_NAME AS DB, I.SCHEMA_NAME AS SC, I.TABLE_NAME AS TB,
+               SUM(
+                 (CASE LOWER(COALESCE(I.SEVERITY,'medium')) {weight_case} ELSE 2 END)
+                 * (P.P * 1.0 / P.T)
+               ) AS WEIGHTED_PASS,
+               SUM(
+                 CASE LOWER(COALESCE(I.SEVERITY,'medium')) {weight_case} ELSE 2 END
+               ) AS TOTAL_WEIGHT
+        FROM PER_INSTANCE P
+        JOIN RULE_INSTANCES I ON I.ID = P.INSTANCE_ID
+        WHERE P.T > 0
+        GROUP BY I.DATABASE_NAME, I.SCHEMA_NAME, I.TABLE_NAME
+        """,
+        params,
+    )
+    out: Dict[tuple, Optional[float]] = {}
+    for r in rows:
+        tw = r.get("TOTAL_WEIGHT")
+        wp = r.get("WEIGHTED_PASS")
+        if tw and float(tw) > 0:
+            out[(r["DB"], r["SC"], r["TB"])] = float(wp) / float(tw)
+    return out
+
+
+def list_databases_for_connection(connection_id: str) -> list[str]:
+    """Distinct database names present in ASSETS (tables) — regardless of
+    whether they've been lineage-refreshed yet. Feeds the all-databases
+    graph's node list so unlinked DBs still appear."""
+    rows = sf_session.query(
+        """
+        SELECT DISTINCT DATABASE_NAME
+        FROM ASSETS
+        WHERE ASSET_TYPE = 'table' AND DATABASE_NAME IS NOT NULL
+        ORDER BY DATABASE_NAME
+        """,
+    )
+    return [r["DATABASE_NAME"] for r in rows]
+
+
+# ── LINEAGE_CATALOG — full Snowflake object catalog (not just scanned rows) ─
+
+def _catalog_from_row(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row["ID"],
+        connection_id=row["CONNECTION_ID"],
+        database_name=row["DATABASE_NAME"],
+        schema_name=row.get("SCHEMA_NAME"),
+        table_name=row.get("TABLE_NAME"),
+        object_kind=row["OBJECT_KIND"],
+        fqn=row.get("FQN"),
+        row_count=row.get("ROW_COUNT"),
+        size_bytes=row.get("SIZE_BYTES"),
+        comment=row.get("COMMENT"),
+        indexed_at=row.get("INDEXED_AT"),
+    )
+
+
+def list_catalog(
+    connection_id: str,
+    database_name: Optional[str] = None,
+    schema_name: Optional[str] = None,
+    kinds: Optional[list[str]] = None,
+) -> list[SimpleNamespace]:
+    where = ["CONNECTION_ID = %(cid)s"]
+    params: Dict[str, Any] = {"cid": connection_id}
+    if database_name:
+        where.append("DATABASE_NAME = %(db)s")
+        params["db"] = database_name
+    if schema_name:
+        where.append("SCHEMA_NAME = %(sc)s")
+        params["sc"] = schema_name
+    if kinds:
+        ks = ", ".join(f"'{k}'" for k in kinds)
+        where.append(f"OBJECT_KIND IN ({ks})")
+    rows = sf_session.query(
+        f"""
+        SELECT * FROM LINEAGE_CATALOG
+        WHERE {' AND '.join(where)}
+        ORDER BY DATABASE_NAME, SCHEMA_NAME NULLS FIRST, TABLE_NAME NULLS FIRST
+        """,
+        params,
+    )
+    return [_catalog_from_row(r) for r in rows]
+
+
+def replace_catalog_for_database(
+    connection_id: str,
+    database_name: str,
+    rows: list[dict],
+) -> int:
+    """Atomic replace of catalog rows for one (connection, database). Row
+    dicts carry: object_kind, database_name, schema_name, table_name, fqn,
+    row_count, size_bytes, comment."""
+    sf_session.execute(
+        """
+        DELETE FROM LINEAGE_CATALOG
+        WHERE CONNECTION_ID = %(cid)s AND DATABASE_NAME = %(db)s
+        """,
+        {"cid": connection_id, "db": database_name},
+    )
+    if not rows:
+        return 0
+
+    select_clauses = []
+    params: Dict[str, Any] = {"cid": connection_id}
+    for i, r in enumerate(rows):
+        select_clauses.append(
+            f"SELECT %(id{i})s, %(cid)s, %(db{i})s, %(sc{i})s, %(tb{i})s, "
+            f"%(k{i})s, %(fq{i})s, %(rc{i})s, %(sb{i})s, %(cm{i})s, CURRENT_TIMESTAMP()"
+        )
+        params[f"id{i}"] = _new_id()
+        params[f"db{i}"] = r.get("database_name")
+        params[f"sc{i}"] = r.get("schema_name")
+        params[f"tb{i}"] = r.get("table_name")
+        params[f"k{i}"]  = r.get("object_kind")
+        params[f"fq{i}"] = r.get("fqn")
+        params[f"rc{i}"] = r.get("row_count")
+        params[f"sb{i}"] = r.get("size_bytes")
+        params[f"cm{i}"] = (r.get("comment") or "")[:2000] if r.get("comment") else None
+
+    sf_session.execute(
+        f"""
+        INSERT INTO LINEAGE_CATALOG
+            (ID, CONNECTION_ID, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME,
+             OBJECT_KIND, FQN, ROW_COUNT, SIZE_BYTES, COMMENT, INDEXED_AT)
+        {' UNION ALL '.join(select_clauses)}
+        """,
+        params,
+    )
+    return len(rows)
+
+
+def indexed_databases(connection_id: str) -> list[str]:
+    """Distinct DATABASE_NAME rows present in LINEAGE_CATALOG for this
+    connection — i.e. databases the user has clicked 'Index catalog' for."""
+    rows = sf_session.query(
+        """
+        SELECT DISTINCT DATABASE_NAME FROM LINEAGE_CATALOG
+        WHERE CONNECTION_ID = %(cid)s
+        ORDER BY DATABASE_NAME
+        """,
+        {"cid": connection_id},
+    )
+    return [r["DATABASE_NAME"] for r in rows]
+

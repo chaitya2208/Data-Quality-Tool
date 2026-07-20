@@ -52,7 +52,19 @@ function Combobox({
         <input
           value={query}
           onChange={e => { setQuery(e.target.value); onChange(e.target.value); setOpen(true) }}
-          onFocus={() => setOpen(true)}
+          onFocus={() => {
+            // Clear the filter on focus so the full options list is shown.
+            // Otherwise `query` stays equal to the last selected value and the
+            // dropdown filters down to just that one entry — feels like the
+            // dropdown "disappeared" the moment you picked something.
+            setQuery('')
+            setOpen(true)
+          }}
+          onBlur={() => {
+            // If the user tabs away without picking a new option, restore the
+            // input text to the selected value so the field doesn't look empty.
+            setQuery(value)
+          }}
           disabled={disabled}
           placeholder={loading ? 'Loading…' : error ? 'Failed to load' : placeholder}
           className={`w-full text-sm border rounded-lg pl-8 pr-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100 disabled:opacity-50 disabled:cursor-not-allowed ${

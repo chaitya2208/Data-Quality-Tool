@@ -375,6 +375,12 @@ export default function AgentWorkflow() {
   const [saveWfOpen,    setSaveWfOpen]    = useState(false)
   const [saveWfLabel,   setSaveWfLabel]   = useState('')
   const [saveWfDesc,    setSaveWfDesc]    = useState('')
+  // Which rule instances are selected for the saved-workflow template.
+  // Map keyed by instance_id → checked. Populated from findings_output when
+  // the run reports its rules_used/rules_unused; all default to checked so
+  // the user can just uncheck the ones they don't want to keep.
+  const [ruleSelection, setRuleSelection] = useState<Record<string, boolean>>({})
+  const [ruleSelInitRunId, setRuleSelInitRunId] = useState<string | null>(null)
 
   const { data: databases } = useQuery({
     queryKey: ['databases', connId],
@@ -501,12 +507,18 @@ export default function AgentWorkflow() {
     // every run type (AI pipeline, saved-workflow template, scheduled) — it does
     // not depend on instance_review_state, which only exists for runs that
     // paused for review. Origin (scope/db/schema/table) is captured server-side.
-    mutationFn: () =>
-      agentRunsApi.saveAsWorkflow(activeRunId!, {
+    //
+    // If the user unchecked any rule in the review panel, pass only the
+    // checked instance_ids so the saved template contains just that subset.
+    mutationFn: () => {
+      const kept = anyRuleUnchecked ? selectedInstanceIds : undefined
+      return agentRunsApi.saveAsWorkflow(activeRunId!, {
         label: saveWfLabel.trim(),
         description: saveWfDesc.trim(),
         created_by: '',
-      }),
+        ...(kept ? { instance_ids: kept } : {}),
+      })
+    },
     onSuccess: () => {
       setSaveWfOpen(false)
       setSaveWfLabel('')
@@ -654,6 +666,33 @@ export default function AgentWorkflow() {
   })()
 
   const findingsOutput = getTask('findings_agent')?.output
+
+  // Initialize rule-selection map when the findings step first reports its
+  // used/unused lists (once per run). Every executed instance defaults to
+  // checked so save-all-rules is the default; user opts out individual rules.
+  useEffect(() => {
+    if (!activeRunId || !findingsOutput) return
+    if (ruleSelInitRunId === activeRunId) return
+    const used = Array.isArray(findingsOutput.rules_used) ? findingsOutput.rules_used : []
+    const unused = Array.isArray(findingsOutput.rules_unused) ? findingsOutput.rules_unused : []
+    const init: Record<string, boolean> = {}
+    for (const r of [...used, ...unused]) {
+      if (r?.instance_id) init[r.instance_id] = true
+    }
+    setRuleSelection(init)
+    setRuleSelInitRunId(activeRunId)
+  }, [activeRunId, findingsOutput, ruleSelInitRunId])
+
+  // Convenience: list of instance_ids the user has kept checked, and a flag
+  // for whether any were unchecked (so the Save button can show a subtle
+  // "N of M" indicator).
+  const executedInstanceIds: string[] = useMemo(() => {
+    const used = Array.isArray(findingsOutput?.rules_used) ? findingsOutput.rules_used : []
+    const unused = Array.isArray(findingsOutput?.rules_unused) ? findingsOutput.rules_unused : []
+    return [...used, ...unused].map((r: any) => r?.instance_id).filter(Boolean)
+  }, [findingsOutput])
+  const selectedInstanceIds = executedInstanceIds.filter(id => ruleSelection[id])
+  const anyRuleUnchecked = selectedInstanceIds.length !== executedInstanceIds.length
 
   return (
     <div className="space-y-6">
@@ -1475,13 +1514,6 @@ export default function AgentWorkflow() {
                   : <><RefreshCw className="w-4 h-4" />Verify Fixes</>
                 }
               </button>
-              <button
-                onClick={() => setSaveWfOpen(true)}
-                className="flex items-center gap-1.5 px-4 py-2 border border-gray-300 text-gray-700 dark:text-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 rounded-lg text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
-              >
-                <BookmarkPlus className="w-4 h-4" />
-                Save as Workflow
-              </button>
             </div>
           </div>
         </div>
@@ -1492,17 +1524,42 @@ export default function AgentWorkflow() {
       {findingsOutput && getTask('findings_agent')?.status === 'completed' &&
        Array.isArray(findingsOutput.rules_used) && (
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
-          <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700">
-            <div className="flex items-center gap-2">
-              <AlertCircle className="w-5 h-5 text-primary-600" />
-              <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Findings Report</h2>
+          <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 flex items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <AlertCircle className="w-5 h-5 text-primary-600" />
+                <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">Findings Report</h2>
+              </div>
+              <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">
+                {findingsOutput.rules_executed} instances executed ·{' '}
+                <span className="text-orange-700 dark:text-orange-300 font-medium">{findingsOutput.rules_used_count} violated</span> ·{' '}
+                <span className="text-green-700 dark:text-green-400 font-medium">{findingsOutput.rules_unused_count} clean</span>
+                {findingsOutput.findings_count != null && <> · {findingsOutput.findings_count} findings</>}
+              </p>
+              {executedInstanceIds.length > 0 && (
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  Tick the rules you want to keep in the saved workflow template.
+                  {anyRuleUnchecked && (
+                    <span className="ml-1 text-primary-600 dark:text-primary-300 font-medium">
+                      {selectedInstanceIds.length} of {executedInstanceIds.length} selected
+                    </span>
+                  )}
+                </p>
+              )}
             </div>
-            <p className="text-xs text-gray-500 dark:text-gray-300 mt-0.5">
-              {findingsOutput.rules_executed} instances executed ·{' '}
-              <span className="text-orange-700 dark:text-orange-300 font-medium">{findingsOutput.rules_used_count} violated</span> ·{' '}
-              <span className="text-green-700 dark:text-green-400 font-medium">{findingsOutput.rules_unused_count} clean</span>
-              {findingsOutput.findings_count != null && <> · {findingsOutput.findings_count} findings</>}
-            </p>
+            {/* Save as Workflow — always shown once findings are done, so
+                completed runs (Bug 3 auto-complete case) also get the button. */}
+            {activeRun?.scan_id && executedInstanceIds.length > 0 && (
+              <button
+                onClick={() => setSaveWfOpen(true)}
+                disabled={selectedInstanceIds.length === 0}
+                className="flex items-center gap-1.5 px-3 py-2 border border-primary-300 text-primary-700 dark:text-primary-200 dark:border-primary-500/40 bg-primary-50 dark:bg-primary-900/30 rounded-lg text-sm font-medium hover:bg-primary-100 dark:hover:bg-primary-900/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+              >
+                <BookmarkPlus className="w-4 h-4" />
+                Save as Workflow
+                {anyRuleUnchecked && <span className="ml-0.5 text-xs opacity-80">({selectedInstanceIds.length})</span>}
+              </button>
+            )}
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100 dark:divide-gray-700">
@@ -1522,25 +1579,46 @@ export default function AgentWorkflow() {
                     grouped[r.name].instances.push(r)
                     grouped[r.name].total += r.findings ?? 0
                   }
-                  return Object.entries(grouped).map(([name, g]) => (
-                    <div key={name} className="flex items-start justify-between gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
-                      <div className="min-w-0">
-                        <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 truncate">{name}</p>
-                        {g.instances.length > 1 && (
-                          <p className="text-xs text-gray-500 dark:text-gray-400">{g.instances.length} instances</p>
+                  return Object.entries(grouped).map(([name, g]) => {
+                    const ids = g.instances.map(r => r.instance_id).filter(Boolean)
+                    const allChecked = ids.length > 0 && ids.every(id => ruleSelection[id])
+                    const someChecked = ids.some(id => ruleSelection[id])
+                    const toggle = () => {
+                      const next = !allChecked
+                      setRuleSelection(prev => {
+                        const out = { ...prev }
+                        for (const id of ids) out[id] = next
+                        return out
+                      })
+                    }
+                    return (
+                      <div key={name} className="flex items-start gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
+                        <input
+                          type="checkbox"
+                          checked={allChecked}
+                          ref={el => { if (el) el.indeterminate = !allChecked && someChecked }}
+                          onChange={toggle}
+                          className="mt-0.5 accent-primary-600 flex-shrink-0 cursor-pointer"
+                          title="Include in saved workflow"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 truncate">{name}</p>
+                          {g.instances.length > 1 && (
+                            <p className="text-xs text-gray-500 dark:text-gray-400">{g.instances.length} instances</p>
+                          )}
+                        </div>
+                        {activeRun?.scan_id && (
+                          <button
+                            onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}${g.instances.length === 1 ? `&instance=${g.instances[0].instance_id}` : ''}`)}
+                            className="flex-shrink-0 text-xs px-1.5 py-1 text-orange-700 dark:text-orange-300 border border-orange-300 dark:border-orange-500/40 rounded hover:bg-orange-100 dark:hover:bg-orange-500/20 font-medium"
+                            title="View these findings"
+                          >
+                            {g.total} finding{g.total !== 1 ? 's' : ''}
+                          </button>
                         )}
                       </div>
-                      {activeRun?.scan_id && (
-                        <button
-                          onClick={() => navigate(`/findings?scan_id=${activeRun.scan_id}${g.instances.length === 1 ? `&instance=${g.instances[0].instance_id}` : ''}`)}
-                          className="flex-shrink-0 text-xs px-1.5 py-1 text-orange-700 dark:text-orange-300 border border-orange-300 dark:border-orange-500/40 rounded hover:bg-orange-100 dark:hover:bg-orange-500/20 font-medium"
-                          title="View these findings"
-                        >
-                          {g.total} finding{g.total !== 1 ? 's' : ''}
-                        </button>
-                      )}
-                    </div>
-                  ))
+                    )
+                  })
                 })()}
                 {findingsOutput.rules_used_count === 0 && (
                   <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No rules fired — the data is clean.</p>
@@ -1556,19 +1634,41 @@ export default function AgentWorkflow() {
               </h3>
               <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
                 {(() => {
-                  const grouped: Record<string, { count: number }> = {}
+                  const grouped: Record<string, { ids: string[] }> = {}
                   for (const r of (findingsOutput.rules_unused || [])) {
-                    if (!grouped[r.name]) grouped[r.name] = { count: 0 }
-                    grouped[r.name].count += 1
+                    if (!grouped[r.name]) grouped[r.name] = { ids: [] }
+                    if (r.instance_id) grouped[r.name].ids.push(r.instance_id)
                   }
-                  return Object.entries(grouped).map(([name, g]) => (
-                    <div key={name} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm">
-                      <p className="text-xs font-semibold text-gray-500 dark:text-gray-300 truncate">{name}</p>
-                      {g.count > 1 && (
-                        <p className="text-xs text-gray-400 dark:text-gray-500">{g.count} instances</p>
-                      )}
-                    </div>
-                  ))
+                  return Object.entries(grouped).map(([name, g]) => {
+                    const allChecked = g.ids.length > 0 && g.ids.every(id => ruleSelection[id])
+                    const someChecked = g.ids.some(id => ruleSelection[id])
+                    const toggle = () => {
+                      const next = !allChecked
+                      setRuleSelection(prev => {
+                        const out = { ...prev }
+                        for (const id of g.ids) out[id] = next
+                        return out
+                      })
+                    }
+                    return (
+                      <div key={name} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-2.5 text-sm flex items-start gap-2">
+                        <input
+                          type="checkbox"
+                          checked={allChecked}
+                          ref={el => { if (el) el.indeterminate = !allChecked && someChecked }}
+                          onChange={toggle}
+                          className="mt-0.5 accent-primary-600 flex-shrink-0 cursor-pointer"
+                          title="Include in saved workflow"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-semibold text-gray-500 dark:text-gray-300 truncate">{name}</p>
+                          {g.ids.length > 1 && (
+                            <p className="text-xs text-gray-400 dark:text-gray-500">{g.ids.length} instances</p>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })
                 })()}
                 {findingsOutput.rules_unused_count === 0 && (
                   <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">Every executed rule found at least one issue.</p>
@@ -1595,6 +1695,14 @@ export default function AgentWorkflow() {
               Saves the active rules applied on this run's table as a reusable workflow.
               You can run it on any table or schema later.
             </p>
+            {executedInstanceIds.length > 0 && (
+              <div className="mb-4 rounded-lg bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800/40 p-2 text-xs text-primary-800 dark:text-primary-200">
+                {anyRuleUnchecked
+                  ? <>Only the <strong>{selectedInstanceIds.length}</strong> checked rule{selectedInstanceIds.length === 1 ? '' : 's'} (out of {executedInstanceIds.length}) will be saved.</>
+                  : <>All <strong>{executedInstanceIds.length}</strong> rule{executedInstanceIds.length === 1 ? '' : 's'} that ran will be saved.</>
+                }
+              </div>
+            )}
             <div className="space-y-3">
               <div>
                 <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">

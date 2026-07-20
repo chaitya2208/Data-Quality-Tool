@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock, Bell } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock, Bell, Waypoints } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
@@ -13,6 +13,7 @@ import SavedWorkflows from './pages/SavedWorkflows'
 import Schedules from './pages/Schedules'
 import RunHistory from './pages/RunHistory'
 import Notifications from './pages/Notifications'
+import Lineage from './pages/Lineage'
 import { useConnection } from './ConnectionContext'
 import { notificationsApi } from './api/client'
 
@@ -72,6 +73,7 @@ function App() {
   const navigation = [
     { name: 'Dashboard',       href: '/',                icon: Home         },
     { name: 'Data Explorer',   href: '/explorer',        icon: Compass      },
+    { name: 'Lineage',         href: '/lineage',         icon: Waypoints    },
     { name: 'Rule Library',    href: '/rule-library',    icon: Library      },
     { name: 'Findings',        href: '/findings',        icon: AlertCircle  },
     { name: 'Workflow',        href: '/workflow',        icon: GitBranch    },
@@ -208,6 +210,7 @@ function App() {
             <Route path="/schedules"       element={<Schedules />}     />
             <Route path="/settings"        element={<SettingsPage />}  />
             <Route path="/notifications"   element={<Notifications />} />
+            <Route path="/lineage"         element={<Lineage />}       />
           </Routes>
         </main>
       </div>
