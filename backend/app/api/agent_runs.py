@@ -145,9 +145,29 @@ def get_batch(batch_id: str):
 
 
 @router.get("/runs", response_model=AgentRunListResponse)
-def list_runs(limit: int = 20):
-    runs = storage.list_agent_runs(limit=limit)
-    return AgentRunListResponse(total=len(runs), runs=[_build_run_response(r) for r in runs])
+def list_runs(
+    page: int = 1,
+    page_size: int = 20,
+    status: Optional[str] = None,
+    origin: Optional[str] = None,
+    database: Optional[str] = None,
+    schema_name: Optional[str] = None,
+    table: Optional[str] = None,
+    search: Optional[str] = None,
+    connection_id: Optional[str] = None,
+):
+    offset = (page - 1) * page_size
+    filters = dict(status=status, origin=origin, database=database, schema_name=schema_name,
+                   table=table, search=search, connection_id=connection_id)
+    runs = storage.list_agent_runs(limit=page_size, offset=offset, **filters)
+    total = storage.count_agent_runs(**filters)
+    return AgentRunListResponse(total=total, page=page, page_size=page_size, runs=[_build_run_response(r) for r in runs])
+
+
+@router.get("/runs/filter-options")
+def get_run_filter_options():
+    """Distinct databases, schemas, and tables present in run history — for cascading dropdowns."""
+    return storage.list_agent_run_filter_options()
 
 
 @router.get("/runs/{run_id}", response_model=AgentRunResponse)
@@ -241,6 +261,160 @@ def bulk_reject_instances(run_id: str, request: BulkInstanceActionRequest):
     return _build_run_response(run)
 
 
+@router.post("/runs/{run_id}/review-rules/activate-library", response_model=AgentRunResponse)
+def activate_library_definition(run_id: str, request: dict):
+    """
+    Manually activate a library definition on the run's table from the review
+    panel. Creates a PENDING instance (approval happens on Run Pipeline like
+    every other new_instance in the active list) and appends it to
+    instance_review_state.active + removes it from unused_library.
+
+    Request body:
+        definition_id:    required.
+        target_config:    optional dict — column, columns, or cross-table refs.
+        threshold_config: optional dict — thresholds for sql_template shapes.
+        severity:         optional — falls back to definition.default_severity.
+    """
+    run = storage.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if run.status != "awaiting_rule_review":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is in '{run.status}' state, expected 'awaiting_rule_review'",
+        )
+
+    definition_id = (request.get("definition_id") or "").strip()
+    if not definition_id:
+        raise HTTPException(status_code=400, detail="definition_id is required")
+    definition = storage.get_definition(definition_id)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Definition not found")
+
+    target_config = request.get("target_config") or {}
+    threshold_config = request.get("threshold_config") or {}
+    severity = (request.get("severity") or definition.default_severity or "medium")
+
+    # Scope inference — prefer the template shape's own scope (it's the
+    # ground truth for how render_template dispatches), fall back to
+    # target_config shape when the definition has no template shape.
+    from app.services.rule_sql_templates import TEMPLATE_SHAPES
+    shape_spec = TEMPLATE_SHAPES.get(definition.template_shape) if definition.template_shape else None
+    if shape_spec:
+        scope = shape_spec["scope"]
+    elif "columns" in target_config:
+        scope = "multi_column"
+    elif "column" in target_config:
+        scope = "column"
+    elif definition.allowed_scopes:
+        scope = definition.allowed_scopes[0]
+    else:
+        scope = "table"
+
+    rule_sql: Optional[str] = None
+    if definition.check_kind == "sql_template" and definition.template_shape:
+        from app.services.rule_sql_templates import render_template
+        from app.services.sql_validation import validate_sql
+        try:
+            rule_sql = render_template(
+                definition.template_shape,
+                run.database, run.schema_name, run.table,
+                target_config, threshold_config,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to render SQL: {e}")
+
+        # Cross-table shapes reference a second FQN — the SQL validator's
+        # allowed_tables list must include both, or validation will
+        # (correctly) fail on an unknown-table reference.
+        allowed_tables = [
+            f"{run.database}.{run.schema_name}.{run.table}".upper()
+        ]
+        if scope == "cross_table" and target_config.get("ref_database"):
+            allowed_tables.append(
+                f"{target_config['ref_database']}."
+                f"{target_config.get('ref_schema','')}."
+                f"{target_config.get('ref_table','')}".upper()
+            )
+        result = validate_sql(rule_sql, allowed_tables=allowed_tables)
+        if not result.is_valid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Rendered SQL failed validation: {result.errors}",
+            )
+
+    from app.services.fingerprint import compute_fingerprint
+    fingerprint = compute_fingerprint(
+        definition_id=definition_id,
+        scope=scope,
+        database_name=run.database,
+        schema_name=run.schema_name,
+        table_name=run.table,
+        target_config=target_config,
+        threshold_config=threshold_config,
+    )
+
+    existing = storage.get_instance_by_fingerprint(fingerprint)
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This check with the same target already exists as an instance "
+                f"(status={existing.status}). Adjust target/threshold or activate "
+                f"it from the Rule Library."
+            ),
+        )
+
+    instance = storage.create_instance(
+        definition_id=definition_id,
+        scope=scope,
+        database_name=run.database,
+        schema_name=run.schema_name,
+        table_name=run.table,
+        fingerprint=fingerprint,
+        severity=severity,
+        target_config=target_config,
+        threshold_config=threshold_config,
+        rule_sql=rule_sql,
+        rationale="Manually activated from Available in Library at rule review",
+        status="pending",
+        is_active=False,
+        owner="user",
+        created_by="user",
+        source_run_id=run_id,
+    )
+
+    entry = {
+        "instance_id":       instance.id,
+        "definition_id":     definition_id,
+        "name":              definition.name,
+        "description":       definition.description or "",
+        "severity":          severity,
+        "original_severity": severity,
+        "reason":            "Manually activated from library at review",
+        "is_new_instance":   True,
+        "is_new_definition": False,
+        "source":            "user",
+        "scope":             scope,
+        "target_config":     target_config,
+        "violated":          False,
+    }
+
+    state = run.instance_review_state or {"active": [], "skipped": []}
+    state["active"] = state.get("active", []) + [entry]
+    state["unused_library"] = [
+        d for d in (state.get("unused_library") or [])
+        if d.get("definition_id") != definition_id
+    ]
+
+    run = storage.update_agent_run(run_id, instance_review_state=state)
+    logger.info(
+        f"[API] Activated library definition {definition_id} on run {run_id} "
+        f"as instance {instance.id} (scope={scope})"
+    )
+    return _build_run_response(run)
+
+
 @router.post("/runs/{run_id}/run-pipeline", status_code=202)
 def run_pipeline(run_id: str, background_tasks: BackgroundTasks):
     """
@@ -298,6 +472,41 @@ def get_rule_suggestions(run_id: str):
             instance_status=inst.status,
         ))
     return result
+
+
+@router.post("/runs/{run_id}/cancel", response_model=AgentRunResponse)
+def cancel_run(run_id: str):
+    """
+    Manually mark a stuck or in-progress run as failed.
+    Useful when a server restart left a run in 'running' or 'pending' state.
+    Not allowed for runs that have already reached a terminal state
+    (completed, failed, awaiting_fixes).
+    """
+    run = storage.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    terminal = ("completed", "failed", "awaiting_fixes")
+    if run.status in terminal:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is already in terminal state '{run.status}' and cannot be cancelled.",
+        )
+    run = storage.update_agent_run(
+        run_id,
+        status="failed",
+        completed_at=datetime.utcnow(),
+        error_message="Cancelled manually by user.",
+    )
+    # Mark any still-running tasks as failed
+    for task in (run.tasks or []):
+        if task.status in ("running", "pending"):
+            storage.update_agent_task(
+                task.id, status="failed", completed_at=datetime.utcnow(),
+                error_message="Parent run cancelled by user.",
+            )
+    logger.info(f"[API] Run {run_id} cancelled by user")
+    run = storage.get_agent_run(run_id)
+    return _build_run_response(run)
 
 
 @router.post("/runs/{run_id}/verify", status_code=202)

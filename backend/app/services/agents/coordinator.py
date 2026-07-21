@@ -169,7 +169,13 @@ class WorkflowCoordinator:
             # batch only pays discovery cost on its first table.
             try:
                 from app.services.relationship_discovery import get_or_refresh_catalog
-                catalog = get_or_refresh_catalog(run.database, run.schema_name)
+                # Pass require_table so a schema-cache that was built before this
+                # table was added gets refreshed instead of silently returning a
+                # partial catalog — otherwise a newly-seeded FK-having table
+                # loses its referential_integrity coverage for up to 24h.
+                catalog = get_or_refresh_catalog(
+                    run.database, run.schema_name, require_table=run.table,
+                )
                 reldisc_result["catalog"] = catalog
                 self._complete_task(reldisc_task, output={
                     "relationships_found": len(catalog),
@@ -765,6 +771,8 @@ class WorkflowCoordinator:
                     f"{summary['proposed']} rule(s) "
                     f"(scheduled={summary.get('scheduled', False)})"
                 )
+            else:
+                logger.info(f"[Coordinator] AnomalyProposalAgent proposed 0 rules: {summary}")
         except Exception as e:
             logger.warning(f"[Coordinator] AnomalyProposalAgent failed: {e}")
 
@@ -1042,6 +1050,8 @@ class WorkflowCoordinator:
                     f"[Coordinator] AnomalyProposalAgent (template path) proposed "
                     f"{summary['proposed']} rule(s)"
                 )
+            else:
+                logger.info(f"[Coordinator] AnomalyProposalAgent (template path) proposed 0 rules: {summary}")
         except Exception as _ap_err:
             logger.warning(f"[Coordinator] AnomalyProposalAgent (template path) failed: {_ap_err}")
 

@@ -46,6 +46,14 @@ async def lifespan(app: FastAPI):
             schedule_runner.start()
         except Exception as sched_err:
             logger.warning(f"Scheduler start skipped: {sched_err}")
+        # Recover any runs that were left 'running' by a prior server crash/restart.
+        try:
+            from app.services.storage import recover_orphaned_runs
+            n = recover_orphaned_runs()
+            if n:
+                logger.info(f"Recovered {n} orphaned run(s) from prior server restart.")
+        except Exception as rec_err:
+            logger.warning(f"Orphaned-run recovery skipped: {rec_err}")
     except Exception as e:
         logger.error(f"Snowflake startup failed: {e}")
     yield
@@ -88,6 +96,10 @@ app.include_router(settings_api.router, prefix=f"{settings.API_V1_STR}/settings"
 app.include_router(table_health.router, prefix=f"{settings.API_V1_STR}/table-health", tags=["table-health"])
 app.include_router(mutes.router, prefix=f"{settings.API_V1_STR}/mutes", tags=["mutes"])
 app.include_router(lineage.router, prefix=f"{settings.API_V1_STR}/lineage", tags=["lineage"])
+app.include_router(notifications.router, prefix=f"{settings.API_V1_STR}/notifications", tags=["notifications"])
+app.include_router(proposals.router, prefix=f"{settings.API_V1_STR}/proposals", tags=["proposals"])
+app.include_router(validate.router, prefix=f"{settings.API_V1_STR}/validate", tags=["validate"])
+app.include_router(maintenance.router, prefix=f"{settings.API_V1_STR}/maintenance", tags=["maintenance"])
 
 
 @app.get("/")

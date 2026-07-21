@@ -1,77 +1,18 @@
 import { useState } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { settingsApi } from '../api/client'
-import type { SettingsMap } from '../api/client'
-import { Plug, SlidersHorizontal, Info, Palette, Loader2, Save, CheckCircle2, XCircle, Monitor, Sun, Moon, Snowflake, Server } from 'lucide-react'
+import { Plug, Info, Palette, Loader2, CheckCircle2, XCircle, Monitor, Sun, Moon, Snowflake, Server } from 'lucide-react'
 import Connections from './Connections'
 import { useTheme } from '../ThemeContext'
 import type { ThemeMode } from '../ThemeContext'
 
-type Tab = 'connections' | 'profiling' | 'appearance' | 'system'
+type Tab = 'connections' | 'appearance' | 'system'
 
 const TABS: { id: Tab; label: string; icon: any }[] = [
   { id: 'connections', label: 'Connections', icon: Plug },
-  { id: 'profiling',   label: 'Profiling',   icon: SlidersHorizontal },
   { id: 'appearance',  label: 'Appearance',  icon: Palette },
   { id: 'system',      label: 'System',      icon: Info },
 ]
-
-// ── Profiling preferences tab ───────────────────────────────────────────────
-function ProfilingTab() {
-  const qc = useQueryClient()
-  const { data, isLoading } = useQuery({
-    queryKey: ['settings'],
-    queryFn: () => settingsApi.get().then(r => r.data),
-  })
-  const [draft, setDraft] = useState<Record<string, number>>({})
-  const [saved, setSaved] = useState(false)
-
-  const save = useMutation({
-    mutationFn: (updates: Record<string, number>) => settingsApi.update(updates).then(r => r.data),
-    onSuccess: (fresh) => {
-      qc.setQueryData(['settings'], fresh)
-      setDraft({}); setSaved(true); setTimeout(() => setSaved(false), 2000)
-    },
-  })
-
-  if (isLoading || !data) {
-    return <div className="p-6 text-sm text-gray-400 dark:text-gray-300 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />Loading…</div>
-  }
-
-  const settings = data as SettingsMap
-  const value = (k: string) => (k in draft ? draft[k] : settings[k].value)
-  const dirty = Object.keys(draft).length > 0
-
-  return (
-    <div className="space-y-5 max-w-2xl">
-      <p className="text-sm text-gray-600 dark:text-gray-200">
-        Tune how the profiling engine classifies columns and flags anomalies. Changes apply to future profiling runs.
-      </p>
-      {Object.entries(settings).map(([key, meta]) => (
-        <div key={key} className="flex items-start justify-between gap-6 py-3 border-b border-gray-100 dark:border-gray-700">
-          <div className="min-w-0">
-            <label className="text-sm font-medium text-gray-800 dark:text-gray-200">{meta.label}</label>
-            <p className="text-xs text-gray-500 dark:text-gray-200 mt-0.5">{meta.help}</p>
-            <p className="text-[11px] text-gray-400 dark:text-gray-300 mt-1">Default {meta.default} · range {meta.min}–{meta.max}</p>
-          </div>
-          <input
-            type="number" step={meta.type === 'float' ? 0.5 : 1} min={meta.min} max={meta.max}
-            value={value(key)}
-            onChange={e => setDraft(d => ({ ...d, [key]: meta.type === 'float' ? parseFloat(e.target.value) : parseInt(e.target.value, 10) }))}
-            className="w-28 flex-shrink-0 px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm"
-          />
-        </div>
-      ))}
-      <div className="flex items-center gap-3">
-        <button onClick={() => save.mutate(draft)} disabled={!dirty || save.isPending}
-          className="flex items-center gap-2 px-4 py-2 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 disabled:opacity-50">
-          {save.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}Save Changes
-        </button>
-        {saved && <span className="flex items-center gap-1 text-sm text-green-600"><CheckCircle2 className="w-4 h-4" />Saved</span>}
-      </div>
-    </div>
-  )
-}
 
 // ── Appearance tab ──────────────────────────────────────────────────────────
 function AppearanceTab() {
@@ -161,7 +102,7 @@ export default function Settings() {
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Settings</h1>
-        <p className="mt-1 text-gray-600 dark:text-gray-200">Connections, profiling preferences, appearance, and system info.</p>
+        <p className="mt-1 text-gray-600 dark:text-gray-200">Connections, appearance, and system info.</p>
       </div>
 
       {/* Tabs */}
@@ -182,7 +123,6 @@ export default function Settings() {
 
       <div>
         {tab === 'connections' && <Connections embedded />}
-        {tab === 'profiling'   && <ProfilingTab />}
         {tab === 'appearance'  && <AppearanceTab />}
         {tab === 'system'      && <SystemTab />}
       </div>

@@ -82,15 +82,62 @@ def _types_compatible(from_type: Optional[str], to_type: Optional[str]) -> bool:
     return f1 == f2
 
 
-def get_or_refresh_catalog(database: str, schema_name: str, force: bool = False) -> List[Any]:
+def get_or_refresh_catalog(
+    database: str, schema_name: str,
+    force: bool = False,
+    require_table: Optional[str] = None,
+) -> List[Any]:
     """Returns the relationship catalog for this schema, using the persisted
-    cache if it's fresh enough (unless force=True)."""
+    cache if it's fresh enough (unless force=True).
+
+    `require_table` — if set, the cache is only considered fresh when the
+    schema-live table list contains this name AND either (a) the cache has at
+    least one row where from_table == require_table, OR (b) the table has no
+    FK-shaped columns so no rows are expected. Otherwise the cache is treated
+    as stale (a table added after the last discovery would otherwise miss
+    every referential_integrity check on its own FK columns for up to
+    CACHE_TTL_HOURS — the root cause of the DQTEST_ORPHAN_FK regression).
+    """
     if not force:
         cached = storage.list_relationships(database, schema_name)
         if cached and _fresh_enough(cached, CACHE_TTL_HOURS):
-            logger.info(f"[RelationshipDiscovery] Using cached catalog for {database}.{schema_name} ({len(cached)} rows)")
-            return cached
+            if require_table is None or _cache_covers_table(cached, database, schema_name, require_table):
+                logger.info(f"[RelationshipDiscovery] Using cached catalog for {database}.{schema_name} ({len(cached)} rows)")
+                return cached
+            logger.info(
+                f"[RelationshipDiscovery] Cache for {database}.{schema_name} is fresh "
+                f"but missing entries for table {require_table!r} — refreshing"
+            )
     return _discover(database, schema_name)
+
+
+def _cache_covers_table(
+    cached: List[Any], database: str, schema_name: str, table: str,
+) -> bool:
+    """True if the cached catalog plausibly covers `table` — either it has an
+    entry with from_table=table, OR the table itself has no FK-shaped columns
+    to have generated one. A schema-scope discovery legitimately produces no
+    row for a table with zero FK-shaped columns; we should NOT keep bouncing
+    off the cache in that case."""
+    for r in cached:
+        if r.from_table == table:
+            return True
+    try:
+        rows = sf_session.query(
+            f"""
+            SELECT COLUMN_NAME FROM {database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %(sch)s AND TABLE_NAME = %(tbl)s
+            """,
+            {"sch": schema_name, "tbl": table},
+        )
+    except Exception as e:
+        logger.debug(f"[RelationshipDiscovery] _cache_covers_table lookup failed: {e}")
+        return False  # unknown — err on the side of refreshing
+    for row in rows:
+        col = row.get("COLUMN_NAME") or ""
+        if _FK_SHAPE_RE.search(col.upper()) and col.upper() not in _own_pk_names(table):
+            return False  # table has an FK-shaped column but cache has none → stale
+    return True  # no FK-shaped columns → nothing was expected in the cache
 
 
 def _fresh_enough(rows: List[Any], ttl_hours: int) -> bool:

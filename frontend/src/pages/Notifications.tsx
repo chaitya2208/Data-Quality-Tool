@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react';
-import { Bell, CheckCircle, XCircle, ChevronRight, Loader2, RefreshCw, Wrench, PlayCircle } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
+import { CheckCircle, XCircle, ChevronRight, Loader2, RefreshCw, Wrench, PlayCircle, ClipboardList } from 'lucide-react';
 import {
-  notificationsApi, proposalsApi, maintenanceApi,
-  type Notification, type PendingProposal, type MaintenanceProposal,
+  proposalsApi, maintenanceApi,
+  type PendingProposal, type MaintenanceProposal,
 } from '../api/client';
 
 export default function Notifications() {
-  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const refRunId = searchParams.get('ref');
   const [proposals, setProposals] = useState<PendingProposal[]>([]);
   const [maintenance, setMaintenance] = useState<MaintenanceProposal[]>([]);
   const [loading, setLoading] = useState(true);
@@ -20,16 +22,14 @@ export default function Notifications() {
     setLoading(true);
     setError(null);
     try {
-      const [n, p, m] = await Promise.all([
-        notificationsApi.list({ limit: 100 }),
+      const [p, m] = await Promise.all([
         proposalsApi.listPending(200),
         maintenanceApi.listPending(200),
       ]);
-      setNotifications(n.data.items);
       setProposals(p.data.items);
       setMaintenance(m.data.items);
     } catch (e: any) {
-      setError(e?.message || 'Failed to load notifications');
+      setError(e?.message || 'Failed to load pending proposals');
     } finally {
       setLoading(false);
     }
@@ -75,14 +75,14 @@ export default function Notifications() {
 
   useEffect(() => { load(); }, []);
 
-  async function markAllRead() {
-    try {
-      await notificationsApi.markAllRead();
-      await load();
-    } catch (e) {
-      console.error(e);
-    }
-  }
+  // Deep-link from the bell: /notifications?ref=<run_id> pre-selects the
+  // first pending proposal that came from that scan run.
+  useEffect(() => {
+    if (!refRunId || proposals.length === 0) return;
+    if (selected && selected.source_run_id === refRunId) return;
+    const match = proposals.find(p => p.source_run_id === refRunId);
+    if (match) setSelected(match);
+  }, [refRunId, proposals]);
 
   async function approve(p: PendingProposal) {
     setBusy(true);
@@ -111,17 +111,19 @@ export default function Notifications() {
     }
   }
 
-  const unread = notifications.filter(n => !n.read_at);
+  const linkedProposals = refRunId
+    ? proposals.filter(p => p.source_run_id === refRunId)
+    : [];
 
   return (
     <div className="max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
-          <Bell className="w-6 h-6 text-primary-600" />
-          <h1 className="text-2xl font-semibold text-gray-900 dark:text-gray-100">Notifications</h1>
-          {unread.length > 0 && (
+          <ClipboardList className="w-6 h-6 text-primary-600" />
+          <h1 className="text-2xl font-semibold text-gray-900 dark:text-gray-100">Review queue</h1>
+          {proposals.length > 0 && (
             <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-800 dark:bg-primary-900/40 dark:text-primary-300">
-              {unread.length} unread
+              {proposals.length} pending
             </span>
           )}
         </div>
@@ -132,16 +134,22 @@ export default function Notifications() {
           >
             <RefreshCw className="w-4 h-4" /> Refresh
           </button>
-          {unread.length > 0 && (
-            <button
-              onClick={markAllRead}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg bg-primary-600 text-white hover:bg-primary-700"
-            >
-              Mark all read
-            </button>
-          )}
         </div>
       </div>
+
+      {refRunId && (
+        <div className="mb-4 p-3 rounded-lg bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800 text-sm text-primary-800 dark:text-primary-200 flex items-center justify-between gap-3">
+          <span>
+            Showing {linkedProposals.length} proposal{linkedProposals.length === 1 ? '' : 's'} from the notification you opened.
+          </span>
+          <button
+            onClick={() => { setSearchParams({}); setSelected(null); }}
+            className="text-xs font-medium underline hover:no-underline"
+          >
+            Show all
+          </button>
+        </div>
+      )}
 
       {error && (
         <div className="mb-4 p-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-200">
@@ -154,83 +162,18 @@ export default function Notifications() {
           <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* ── Left: notifications feed ─────────────────────── */}
-          <div className="lg:col-span-1 space-y-3">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* ── Left: pending proposals list ─────────────────── */}
+          <div className="space-y-3">
             <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
-              Recent
+              Pending anomaly rules ({refRunId ? linkedProposals.length : proposals.length})
             </h2>
-            {notifications.length === 0 && (
-              <p className="text-sm text-gray-500 dark:text-gray-400 italic">No notifications yet.</p>
+            {(refRunId ? linkedProposals : proposals).length === 0 && (
+              <p className="text-sm text-gray-500 dark:text-gray-400 italic">
+                {refRunId ? 'These proposals have already been reviewed.' : 'Nothing pending review.'}
+              </p>
             )}
-            {notifications.map(n => {
-              // Match a notification to its proposals so a click opens them.
-              // Anomaly notifications carry the source run_id in ref_id; each
-              // pending proposal from that run has source_run_id === ref_id.
-              const linked = proposals.filter(
-                p => (n.kind === 'anomaly_proposals') && p.source_run_id === n.ref_id
-              );
-              const first = linked[0] || null;
-              async function onClick() {
-                if (first) setSelected(first);
-                if (!n.read_at) {
-                  try {
-                    await notificationsApi.markRead(n.id);
-                  } catch (e) {
-                    console.error('markRead failed', e);
-                  }
-                  await load();
-                }
-              }
-              return (
-                <button
-                  key={n.id}
-                  onClick={onClick}
-                  className={`w-full text-left p-3 rounded-lg border transition-colors cursor-pointer ${
-                    n.read_at
-                      ? 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700/50'
-                      : 'border-primary-200 dark:border-primary-800 bg-primary-50 dark:bg-primary-900/20 hover:bg-primary-100 dark:hover:bg-primary-900/30'
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="text-sm font-medium text-gray-900 dark:text-gray-100">{n.title}</p>
-                    {!n.read_at && (
-                      <span className="mt-1 w-2 h-2 rounded-full bg-primary-500 flex-shrink-0" />
-                    )}
-                  </div>
-                  {n.body && (
-                    <p className="mt-1 text-xs text-gray-600 dark:text-gray-400">{n.body}</p>
-                  )}
-                  <div className="mt-2 flex items-center justify-between">
-                    <p className="text-[11px] text-gray-400">
-                      {n.created_at ? new Date(n.created_at).toLocaleString() : ''}
-                    </p>
-                    {linked.length > 0 ? (
-                      <span className="text-[11px] font-medium text-primary-600 dark:text-primary-400 inline-flex items-center gap-0.5">
-                        Review {linked.length} <ChevronRight className="w-3 h-3" />
-                      </span>
-                    ) : (
-                      n.kind === 'anomaly_proposals' && (
-                        <span className="text-[11px] text-gray-400 italic">
-                          Already reviewed
-                        </span>
-                      )
-                    )}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* ── Middle: pending proposals list ─────────────────── */}
-          <div className="lg:col-span-1 space-y-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
-              Pending anomaly rules ({proposals.length})
-            </h2>
-            {proposals.length === 0 && (
-              <p className="text-sm text-gray-500 dark:text-gray-400 italic">Nothing pending review.</p>
-            )}
-            {proposals.map(p => {
+            {(refRunId ? linkedProposals : proposals).map(p => {
               const isSelected = selected?.id === p.id;
               return (
                 <button
@@ -265,7 +208,7 @@ export default function Notifications() {
           </div>
 
           {/* ── Right: detail + actions ─────────────────────── */}
-          <div className="lg:col-span-1">
+          <div>
             <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-3">
               Details
             </h2>

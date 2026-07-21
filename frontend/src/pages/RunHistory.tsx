@@ -1,12 +1,12 @@
-import { useState, useMemo } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { agentRunsApi } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import { fmtIST } from '../utils/dates'
 import {
   History, Loader2, CheckCircle2, AlertTriangle, BrainCircuit,
-  Wrench, Database, Search, Filter, ExternalLink, Clock,
+  Wrench, Database, Search, Filter, ExternalLink, Clock, XCircle,
 } from 'lucide-react'
 
 type StatusFilter = 'all' | 'completed' | 'failed' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes'
@@ -50,75 +50,76 @@ function statusBadge(status: string) {
   }
 }
 
+const PAGE_SIZE = 20
+
 export default function RunHistory() {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [cancellingId, setCancellingId] = useState<string | null>(null)
   const [searchParams] = useSearchParams()
-  const [search, setSearch]           = useState('')
+  const [search, setSearch]             = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [originFilter, setOriginFilter] = useState<OriginFilter>('all')
   const [dbFilter, setDbFilter]         = useState(() => searchParams.get('db') ?? '')
   const [schemaFilter, setSchemaFilter] = useState(() => searchParams.get('schema') ?? '')
   const [tableFilter, setTableFilter]   = useState(() => searchParams.get('table') ?? '')
-  // Run History is scoped to the selected data source. Runs already carry
-  // connection_id, so we filter client-side; legacy NULL-connection runs are
-  // attributed to Snowflake to match the findings/dashboard scoping rule.
+  const [page, setPage] = useState(1)
+
+  // Non-Snowflake sources scope by connection_id. Snowflake shows all runs
+  // (connection row may be deleted/recreated but runs should survive that).
   const { selectedId: connId, selected } = useConnection()
   const isSnowflake = (selected?.type ?? '').toLowerCase() === 'snowflake'
+  const effectiveConnId = (!connId || isSnowflake) ? undefined : connId
+
+  const queryParams = {
+    page,
+    page_size: PAGE_SIZE,
+    status:      statusFilter !== 'all' ? statusFilter : undefined,
+    origin:      originFilter !== 'all' ? originFilter : undefined,
+    database:    dbFilter     || undefined,
+    schema_name: schemaFilter || undefined,
+    table:       tableFilter  || undefined,
+    search:      search       || undefined,
+    connection_id: effectiveConnId,
+  }
 
   const { data, isLoading } = useQuery({
-    queryKey: ['agent-runs-history'],
-    queryFn: () => agentRunsApi.list().then(r => r.data),
+    queryKey: ['agent-runs-history', queryParams],
+    queryFn: () => agentRunsApi.list(queryParams).then(r => r.data),
     refetchInterval: 10_000,
   })
 
-  const allRuns = data?.runs ?? []
-  // For Snowflake, the CONNECTIONS row is just credentials for the shared
-  // warehouse — history must survive delete/recreate of that row. So show
-  // ALL runs regardless of which (possibly-orphaned) connection_id they
-  // carry. Non-Snowflake sources stay scoped to their own connection.
-  const runs = allRuns.filter(run =>
-    !connId
-      ? true
-      : isSnowflake
-        ? true
-        : run.connection_id === connId
-  )
-
-  // Cascading DB → schema → table option lists, derived from the (connection-
-  // scoped) runs. Schema options depend on the chosen DB, tables on the schema.
-  const dbOptions = useMemo(
-    () => Array.from(new Set(runs.map(r => r.database).filter(Boolean))).sort(),
-    [runs],
-  )
-  const schemaOptions = useMemo(
-    () => Array.from(new Set(
-      runs.filter(r => !dbFilter || r.database === dbFilter)
-          .map(r => r.schema_name).filter(Boolean),
-    )).sort(),
-    [runs, dbFilter],
-  )
-  const tableOptions = useMemo(
-    () => Array.from(new Set(
-      runs.filter(r => (!dbFilter || r.database === dbFilter) && (!schemaFilter || r.schema_name === schemaFilter))
-          .map(r => r.table).filter(Boolean),
-    )).sort(),
-    [runs, dbFilter, schemaFilter],
-  )
-
-  const filtered = runs.filter(run => {
-    const matchesStatus = statusFilter === 'all' || run.status === statusFilter
-    const fqn = `${run.database}.${run.schema_name}.${run.table}`.toLowerCase()
-    const matchesSearch = !search || fqn.includes(search.toLowerCase())
-    const matchesDb     = !dbFilter     || run.database    === dbFilter
-    const matchesSchema = !schemaFilter || run.schema_name === schemaFilter
-    const matchesTable  = !tableFilter  || run.table       === tableFilter
-    const matchesOrigin = originFilter === 'all'
-      || (originFilter === 'scheduled' ? !!run.schedule_id : !run.schedule_id)
-    return matchesStatus && matchesSearch && matchesDb && matchesSchema && matchesTable && matchesOrigin
+  // Filter options — distinct db/schema/table values across ALL runs (not just
+  // the current page), used to populate the cascading dropdowns.
+  const { data: filterOpts } = useQuery({
+    queryKey: ['agent-runs-filter-options'],
+    queryFn: () => agentRunsApi.filterOptions().then(r => r.data),
+    staleTime: 60_000,
   })
 
+  const totalRuns  = data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(totalRuns / PAGE_SIZE))
+  const runs       = data?.runs ?? []
+
+  const dbOptions     = filterOpts?.databases ?? []
+  const schemaOptions = dbFilter ? (filterOpts?.schemas?.[dbFilter] ?? []) : []
+  const tableOptions  = (dbFilter && schemaFilter) ? (filterOpts?.tables?.[`${dbFilter}.${schemaFilter}`] ?? []) : []
+
+  async function handleCancel(runId: string) {
+    if (!window.confirm('Cancel this run? It will be marked as failed.')) return
+    setCancellingId(runId)
+    try {
+      await agentRunsApi.cancel(runId)
+      queryClient.invalidateQueries({ queryKey: ['agent-runs-history'] })
+    } catch {
+      // ignore — run list will refresh on its own
+    } finally {
+      setCancellingId(null)
+    }
+  }
+
   const stats = {
-    total:     runs.length,
+    total:     totalRuns,
     completed: runs.filter(r => r.status === 'completed').length,
     failed:    runs.filter(r => r.status === 'failed').length,
     active:    runs.filter(r => ['running', 'awaiting_rule_review', 'awaiting_fixes', 'pending'].includes(r.status)).length,
@@ -155,7 +156,7 @@ export default function RunHistory() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
             <input
               value={search}
-              onChange={e => setSearch(e.target.value)}
+              onChange={e => { setSearch(e.target.value); setPage(1) }}
               placeholder="Search by database, schema, or table..."
               className="w-full pl-9 pr-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
             />
@@ -164,7 +165,7 @@ export default function RunHistory() {
             <Filter className="w-4 h-4 text-gray-400 flex-shrink-0" />
             <select
               value={statusFilter}
-              onChange={e => setStatusFilter(e.target.value as StatusFilter)}
+              onChange={e => { setStatusFilter(e.target.value as StatusFilter); setPage(1) } }
               className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
             >
               {STATUS_OPTIONS.map(o => (
@@ -178,7 +179,7 @@ export default function RunHistory() {
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <select
             value={dbFilter}
-            onChange={e => { setDbFilter(e.target.value); setSchemaFilter(''); setTableFilter('') }}
+            onChange={e => { setDbFilter(e.target.value); setSchemaFilter(''); setTableFilter(''); setPage(1) } }
             className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
           >
             <option value="">All Databases</option>
@@ -186,7 +187,7 @@ export default function RunHistory() {
           </select>
           <select
             value={schemaFilter}
-            onChange={e => { setSchemaFilter(e.target.value); setTableFilter('') }}
+            onChange={e => { setSchemaFilter(e.target.value); setTableFilter(''); setPage(1) } }
             className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
           >
             <option value="">All Schemas</option>
@@ -202,7 +203,7 @@ export default function RunHistory() {
           </select>
           <select
             value={originFilter}
-            onChange={e => setOriginFilter(e.target.value as OriginFilter)}
+            onChange={e => { setOriginFilter(e.target.value as OriginFilter); setPage(1) } }
             className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 dark:bg-gray-800 dark:text-gray-100"
           >
             <option value="all">All Runs</option>
@@ -218,14 +219,14 @@ export default function RunHistory() {
           <div className="p-12 flex items-center justify-center gap-2 text-gray-400">
             <Loader2 className="w-5 h-5 animate-spin" />Loading runs...
           </div>
-        ) : filtered.length === 0 ? (
+        ) : runs.length === 0 ? (
           <div className="p-12 text-center">
             <History className="w-12 h-12 text-gray-200 mx-auto mb-3" />
             <p className="text-gray-900 dark:text-gray-100 font-medium mb-1">
-              {runs.length === 0 ? 'No runs yet' : 'No runs match your filters'}
+              {totalRuns === 0 ? 'No runs yet' : 'No runs match your filters'}
             </p>
             <p className="text-sm text-gray-400 dark:text-gray-400">
-              {runs.length === 0
+              {totalRuns === 0
                 ? 'Start a workflow from the Workflow page to see runs here.'
                 : 'Try changing the status filter or search term.'}
             </p>
@@ -241,7 +242,7 @@ export default function RunHistory() {
               <span className="text-right">Actions</span>
             </div>
 
-            {filtered.map(run => {
+            {runs.map(run => {
               // Nodes that failed during this run — surfaced even when the run
               // itself isn't 'failed' (e.g. a soft node failure the pipeline
               // continued past), so a partial failure is never invisible.
@@ -306,7 +307,21 @@ export default function RunHistory() {
                     </div>
 
                     {/* Actions */}
-                    <div className="flex items-center justify-end gap-3">
+                    <div className="flex items-center justify-end gap-2">
+                      {(run.status === 'running' || run.status === 'pending') && (
+                        <button
+                          onClick={() => handleCancel(run.id)}
+                          disabled={cancellingId === run.id}
+                          className="text-xs px-2 py-1 border border-red-300 dark:border-red-700 rounded-lg text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0 flex items-center gap-1"
+                          title="Cancel this run"
+                        >
+                          {cancellingId === run.id
+                            ? <Loader2 className="w-3 h-3 animate-spin" />
+                            : <XCircle className="w-3 h-3" />
+                          }
+                          Cancel
+                        </button>
+                      )}
                       <button
                         onClick={() => navigate(`/workflow?run_id=${run.id}`)}
                         className="text-xs px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors flex-shrink-0"
@@ -362,10 +377,33 @@ export default function RunHistory() {
         )}
       </div>
 
-      {/* Footer count */}
-      {!isLoading && filtered.length > 0 && (
+      {/* Pagination */}
+      {!isLoading && totalPages > 1 && (
+        <div className="flex items-center justify-between">
+          <p className="text-xs text-gray-400 dark:text-gray-500">
+            Page {page} of {totalPages} · {totalRuns} total runs · auto-refreshes every 10s
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page === 1}
+              className="px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              Previous
+            </button>
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page === totalPages}
+              className="px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
+      {!isLoading && totalPages === 1 && runs.length > 0 && (
         <p className="text-xs text-gray-400 dark:text-gray-500 text-right">
-          Showing {filtered.length} of {runs.length} runs · auto-refreshes every 10s
+          {totalRuns} runs · auto-refreshes every 10s
         </p>
       )}
     </div>

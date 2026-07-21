@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
-import { Routes, Route, Link, useLocation } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock, Bell, Waypoints } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom'
+import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock, Bell, Waypoints, CheckCheck, Inbox, ChevronRight } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
@@ -15,33 +15,40 @@ import RunHistory from './pages/RunHistory'
 import Notifications from './pages/Notifications'
 import Lineage from './pages/Lineage'
 import { useConnection } from './ConnectionContext'
-import { notificationsApi } from './api/client'
+import { notificationsApi, type Notification } from './api/client'
 
 function NotificationsBell() {
+  const navigate = useNavigate()
   const [unread, setUnread] = useState(0)
+  const [open, setOpen] = useState(false)
+  const [items, setItems] = useState<Notification[]>([])
+  const [listLoading, setListLoading] = useState(false)
+  const [listError, setListError] = useState<string | null>(null)
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+
+  async function refreshCount() {
+    try {
+      const r = await notificationsApi.unreadCount()
+      setUnread(r.data.unread)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  // Poll unread-count with backoff — auth loss / backend hiccups shouldn't
+  // hammer the endpoint every minute (each 500 triggers an SSO retry on the
+  // backend). Doubles up to a 10-min ceiling; resets on success.
   useEffect(() => {
     let cancelled = false
     let failures = 0
     let timeoutId: ReturnType<typeof setTimeout> | null = null
-
     async function poll() {
-      try {
-        const r = await notificationsApi.unreadCount()
-        if (!cancelled) {
-          setUnread(r.data.unread)
-          failures = 0
-        }
-      } catch {
-        // Back off on failure — a Snowflake auth loss or backend
-        // hiccup shouldn't have the bell hammering /unread-count
-        // every minute (each 500 also triggers an SSO retry on the
-        // backend). Doubles up to a 10-min ceiling; resets on success.
-        failures = Math.min(failures + 1, 6)
-      }
-      if (!cancelled) {
-        const nextMs = failures === 0 ? 60_000 : Math.min(60_000 * (2 ** failures), 600_000)
-        timeoutId = setTimeout(poll, nextMs)
-      }
+      const ok = await refreshCount()
+      if (cancelled) return
+      failures = ok ? 0 : Math.min(failures + 1, 6)
+      const nextMs = failures === 0 ? 60_000 : Math.min(60_000 * (2 ** failures), 600_000)
+      timeoutId = setTimeout(poll, nextMs)
     }
     poll()
     return () => {
@@ -49,19 +56,161 @@ function NotificationsBell() {
       if (timeoutId) clearTimeout(timeoutId)
     }
   }, [])
+
+  async function loadList() {
+    setListLoading(true)
+    setListError(null)
+    try {
+      const r = await notificationsApi.list({ limit: 20 })
+      setItems(r.data.items)
+    } catch (e: any) {
+      setListError(e?.message || 'Failed to load')
+    } finally {
+      setListLoading(false)
+    }
+  }
+
+  // Open/close: fetch fresh list on open, close on outside-click / ESC.
+  useEffect(() => {
+    if (!open) return
+    loadList()
+    function onDocClick(e: MouseEvent) {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false)
+    }
+    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDocClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDocClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  async function onItemClick(n: Notification) {
+    if (!n.read_at) {
+      try { await notificationsApi.markRead(n.id) } catch (e) { console.error(e) }
+      setItems(prev => prev.map(x => x.id === n.id ? { ...x, read_at: new Date().toISOString() } : x))
+      refreshCount()
+    }
+    // Anomaly-proposal notifications carry the source run_id in ref_id — deep-link
+    // the review workspace to auto-select the matching proposals.
+    if (n.kind === 'anomaly_proposals' && n.ref_id) {
+      navigate(`/notifications?ref=${encodeURIComponent(n.ref_id)}`)
+    } else {
+      navigate('/notifications')
+    }
+    setOpen(false)
+  }
+
+  async function markAllRead() {
+    try {
+      await notificationsApi.markAllRead()
+      setItems(prev => prev.map(x => x.read_at ? x : { ...x, read_at: new Date().toISOString() }))
+      refreshCount()
+    } catch (e) { console.error(e) }
+  }
+
   return (
-    <Link
-      to="/notifications"
-      className="relative inline-flex items-center justify-center w-9 h-9 rounded-lg text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
-      aria-label="Notifications"
-    >
-      <Bell className="w-5 h-5" />
-      {unread > 0 && (
-        <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold inline-flex items-center justify-center">
-          {unread > 99 ? '99+' : unread}
-        </span>
+    <div ref={wrapRef} className="relative">
+      <button
+        onClick={() => setOpen(v => !v)}
+        aria-label="Notifications"
+        aria-expanded={open}
+        className={`relative inline-flex items-center justify-center w-9 h-9 rounded-lg transition-colors ${
+          open
+            ? 'bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-gray-100'
+            : 'text-gray-500 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
+        }`}
+      >
+        <Bell className="w-5 h-5" />
+        {unread > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold inline-flex items-center justify-center">
+            {unread > 99 ? '99+' : unread}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div
+          role="dialog"
+          aria-label="Notifications"
+          className="absolute right-0 mt-2 w-[380px] max-w-[calc(100vw-1.5rem)] rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-2xl z-30 overflow-hidden"
+        >
+          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-700">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">Notifications</span>
+              {unread > 0 && (
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-primary-100 text-primary-800 dark:bg-primary-900/40 dark:text-primary-300">
+                  {unread} new
+                </span>
+              )}
+            </div>
+            {unread > 0 && (
+              <button
+                onClick={markAllRead}
+                className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100"
+              >
+                <CheckCheck className="w-3.5 h-3.5" /> Mark all read
+              </button>
+            )}
+          </div>
+
+          <div className="max-h-[420px] overflow-y-auto">
+            {listLoading ? (
+              <div className="py-10 text-center text-xs text-gray-400">Loading…</div>
+            ) : listError ? (
+              <div className="p-4 text-xs text-red-600 dark:text-red-300">{listError}</div>
+            ) : items.length === 0 ? (
+              <div className="py-10 px-4 text-center">
+                <Inbox className="w-6 h-6 mx-auto text-gray-300 dark:text-gray-600 mb-2" />
+                <p className="text-xs text-gray-500 dark:text-gray-400">You're all caught up.</p>
+              </div>
+            ) : (
+              <ul className="divide-y divide-gray-100 dark:divide-gray-700">
+                {items.map(n => (
+                  <li key={n.id}>
+                    <button
+                      onClick={() => onItemClick(n)}
+                      className={`w-full text-left px-4 py-3 flex items-start gap-2 transition-colors ${
+                        n.read_at
+                          ? 'hover:bg-gray-50 dark:hover:bg-gray-700/40'
+                          : 'bg-primary-50/60 dark:bg-primary-900/10 hover:bg-primary-50 dark:hover:bg-primary-900/20'
+                      }`}
+                    >
+                      <span
+                        className={`mt-1.5 w-2 h-2 rounded-full flex-shrink-0 ${
+                          n.read_at ? 'bg-transparent' : 'bg-primary-500'
+                        }`}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-2">{n.title}</p>
+                        {n.body && (
+                          <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400 line-clamp-2">{n.body}</p>
+                        )}
+                        <p className="mt-1 text-[11px] text-gray-400">
+                          {n.created_at ? new Date(n.created_at).toLocaleString() : ''}
+                        </p>
+                      </div>
+                      <ChevronRight className="w-4 h-4 text-gray-300 dark:text-gray-500 flex-shrink-0 mt-1" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="border-t border-gray-100 dark:border-gray-700">
+            <Link
+              to="/notifications"
+              onClick={() => setOpen(false)}
+              className="block px-4 py-2.5 text-center text-xs font-medium text-primary-600 dark:text-primary-400 hover:bg-gray-50 dark:hover:bg-gray-700/50"
+            >
+              View all &amp; review pending
+            </Link>
+          </div>
+        </div>
       )}
-    </Link>
+    </div>
   )
 }
 

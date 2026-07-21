@@ -284,15 +284,18 @@ def fetch_lineage_via_get_lineage(
             if not src_db or not src_nm:
                 continue
 
+            src_fqn = _fqn(src_db, src_sc or "", src_nm)
+            tgt_fqn = _fqn(tgt_db, tgt_sc or "", tgt_nm)
             edges.append({
                 "source_database": src_db, "source_schema": src_sc, "source_table": src_nm,
-                "source_fqn": _fqn(src_db, src_sc or "", src_nm),
+                "source_fqn": src_fqn,
                 "source_kind": _normalize_domain(src_dm),
                 "target_database": tgt_db, "target_schema": tgt_sc, "target_table": tgt_nm,
-                "target_fqn": _fqn(tgt_db, tgt_sc or "", tgt_nm),
+                "target_fqn": tgt_fqn,
                 "target_kind": _normalize_domain(tgt_dm),
                 "edge_type": _edge_type_from_domains(src_dm, tgt_dm),
                 "discovery_source": "get_lineage",
+                "is_self_loop": src_fqn == tgt_fqn,
                 "evidence": {
                     "query_id": r.get("QUERY_ID"),
                     "distance": r.get("DISTANCE"),
@@ -722,6 +725,8 @@ def _nested_nodes_and_edges(
 
     edges: List[dict] = []
     for e in edge_rows:
+        if e.source_fqn == e.target_fqn:
+            continue
         edges.append({
             "id": f"{e.source_fqn}->{e.target_fqn}:{e.edge_type or ''}",
             "source": e.source_fqn, "target": e.target_fqn,
@@ -938,9 +943,11 @@ def build_schema_graph(
                 "is_external": True,
             })
 
-    # 6. Edges — one entry per LINEAGE_EDGES row.
+    # 6. Edges — one entry per LINEAGE_EDGES row (skip self-loops).
     edges: List[dict] = []
     for e in edges_raw:
+        if e.source_fqn == e.target_fqn:
+            continue
         edges.append({
             "id": f"{e.source_fqn}->{e.target_fqn}:{e.edge_type or ''}",
             "source": e.source_fqn, "target": e.target_fqn,
@@ -961,11 +968,30 @@ def build_table_lineage(
     connection_id: Optional[str], database: str, schema: str, table: str, hops: int = 3,
 ) -> dict:
     """BFS upstream + downstream from a single table, up to `hops` steps.
-    Nodes carry the same overlay contract as schema-level view."""
+    Nodes carry the same overlay contract as schema-level view, plus a
+    `direction` field: 'focus' | 'upstream' | 'downstream'. Edges carry the
+    matching `direction` so the frontend can dim/filter one side.
+
+    Auto-crawls the focus's database on first open (mirrors
+    build_database_graph). Without this, cascading Database→Schema→Table
+    on a never-refreshed DB returns an empty BFS and looks like 'no
+    upstream'."""
     cid, empty = _check_snowflake_or_empty(connection_id)
     if empty is not None:
         return empty
     hops = max(1, min(int(hops or 3), 10))
+
+    prior_state = storage.get_refresh_state(cid, database)
+    if prior_state is None:
+        logger.info(f"[lineage] auto-crawl triggered for {database} (table-level, no prior refresh state)")
+        try:
+            result = refresh_database(cid, database)
+            logger.info(
+                f"[lineage] auto-crawl finished for {database}: "
+                f"status={result.status} edges={result.edge_count} method={result.method_used}"
+            )
+        except Exception as e:
+            logger.warning(f"[lineage] auto-crawl failed for {database}: {e}")
 
     all_edges = storage.list_lineage_edges(cid)
     upstream = defaultdict(list)   # target_fqn -> list of edges arriving
@@ -975,23 +1001,49 @@ def build_table_lineage(
         downstream[e.source_fqn].append(e)
 
     start = _fqn(database, schema, table)
+    # direction: 'focus' | 'upstream' | 'downstream'
+    node_direction: Dict[str, str] = {start: "focus"}
+    edge_direction: Dict[Tuple[str, str, str], str] = {}
     visited: Dict[str, int] = {start: 0}
-    used_edges: List = []
-    queue = deque([(start, 0)])
-    while queue:
-        node, depth = queue.popleft()
+
+    # Walk upstream and downstream separately so each edge/node gets a
+    # stable direction tag (the direction it was first reached from the
+    # focus). Diamonds where a node is reachable both ways keep whichever
+    # direction reached them first — matches how users read the graph.
+    up_q = deque([(start, 0)])
+    while up_q:
+        node, depth = up_q.popleft()
         if depth >= hops:
             continue
         for e in upstream.get(node, []):
-            used_edges.append(e)
+            key = (e.source_fqn, e.target_fqn, e.edge_type or "")
+            edge_direction.setdefault(key, "upstream")
             if e.source_fqn not in visited:
                 visited[e.source_fqn] = depth + 1
-                queue.append((e.source_fqn, depth + 1))
+                node_direction[e.source_fqn] = "upstream"
+                up_q.append((e.source_fqn, depth + 1))
+
+    dn_q = deque([(start, 0)])
+    while dn_q:
+        node, depth = dn_q.popleft()
+        if depth >= hops:
+            continue
         for e in downstream.get(node, []):
-            used_edges.append(e)
+            key = (e.source_fqn, e.target_fqn, e.edge_type or "")
+            edge_direction.setdefault(key, "downstream")
             if e.target_fqn not in visited:
                 visited[e.target_fqn] = depth + 1
-                queue.append((e.target_fqn, depth + 1))
+                node_direction[e.target_fqn] = "downstream"
+                dn_q.append((e.target_fqn, depth + 1))
+
+    used_edge_keys = set(edge_direction.keys())
+    used_edges = []
+    seen_keys = set()
+    for e in all_edges:
+        key = (e.source_fqn, e.target_fqn, e.edge_type or "")
+        if key in used_edge_keys and key not in seen_keys:
+            seen_keys.add(key)
+            used_edges.append(e)
 
     # Build node metadata. Group affected DBs and pull overlays lazily.
     dbs_scoped: Dict[str, set] = defaultdict(set)
@@ -1048,32 +1100,37 @@ def build_table_lineage(
             "rules_run": all_rules.get((db, sc, tb), 0),
             "depth": visited[fqn],
             "is_focus": fqn == start,
+            "direction": node_direction.get(fqn, "focus"),
         })
 
     findings = storage.count_open_findings_by_asset([aid for aid in asset_ids_needed.values() if aid])
     for n in nodes:
         n["open_findings"] = findings.get(n["asset_id"], 0) if n["asset_id"] else 0
 
-    # Dedupe edges by identity
-    seen_edge_ids = set()
     edges_out = []
     for e in used_edges:
-        key = (e.source_fqn, e.target_fqn, e.edge_type or "")
-        if key in seen_edge_ids:
+        if e.source_fqn == e.target_fqn:
             continue
-        seen_edge_ids.add(key)
+        key = (e.source_fqn, e.target_fqn, e.edge_type or "")
         edges_out.append({
             "id": f"{e.source_fqn}->{e.target_fqn}:{e.edge_type or ''}",
             "source": e.source_fqn, "target": e.target_fqn,
             "edge_type": e.edge_type,
             "discovery_source": e.discovery_source,
+            "direction": edge_direction.get(key, "downstream"),
         })
+
+    # Summary counts so the UI can label the direction chips.
+    upstream_ct = sum(1 for d in node_direction.values() if d == "upstream")
+    downstream_ct = sum(1 for d in node_direction.values() if d == "downstream")
 
     ts, method = _latest_refresh_meta(cid, database)
     return {
         "available": True, "reason": None,
         "nodes": nodes, "edges": edges_out,
         "focus_fqn": start, "hops": hops,
+        "upstream_count": upstream_ct,
+        "downstream_count": downstream_ct,
         "last_refreshed_at": ts,
         "discovery_method": method,
     }

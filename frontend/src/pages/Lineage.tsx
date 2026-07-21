@@ -1,7 +1,7 @@
 import { useMemo, useReducer, useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  ReactFlow, Background, Controls, MiniMap, Handle, Position,
+  ReactFlow, Background, Controls, Handle, Position,
   type Node, type Edge, type NodeProps, MarkerType,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
@@ -31,12 +31,15 @@ type ViewMode =
   | { level: 'schema'; database: string; schema: string }
   | { level: 'table'; database: string; schema: string; table: string; hops: number }
 
+type DirectionFilter = 'all' | 'upstream' | 'downstream'
+
 type State = {
   view: ViewMode
   workflowId: string | null
   focusFqn: string | null
   refreshKey: number
   showOrphans: boolean
+  directionFilter: DirectionFilter
 }
 
 type Action =
@@ -45,19 +48,25 @@ type Action =
   | { type: 'focus'; fqn: string | null }
   | { type: 'toggleOrphans' }
   | { type: 'bumpRefresh' }
+  | { type: 'setDirection'; direction: DirectionFilter }
+  | { type: 'setHops'; hops: number }
 
 const initialState: State = {
   view: { level: 'picker' }, workflowId: null, focusFqn: null,
-  refreshKey: 0, showOrphans: false,
+  refreshKey: 0, showOrphans: false, directionFilter: 'all',
 }
 
 function reducer(s: State, a: Action): State {
   switch (a.type) {
-    case 'goto': return { ...s, view: a.view, focusFqn: null }
+    case 'goto': return { ...s, view: a.view, focusFqn: null, directionFilter: 'all' }
     case 'pickWorkflow': return { ...s, workflowId: a.workflowId }
-    case 'focus': return { ...s, focusFqn: a.fqn }
+    case 'focus': return { ...s, focusFqn: a.fqn, directionFilter: 'all' }
     case 'toggleOrphans': return { ...s, showOrphans: !s.showOrphans }
     case 'bumpRefresh': return { ...s, refreshKey: s.refreshKey + 1 }
+    case 'setDirection': return { ...s, directionFilter: a.direction }
+    case 'setHops':
+      if (s.view.level !== 'table') return s
+      return { ...s, view: { ...s.view, hops: Math.max(1, Math.min(10, a.hops)) } }
   }
 }
 
@@ -263,7 +272,8 @@ function computeDagreLayout(
 function computePath(edges: LineageEdge[], focus: string) {
   const upstream = new Set<string>()
   const downstream = new Set<string>()
-  const edgeSet = new Set<string>()
+  const upEdges = new Set<string>()
+  const downEdges = new Set<string>()
   const upBy: Record<string, LineageEdge[]> = {}
   const downBy: Record<string, LineageEdge[]> = {}
   for (const e of edges) {
@@ -274,7 +284,7 @@ function computePath(edges: LineageEdge[], focus: string) {
   while (upQ.length) {
     const cur = upQ.shift()!
     for (const e of upBy[cur] || []) {
-      edgeSet.add(e.id)
+      upEdges.add(e.id)
       if (!seenUp.has(e.source)) { seenUp.add(e.source); upstream.add(e.source); upQ.push(e.source) }
     }
   }
@@ -282,11 +292,13 @@ function computePath(edges: LineageEdge[], focus: string) {
   while (dnQ.length) {
     const cur = dnQ.shift()!
     for (const e of downBy[cur] || []) {
-      edgeSet.add(e.id)
+      downEdges.add(e.id)
       if (!seenDn.has(e.target)) { seenDn.add(e.target); downstream.add(e.target); dnQ.push(e.target) }
     }
   }
-  return { nodes: new Set<string>([focus, ...upstream, ...downstream]), edges: edgeSet, upstream, downstream }
+  const allEdges = new Set<string>([...upEdges, ...downEdges])
+  const allNodes = new Set<string>([focus, ...upstream, ...downstream])
+  return { nodes: allNodes, edges: allEdges, upstream, downstream, upEdges, downEdges }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -424,6 +436,43 @@ function DatabaseCard({ card, onOpen, dark }: {
   )
 }
 
+function DirectionChips({ value, onChange, upCount, downCount, dark }: {
+  value: DirectionFilter
+  onChange: (d: DirectionFilter) => void
+  upCount: number
+  downCount: number
+  dark: boolean
+}) {
+  const total = upCount + downCount
+  const items: Array<{ id: DirectionFilter; label: string; count?: number; activeColor: string }> = [
+    { id: 'all',        label: 'All',        count: total,     activeColor: dark ? 'bg-primary-500/30 text-primary-200 ring-primary-400/40' : 'bg-primary-100 text-primary-800 ring-primary-300' },
+    { id: 'upstream',   label: 'Upstream',   count: upCount,   activeColor: dark ? 'bg-blue-500/30 text-blue-200 ring-blue-400/40'          : 'bg-blue-100 text-blue-800 ring-blue-300' },
+    { id: 'downstream', label: 'Downstream', count: downCount, activeColor: dark ? 'bg-violet-500/30 text-violet-200 ring-violet-400/40'    : 'bg-violet-100 text-violet-800 ring-violet-300' },
+  ]
+  return (
+    <div className="inline-flex items-center gap-1 p-0.5 rounded-lg bg-gray-100 dark:bg-gray-900/50 border border-gray-200 dark:border-gray-700">
+      {items.map(it => {
+        const active = value === it.id
+        return (
+          <button
+            key={it.id}
+            onClick={() => onChange(it.id)}
+            className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+              active
+                ? `${it.activeColor} ring-1`
+                : 'text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-gray-800'
+            }`}
+            title={it.id === 'upstream' ? 'Sources feeding this table' : it.id === 'downstream' ? 'Tables fed by this one' : 'Show both directions'}
+          >
+            {it.label}
+            {it.count != null && <span className="ml-1 opacity-70">{it.count}</span>}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 function EmptyState({ icon: Icon, title, body, action }: {
   icon: any; title: string; body: string; action?: React.ReactNode;
 }) {
@@ -527,10 +576,37 @@ export default function Lineage() {
   }, [highlightQ.data])
   const filterActive = state.workflowId != null && highlightQ.data != null
 
+  // At the table level the API returns focus_fqn — treat that as the implicit
+  // focus so direction highlighting works without requiring a click.
+  const effectiveFocus = state.focusFqn ?? (graphQ.data?.focus_fqn ?? null)
+
   const focusPath = useMemo(() => {
-    if (!state.focusFqn || !graphQ.data) return null
-    return computePath(graphQ.data.edges, state.focusFqn)
-  }, [state.focusFqn, graphQ.data])
+    if (!effectiveFocus || !graphQ.data) return null
+    return computePath(graphQ.data.edges, effectiveFocus)
+  }, [effectiveFocus, graphQ.data])
+
+  // Direction filter applied on top of focusPath: 'upstream' keeps the focus
+  // and every node reachable via edges arriving at the focus; 'downstream'
+  // keeps the focus and everything downstream.
+  const dirFilteredPath = useMemo(() => {
+    if (!focusPath) return null
+    if (state.directionFilter === 'all') return focusPath
+    const focus = effectiveFocus!
+    if (state.directionFilter === 'upstream') {
+      return {
+        nodes: new Set<string>([focus, ...focusPath.upstream]),
+        edges: focusPath.upEdges,
+        upstream: focusPath.upstream, downstream: new Set<string>(),
+        upEdges: focusPath.upEdges, downEdges: new Set<string>(),
+      }
+    }
+    return {
+      nodes: new Set<string>([focus, ...focusPath.downstream]),
+      edges: focusPath.downEdges,
+      upstream: new Set<string>(), downstream: focusPath.downstream,
+      upEdges: new Set<string>(), downEdges: focusPath.downEdges,
+    }
+  }, [focusPath, state.directionFilter, effectiveFocus])
 
   // ── Split tables into "connected" (in a lineage edge) vs "orphans" ────
   const { connectedTables, orphanTables, tableEdges } = useMemo(() => {
@@ -556,7 +632,7 @@ export default function Lineage() {
 
     const { positions } = computeDagreLayout(tables, tableEdges)
 
-    const fp = focusPath
+    const fp = dirFilteredPath
     const wf = filterActive
     const isHighlighted = (n: LineageNode): boolean => {
       if (fp) return fp.nodes.has(n.id)
@@ -569,6 +645,11 @@ export default function Lineage() {
       return false
     }
 
+    // Upstream = blue, downstream = violet, focus = amber ring.
+    const UPSTREAM = dark ? '#60a5fa' : '#2563eb'
+    const DOWNSTREAM = dark ? '#c084fc' : '#7c3aed'
+    const NEUTRAL = dark ? '#94a3b8' : '#64748b'
+
     const rfNodes: Node[] = tables.map(n => ({
       id: n.id,
       type: 'table',
@@ -578,7 +659,7 @@ export default function Lineage() {
         highlighted: isHighlighted(n),
         dimmed: isDimmed(n),
         isOrigin: n.id === highlightSets.originFqn,
-        isFocus: n.id === state.focusFqn,
+        isFocus: n.id === effectiveFocus,
         dark,
         onNodeClick: () => dispatch({ type: 'focus', fqn: state.focusFqn === n.id ? null : n.id }),
         onNodeHover: (hn: LineageNode | null) => { setHoveredNode(hn); setHoveredEdge(null) },
@@ -587,13 +668,19 @@ export default function Lineage() {
     }))
 
     const rfEdges: Edge[] = tableEdges.map(e => {
-      const onPath = fp?.edges.has(e.id) ?? false
+      const onUp = fp?.upEdges.has(e.id) ?? false
+      const onDown = fp?.downEdges.has(e.id) ?? false
+      const onPath = onUp || onDown
       const wfBoth = wf && highlightSets.nodeFqns.has(e.source) && highlightSets.nodeFqns.has(e.target)
       const isThick = onPath || wfBoth
       const isDimmedE = (fp && !onPath) || (wf && !wfBoth && !fp)
-      const stroke = isThick
-        ? (dark ? '#60a5fa' : '#2563eb')
-        : (dark ? '#94a3b8' : '#64748b')
+      const stroke = onUp
+        ? UPSTREAM
+        : onDown
+          ? DOWNSTREAM
+          : wfBoth
+            ? UPSTREAM
+            : NEUTRAL
       return {
         id: e.id,
         source: e.source,
@@ -610,7 +697,7 @@ export default function Lineage() {
     })
 
     return { rfNodes, rfEdges }
-  }, [state.view.level, connectedTables, tableEdges, dark, filterActive, highlightSets, focusPath, state.focusFqn])
+  }, [state.view.level, connectedTables, tableEdges, dark, filterActive, highlightSets, dirFilteredPath, effectiveFocus, state.focusFqn])
 
   const activeDatabase = state.view.level !== 'picker' ? state.view.database : null
   const method = graphQ.data?.discovery_method ?? statusQ.data?.databases[0]?.discovery_method_used ?? null
@@ -741,6 +828,39 @@ export default function Lineage() {
               <button onClick={() => dispatch({ type: 'focus', fqn: null })} className="ml-1"><X className="w-3 h-3" /></button>
             </span>
           )}
+
+          {/* Direction filter + upstream/downstream counts. Visible whenever
+              we have a focus (explicit or implicit at the table level). */}
+          {effectiveFocus && focusPath && (
+            <DirectionChips
+              value={state.directionFilter}
+              onChange={(d) => dispatch({ type: 'setDirection', direction: d })}
+              upCount={focusPath.upstream.size}
+              downCount={focusPath.downstream.size}
+              dark={dark}
+            />
+          )}
+
+          {/* Hops stepper — only at the table level */}
+          {state.view.level === 'table' && (() => {
+            const hops = state.view.hops
+            return (
+              <div className="inline-flex items-center gap-1 text-xs" title="How many lineage hops to walk from the focus table (1–10)">
+                <span className="text-gray-500 dark:text-gray-400">hops</span>
+                <button
+                  onClick={() => dispatch({ type: 'setHops', hops: hops - 1 })}
+                  disabled={hops <= 1}
+                  className="px-1.5 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40"
+                >−</button>
+                <span className="w-5 text-center font-semibold text-gray-800 dark:text-gray-100">{hops}</span>
+                <button
+                  onClick={() => dispatch({ type: 'setHops', hops: hops + 1 })}
+                  disabled={hops >= 10}
+                  className="px-1.5 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40"
+                >+</button>
+              </div>
+            )
+          })()}
         </div>
 
         <div className="h-6 w-px bg-gray-200 dark:bg-gray-700" />
@@ -907,14 +1027,6 @@ export default function Lineage() {
               onEdgeMouseLeave={() => setHoveredEdge(null)}
             >
               <Background color={dark ? '#374151' : '#e5e7eb'} gap={16} />
-              <MiniMap
-                className="!bg-gray-100 dark:!bg-gray-900"
-                nodeColor={(n) => {
-                  const d = n.data as unknown as NodeData
-                  return healthColor(d.health_score, dark)
-                }}
-                maskColor={dark ? 'rgba(31,41,55,0.7)' : 'rgba(249,250,251,0.7)'}
-              />
               <Controls className="!bg-white dark:!bg-gray-700 !border-gray-200 dark:!border-gray-600" />
             </ReactFlow>
 
@@ -923,9 +1035,15 @@ export default function Lineage() {
               onClose={() => { setHoveredNode(null); setHoveredEdge(null) }}
             />
 
-            {state.focusFqn && (
-              <div className="absolute bottom-3 left-3 text-[11px] bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-2 py-1 text-gray-700 dark:text-gray-200 shadow z-10">
-                Tracing {state.focusFqn.split('.').slice(-1)[0]} · click empty space to reset
+            {effectiveFocus && focusPath && (
+              <div className="absolute bottom-3 left-3 text-[11px] bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-2 py-1 text-gray-700 dark:text-gray-200 shadow z-10 flex items-center gap-2">
+                <span>
+                  {state.focusFqn ? 'Tracing' : 'Focus'} <span className="font-semibold">{effectiveFocus.split('.').slice(-1)[0]}</span>
+                </span>
+                <span className="text-gray-400 dark:text-gray-500">·</span>
+                <span className="inline-flex items-center gap-0.5"><span className="w-2 h-0.5 rounded" style={{ background: dark ? '#60a5fa' : '#2563eb' }} /> {focusPath.upstream.size} up</span>
+                <span className="inline-flex items-center gap-0.5"><span className="w-2 h-0.5 rounded" style={{ background: dark ? '#c084fc' : '#7c3aed' }} /> {focusPath.downstream.size} down</span>
+                {state.focusFqn && <span className="text-gray-400 dark:text-gray-500">· click empty space to reset</span>}
               </div>
             )}
           </div>
@@ -970,7 +1088,10 @@ export default function Lineage() {
           <LegendBorder color="#0ea5e9" label="Dynamic table" />
           <LegendBorder color="#a855f7" label="Stage / external" />
           <span className="w-px h-4 bg-gray-200 dark:bg-gray-700" />
-          <span>Top-of-card colour = schema · click a table to trace its path.</span>
+          <LegendLine color={dark ? '#60a5fa' : '#2563eb'} label="Upstream" />
+          <LegendLine color={dark ? '#c084fc' : '#7c3aed'} label="Downstream" />
+          <span className="w-px h-4 bg-gray-200 dark:bg-gray-700" />
+          <span>Click a table to trace · use the Upstream / Downstream chips to focus one side.</span>
         </div>
       )}
     </div>
@@ -1038,7 +1159,7 @@ function PageHeader() {
         <Waypoints className="w-6 h-6 text-primary-500" /> Data Lineage
       </h1>
       <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-        Pick a database to see how data flows through it — tables laid out left-to-right in dependency order. Click a table to trace its full upstream and downstream path. Hover for health, findings, and rule details.
+        Pick a database to see how data flows through it — tables laid out left-to-right in dependency order. Click a table to trace its path, then toggle Upstream / Downstream to focus one side. Hover for health, findings, and rule details.
       </p>
     </div>
   )
@@ -1056,6 +1177,14 @@ function LegendBorder({ color, label }: { color: string; label: string }) {
   return (
     <span className="inline-flex items-center gap-1.5">
       <span className="inline-block w-3 h-3 rounded-sm bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-600" style={{ borderLeftWidth: 3, borderLeftColor: color }} />
+      {label}
+    </span>
+  )
+}
+function LegendLine({ color, label }: { color: string; label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className="inline-block w-4 h-0.5 rounded" style={{ background: color }} />
       {label}
     </span>
   )

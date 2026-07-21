@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional, Set
 from app.services import storage
 from app.services.dynamic_rules import run_dynamic_checks, DYNAMIC_RULE_HANDLER_KEYS
+from app.services.schema_drift import DRIFT_HANDLER_KEYS
 from app.services.snowflake_session import session as sf_session
 import logging
 
@@ -76,18 +77,20 @@ class RuleEngine:
         _HANDLERS dispatch table (missing_table_comment/owner, missing_
         column_comment — the only 3 keys with a method here). Instances
         whose handler_key belongs to dynamic_rules.py (PII, nullable-ID,
-        type-mismatch, etc.) are excluded — they're real checks, just
-        executed via run_dynamic_checks() in execute_all_rules() instead of
-        this dispatch table, so including them here would only ever produce
-        a "no handler found" warning for a check that DOES run, elsewhere.
-        If allowed_rule_codes is given, only runs instances whose HANDLER_KEY
-        (upper-cased) is in that set.
+        type-mismatch, etc.) or schema_drift.py (column_added/removed/
+        type_changed/nullability_changed/table_removed) are excluded — they're
+        real checks, just executed elsewhere (run_dynamic_checks in
+        execute_all_rules; scan_service for drift), so including them here
+        would only ever produce a "no handler found" warning for a check
+        that DOES run, elsewhere. If allowed_rule_codes is given, only runs
+        instances whose HANDLER_KEY (upper-cased) is in that set.
         """
         findings = []
         instances = [
             i for i in self.get_active_instances(asset.asset_type)
             if i.check_kind == "python_handler"
             and (i.handler_key or "").lower() not in DYNAMIC_RULE_HANDLER_KEYS
+            and (i.handler_key or "").lower() not in DRIFT_HANDLER_KEYS
         ]
 
         if allowed_rule_codes is not None:

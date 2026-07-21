@@ -285,6 +285,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent()
             agent._closed_set_columns = {}
+            agent._source = None
         return agent, mock_sf
 
     def test_valid_query_returns_formatted_rows(self):
@@ -297,6 +298,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             table = _fake_table("MYDB.MYSCH.ORDERS")
             inputs = {
@@ -318,6 +320,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             table = _fake_table()
             inputs = {"where_clause": "1=1 UNION SELECT * FROM OTHER_TABLE", "reason": "injection attempt"}
@@ -332,6 +335,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             table = _fake_table()
             inputs = {"where_clause": "1=1; DROP TABLE ORDERS", "reason": "bad actor"}
@@ -346,6 +350,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             table = _fake_table()
             inputs = {"where_clause": "AMOUNT < 0; --", "reason": "comment injection"}
@@ -360,6 +365,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent, _SAMPLE_MAX_ROWS
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             table = _fake_table()
             inputs = {"limit": 999, "reason": "greedy"}
@@ -374,6 +380,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             result = agent._execute_sample_tool(_fake_table(), {"reason": "test"})
 
@@ -385,6 +392,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             result = agent._execute_sample_tool(_fake_table(), {"reason": "test"})
 
@@ -397,6 +405,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             agent._execute_sample_tool(
                 _fake_table(),
@@ -414,6 +423,7 @@ class TestExecuteSampleTool(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             agent._execute_sample_tool(
                 _fake_table(),
@@ -452,116 +462,167 @@ class TestSelfCritiqueProposals(unittest.TestCase):
             for i in range(n)
         ]
 
+    def _existing_reuse_proposals(self, n=3):
+        """Existing-reuse proposals (definition_id set, no new_definition) —
+        these are the ones that actually go through the critique. Novel
+        proposals bypass it by design."""
+        return [
+            {
+                "definition_id": f"def-{i}",
+                "new_definition": None,
+                "scope": "column",
+                "column_name": f"COL_{i}",
+                "template_shape": "not_null",
+                "threshold_config": {},
+                "severity": "medium",
+                "violation_detected": False,
+                "rationale": f"Rationale {i}",
+            }
+            for i in range(n)
+        ]
+
     def test_all_kept_when_scores_above_threshold(self):
         """All proposals with mean >= 3 are kept."""
-        proposals = self._proposals(2)
-        scores_response = json.dumps({
+        proposals = self._existing_reuse_proposals(2)
+        scores_response = {
             "scores": [
                 {"index": 0, "evidence": 4, "impact": 4, "approval": 4, "drop_reason": None},
                 {"index": 1, "evidence": 3, "impact": 3, "approval": 3, "drop_reason": None},
             ]
-        })
+        }
 
         agent = self._agent()
-        with patch("app.services.agents.rule_intelligence_agent.ask_claude", return_value=scores_response):
+        with patch("app.services.agents.rule_intelligence_agent.ask_claude_json", return_value=scores_response):
             result = agent._self_critique_proposals(
                 proposals=proposals,
                 table_asset=_fake_table(),
                 column_stats_text="COL_0  null%=0  distinct=50",
+                run_id="run-x",
+                min_score=3.0,
             )
 
         self.assertEqual(len(result), 2)
 
     def test_weak_proposals_dropped(self):
-        """Proposals with mean < 3.0 are removed from the list."""
-        proposals = self._proposals(3)
-        scores_response = json.dumps({
+        """Proposals with mean < min_score are removed from the list."""
+        proposals = self._existing_reuse_proposals(3)
+        scores_response = {
             "scores": [
                 {"index": 0, "evidence": 5, "impact": 5, "approval": 5, "drop_reason": None},
-                # index 1: mean = (1+1+1)/3 = 1.0 → dropped
+                # index 1: mean = 1.0 → dropped
                 {"index": 1, "evidence": 1, "impact": 1, "approval": 1,
                  "drop_reason": "no evidence in stats"},
-                # index 2: mean = (2+2+2)/3 = 2.0 → dropped (< 3)
+                # index 2: mean = 2.0 → dropped when min_score=3
                 {"index": 2, "evidence": 2, "impact": 2, "approval": 2,
                  "drop_reason": "speculative"},
             ]
-        })
+        }
 
         agent = self._agent()
-        with patch("app.services.agents.rule_intelligence_agent.ask_claude", return_value=scores_response):
+        with patch("app.services.agents.rule_intelligence_agent.ask_claude_json", return_value=scores_response), \
+             patch("app.services.agents.rule_intelligence_agent.storage") as mock_storage:
             result = agent._self_critique_proposals(
                 proposals=proposals,
                 table_asset=_fake_table(),
                 column_stats_text="",
+                run_id="run-x",
+                min_score=3.0,
             )
 
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["new_definition"]["name"], "Check 0")
+        self.assertEqual(result[0]["definition_id"], "def-0")
+        # dropped proposals are logged to RULE_CRITIQUE_DROPS
+        self.assertEqual(mock_storage.log_critique_drop.call_count, 2)
 
     def test_boundary_score_exactly_3_is_kept(self):
-        """Mean == 3.0 exactly is kept (>= threshold)."""
-        proposals = self._proposals(1)
-        scores_response = json.dumps({
+        """Mean == threshold exactly is kept (>= threshold)."""
+        proposals = self._existing_reuse_proposals(1)
+        scores_response = {
             "scores": [{"index": 0, "evidence": 3, "impact": 3, "approval": 3, "drop_reason": None}]
-        })
+        }
 
         agent = self._agent()
-        with patch("app.services.agents.rule_intelligence_agent.ask_claude", return_value=scores_response):
-            result = agent._self_critique_proposals(proposals, _fake_table(), "")
+        with patch("app.services.agents.rule_intelligence_agent.ask_claude_json", return_value=scores_response):
+            result = agent._self_critique_proposals(proposals, _fake_table(), "", run_id="run-x", min_score=3.0)
 
         self.assertEqual(len(result), 1)
 
     def test_parse_failure_keeps_all_proposals(self):
-        """If the critique call returns unparseable JSON, all proposals are kept."""
-        proposals = self._proposals(3)
+        """If the critique call returns None (unparseable JSON), all proposals are kept."""
+        proposals = self._existing_reuse_proposals(3)
 
         agent = self._agent()
-        with patch("app.services.agents.rule_intelligence_agent.ask_claude", return_value="not json at all"):
-            result = agent._self_critique_proposals(proposals, _fake_table(), "")
+        with patch("app.services.agents.rule_intelligence_agent.ask_claude_json", return_value=None):
+            result = agent._self_critique_proposals(proposals, _fake_table(), "", run_id="run-x")
 
         self.assertEqual(len(result), 3)
 
     def test_empty_proposals_returns_empty(self):
         agent = self._agent()
-        with patch("app.services.agents.rule_intelligence_agent.ask_claude") as mock_ask:
-            result = agent._self_critique_proposals([], _fake_table(), "")
+        with patch("app.services.agents.rule_intelligence_agent.ask_claude_json") as mock_ask:
+            result = agent._self_critique_proposals([], _fake_table(), "", run_id="run-x")
         mock_ask.assert_not_called()
         self.assertEqual(result, [])
 
     def test_missing_score_entry_keeps_proposal(self):
         """If the critique omits an index, that proposal survives (safe default)."""
-        proposals = self._proposals(2)
-        scores_response = json.dumps({
+        proposals = self._existing_reuse_proposals(2)
+        scores_response = {
             "scores": [
                 # Only index 0 scored; index 1 missing → kept by default
                 {"index": 0, "evidence": 5, "impact": 5, "approval": 5, "drop_reason": None},
             ]
-        })
+        }
 
         agent = self._agent()
-        with patch("app.services.agents.rule_intelligence_agent.ask_claude", return_value=scores_response):
-            result = agent._self_critique_proposals(proposals, _fake_table(), "")
+        with patch("app.services.agents.rule_intelligence_agent.ask_claude_json", return_value=scores_response):
+            result = agent._self_critique_proposals(proposals, _fake_table(), "", run_id="run-x")
 
         self.assertEqual(len(result), 2)
 
     def test_critique_call_receives_all_proposals(self):
         """The prompt sent to Claude contains all proposal names."""
-        proposals = self._proposals(2)
-        scores_response = json.dumps({
+        proposals = self._existing_reuse_proposals(2)
+        scores_response = {
             "scores": [
                 {"index": 0, "evidence": 4, "impact": 4, "approval": 4, "drop_reason": None},
                 {"index": 1, "evidence": 4, "impact": 4, "approval": 4, "drop_reason": None},
             ]
-        })
+        }
 
         agent = self._agent()
-        with patch("app.services.agents.rule_intelligence_agent.ask_claude", return_value=scores_response) as mock_ask:
-            agent._self_critique_proposals(proposals, _fake_table(), "COL_0 null%=5")
+        with patch("app.services.agents.rule_intelligence_agent.ask_claude_json", return_value=scores_response) as mock_ask:
+            agent._self_critique_proposals(proposals, _fake_table(), "COL_0 null%=5", run_id="run-x")
 
         prompt_sent = mock_ask.call_args[0][0]
-        self.assertIn("Check 0", prompt_sent)
-        self.assertIn("Check 1", prompt_sent)
+        self.assertIn("def-0", prompt_sent)
+        self.assertIn("def-1", prompt_sent)
         self.assertIn("COL_0 null%=5", prompt_sent)
+
+    def test_novel_proposals_bypass_critique(self):
+        """New: novel proposals (definition_id=None + new_definition set) skip
+        the critique entirely — they're kept without being scored."""
+        proposals = [
+            {
+                "definition_id": None,
+                "new_definition": {"name": "Check N", "category": "data_quality", "description": "desc"},
+                "scope": "column",
+                "column_name": "COL",
+                "template_shape": "not_null",
+                "threshold_config": {},
+                "severity": "medium",
+                "violation_detected": False,
+                "rationale": "rationale",
+            }
+        ]
+
+        agent = self._agent()
+        with patch("app.services.agents.rule_intelligence_agent.ask_claude_json") as mock_ask:
+            result = agent._self_critique_proposals(proposals, _fake_table(), "",
+                                                    run_id="run-x", min_score=3.0)
+        # No call to Claude — nothing to score, everything is novel
+        mock_ask.assert_not_called()
+        self.assertEqual(len(result), 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -586,6 +647,7 @@ class TestRepairDraftSql(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             result = agent._repair_draft_sql(
                 draft_sql="SELECT bad_column FROM ORDERS",
@@ -608,6 +670,7 @@ class TestRepairDraftSql(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             result = agent._repair_draft_sql(
                 draft_sql="bad", errors="err",
@@ -627,6 +690,7 @@ class TestRepairDraftSql(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             result = agent._repair_draft_sql(
                 draft_sql="bad", errors="err",
@@ -649,6 +713,7 @@ class TestRepairDraftSql(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             agent._repair_draft_sql(
                 draft_sql=original_sql,
@@ -687,6 +752,7 @@ class TestRepairDraftSql(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             sql, tc = agent._build_rule_sql(
                 candidate={"draft_sql": bad_sql, "threshold_config": {}},
@@ -704,6 +770,7 @@ class TestRepairDraftSql(unittest.TestCase):
             from app.services.agents.rule_intelligence_agent import RuleIntelligenceAgent
             agent = RuleIntelligenceAgent.__new__(RuleIntelligenceAgent)
             agent._closed_set_columns = {}
+            agent._source = None
 
             sql, tc = agent._build_rule_sql(
                 candidate={"draft_sql": "bad sql", "threshold_config": {}},

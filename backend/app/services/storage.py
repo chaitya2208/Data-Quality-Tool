@@ -1579,9 +1579,77 @@ def get_agent_run(run_id: str, with_tasks: bool = True) -> Optional[SimpleNamesp
     return _agent_run_from_row(rows[0], tasks=tasks)
 
 
-def list_agent_runs(limit: int = 20) -> list[SimpleNamespace]:
+def _agent_runs_where(
+    status: str | None = None,
+    origin: str | None = None,
+    database: str | None = None,
+    schema_name: str | None = None,
+    table: str | None = None,
+    search: str | None = None,
+    connection_id: str | None = None,
+) -> tuple[str, dict]:
+    """Build a reusable WHERE clause + params for agent-run queries."""
+    clauses = []
+    params: dict = {}
+    if status:
+        clauses.append("STATUS = %(status)s")
+        params["status"] = status
+    if origin == "scheduled":
+        clauses.append("SCHEDULE_ID IS NOT NULL")
+    elif origin == "manual":
+        clauses.append("SCHEDULE_ID IS NULL")
+    if database:
+        clauses.append("DATABASE_NAME = %(database)s")
+        params["database"] = database
+    if schema_name:
+        clauses.append("SCHEMA_NAME = %(schema_name)s")
+        params["schema_name"] = schema_name
+    if table:
+        clauses.append("TABLE_NAME = %(table)s")
+        params["table"] = table
+    if search:
+        clauses.append(
+            "(LOWER(DATABASE_NAME) LIKE %(search)s OR LOWER(SCHEMA_NAME) LIKE %(search)s OR LOWER(TABLE_NAME) LIKE %(search)s)"
+        )
+        params["search"] = f"%{search.lower()}%"
+    if connection_id:
+        clauses.append("CONNECTION_ID = %(connection_id)s")
+        params["connection_id"] = connection_id
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def count_agent_runs(
+    status: str | None = None,
+    origin: str | None = None,
+    database: str | None = None,
+    schema_name: str | None = None,
+    table: str | None = None,
+    search: str | None = None,
+    connection_id: str | None = None,
+) -> int:
+    where, params = _agent_runs_where(status, origin, database, schema_name, table, search, connection_id)
+    rows = sf_session.query(f"SELECT COUNT(*) AS CNT FROM AGENT_RUNS {where}", params)
+    return int(rows[0]["CNT"]) if rows else 0
+
+
+def list_agent_runs(
+    limit: int = 20,
+    offset: int = 0,
+    status: str | None = None,
+    origin: str | None = None,
+    database: str | None = None,
+    schema_name: str | None = None,
+    table: str | None = None,
+    search: str | None = None,
+    connection_id: str | None = None,
+) -> list[SimpleNamespace]:
+    where, params = _agent_runs_where(status, origin, database, schema_name, table, search, connection_id)
+    params["limit"] = limit
+    params["offset"] = offset
     rows = sf_session.query(
-        "SELECT * FROM AGENT_RUNS ORDER BY CREATED_AT DESC LIMIT %(limit)s", {"limit": limit}
+        f"SELECT * FROM AGENT_RUNS {where} ORDER BY CREATED_AT DESC LIMIT %(limit)s OFFSET %(offset)s",
+        params,
     )
     result = []
     for r in rows:
@@ -1590,6 +1658,73 @@ def list_agent_runs(limit: int = 20) -> list[SimpleNamespace]:
         except Exception as e:
             logger.warning(f"[storage] Skipping malformed run {r.get('ID')}: {e}")
     return result
+
+
+def list_agent_run_filter_options() -> dict:
+    """Distinct databases, schemas, and tables that appear in AGENT_RUNS,
+    used to populate the cascading filter dropdowns in the Run History UI."""
+    rows = sf_session.query(
+        "SELECT DISTINCT DATABASE_NAME, SCHEMA_NAME, TABLE_NAME FROM AGENT_RUNS "
+        "WHERE DATABASE_NAME IS NOT NULL ORDER BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME"
+    )
+    databases: list[str] = []
+    schemas: dict[str, list[str]] = {}
+    tables: dict[str, list[str]] = {}
+    seen_db: set = set()
+    for r in rows:
+        db = r.get("DATABASE_NAME") or ""
+        sc = r.get("SCHEMA_NAME") or ""
+        tb = r.get("TABLE_NAME") or ""
+        if db and db not in seen_db:
+            databases.append(db)
+            seen_db.add(db)
+        if db and sc:
+            schemas.setdefault(db, [])
+            if sc not in schemas[db]:
+                schemas[db].append(sc)
+        if db and sc and tb:
+            key = f"{db}.{sc}"
+            tables.setdefault(key, [])
+            if tb not in tables[key]:
+                tables[key].append(tb)
+    return {"databases": databases, "schemas": schemas, "tables": tables}
+
+
+def recover_orphaned_runs() -> int:
+    """Mark any AGENT_RUNS still stuck in 'running' as 'failed'.
+
+    Called once at server startup. A run left in 'running' means the process
+    was killed (restart, OOM, etc.) while a background thread was executing
+    the pipeline — daemon threads die silently, so the DB row never gets
+    updated. Without this, those rows show 'Running' in the UI forever and,
+    if they were part of a batch, the batch never advances to the next table.
+
+    Returns the number of runs recovered.
+    """
+    rows = sf_session.query(
+        "SELECT ID, BATCH_ID FROM AGENT_RUNS WHERE STATUS = 'running'"
+    )
+    if not rows:
+        return 0
+    for r in rows:
+        run_id = r["ID"]
+        sf_session.execute(
+            "UPDATE AGENT_RUNS SET STATUS = 'failed', "
+            "COMPLETED_AT = CURRENT_TIMESTAMP(), "
+            "ERROR_MESSAGE = 'Server restart: run was interrupted mid-execution.' "
+            "WHERE ID = %(id)s",
+            {"id": run_id},
+        )
+        # Mark any still-running tasks as failed too
+        sf_session.execute(
+            "UPDATE AGENT_TASKS SET STATUS = 'failed', "
+            "COMPLETED_AT = CURRENT_TIMESTAMP(), "
+            "ERROR_MESSAGE = 'Server restart: parent run was interrupted.' "
+            "WHERE RUN_ID = %(run_id)s AND STATUS = 'running'",
+            {"run_id": run_id},
+        )
+        logger.info(f"[storage] Recovered orphaned run {run_id}")
+    return len(rows)
 
 
 def list_agent_runs_by_batch(batch_id: str) -> list[SimpleNamespace]:

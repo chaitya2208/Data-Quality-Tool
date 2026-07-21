@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { assetsApi, agentRunsApi, findingsApi } from '../api/client'
-import type { AgentTask, RuleReviewEntry } from '../api/client'
+import { assetsApi, agentRunsApi, findingsApi, profilingApi } from '../api/client'
+import type { AgentTask, RuleReviewEntry, ColumnMeta } from '../api/client'
 import { useConnection } from '../ConnectionContext'
 import {
   GitBranch, Database, BrainCircuit, Shield, AlertCircle,
@@ -381,6 +381,19 @@ export default function AgentWorkflow() {
   // the user can just uncheck the ones they don't want to keep.
   const [ruleSelection, setRuleSelection] = useState<Record<string, boolean>>({})
   const [ruleSelInitRunId, setRuleSelInitRunId] = useState<string | null>(null)
+  // Activation modal for "Available in Library" — captures column / thresholds
+  // for a definition before creating a pending instance for this run.
+  const [activateTarget, setActivateTarget] = useState<UnusedLibraryEntry | null>(null)
+  const [activateColumn, setActivateColumn] = useState('')
+  const [activateThresholds, setActivateThresholds] = useState<Record<string, string>>({})
+  const [activateError, setActivateError] = useState<string | null>(null)
+  // Multi-column shapes (duplicate_key) — picked columns form a composite key.
+  const [activateColumns, setActivateColumns] = useState<string[]>([])
+  // Cross-table shapes (referential_integrity) — the referenced table+column.
+  const [activateRefDatabase, setActivateRefDatabase] = useState('')
+  const [activateRefSchema, setActivateRefSchema] = useState('')
+  const [activateRefTable, setActivateRefTable] = useState('')
+  const [activateRefColumn, setActivateRefColumn] = useState('')
 
   const { data: databases } = useQuery({
     queryKey: ['databases', connId],
@@ -526,6 +539,178 @@ export default function AgentWorkflow() {
       queryClient.invalidateQueries({ queryKey: ['workflows'] })
     },
   })
+
+  // Column list for the activation modal — only fetched while a run is in
+  // review mode (the only time the modal can be opened). Keyed by the run's
+  // target so it isn't re-fetched between renders of the same run.
+  const { data: runColumns } = useQuery({
+    queryKey: ['run-columns', activeRun?.database, activeRun?.schema_name, activeRun?.table, activeRun?.connection_id],
+    queryFn: () => profilingApi.columns(
+      activeRun!.database, activeRun!.schema_name, activeRun!.table, activeRun!.connection_id,
+    ).then(r => r.data.columns),
+    enabled: !!activeRun && activeRun.status === 'awaiting_rule_review',
+    staleTime: 5 * 60 * 1000,
+  })
+
+  const activateLibraryMutation = useMutation({
+    mutationFn: (payload: { definition_id: string; target_config: Record<string, any>; threshold_config?: Record<string, any> }) =>
+      agentRunsApi.activateLibrary(activeRunId!, payload).then(r => r.data),
+    onSuccess: (run) => {
+      // Server returns the updated run — sync its review state into local
+      // editable copies so the entry shows in Active and disappears from
+      // Available immediately, without waiting for the next poll.
+      const state = run.instance_review_state
+      if (state) {
+        setReviewActive(state.active || [])
+        setReviewSkipped(state.skipped || [])
+        setReviewUnusedLibrary((state.unused_library as UnusedLibraryEntry[]) || [])
+      }
+      setActivateTarget(null)
+      setActivateColumn('')
+      setActivateColumns([])
+      setActivateRefDatabase('')
+      setActivateRefSchema('')
+      setActivateRefTable('')
+      setActivateRefColumn('')
+      setActivateThresholds({})
+      setActivateError(null)
+      queryClient.invalidateQueries({ queryKey: ['agent-run', activeRunId] })
+    },
+    onError: (err: any) => {
+      setActivateError(err?.response?.data?.detail || 'Failed to activate rule')
+    },
+  })
+
+  // Which threshold fields a template shape needs. Kept in sync with
+  // TEMPLATE_SHAPES on the backend. Empty array = no threshold input needed.
+  const thresholdFieldsForShape = (shape?: string | null): Array<{ key: string; label: string; type: 'number' | 'text' | 'csv'; required?: boolean }> => {
+    switch (shape) {
+      case 'accepted_values':  return [{ key: 'accepted_values', label: 'Accepted values (comma-separated)', type: 'csv', required: true }]
+      case 'range':            return [
+        { key: 'min_value', label: 'Min value (optional)', type: 'number' },
+        { key: 'max_value', label: 'Max value (optional)', type: 'number' },
+      ]
+      case 'regex_match':      return [{ key: 'pattern', label: 'Regex pattern', type: 'text', required: true }]
+      case 'freshness':        return [{ key: 'max_age_hours', label: 'Max age (hours)', type: 'number', required: true }]
+      default:                 return []
+    }
+  }
+
+  // Scope classifier — kept in sync with backend TEMPLATE_SHAPES so the modal
+  // shows the right inputs. 'table' is the fallback for python_handler /
+  // definitions with no template shape (activated with empty target_config).
+  const shapeScope = (shape?: string | null): 'column' | 'multi_column' | 'cross_table' | 'anomaly' | 'table' => {
+    switch (shape) {
+      case 'not_null':
+      case 'uniqueness':
+      case 'accepted_values':
+      case 'range':
+      case 'regex_match':
+      case 'freshness':                return 'column'
+      case 'duplicate_key':            return 'multi_column'
+      case 'referential_integrity':    return 'cross_table'
+      case 'metric_anomaly':
+      case 'metric_relative_change':
+      case 'category_disappeared':     return 'anomaly'
+      default:                          return 'table'
+    }
+  }
+
+  // ── Cross-table ref side: cascading db/schema/table/column pickers ──
+  // Each depends on the previous selection, mirrors the target-picker in
+  // the scan-scope selector at the top of the page.
+  const { data: refDatabases } = useQuery({
+    queryKey: ['ref-databases', connId, !!activateTarget && shapeScope(activateTarget?.template_shape) === 'cross_table'],
+    queryFn: () => assetsApi.discoverDatabases(connId).then(r => r.data),
+    enabled: !!activateTarget && shapeScope(activateTarget?.template_shape) === 'cross_table',
+    staleTime: 5 * 60 * 1000,
+  })
+  const { data: refSchemas } = useQuery({
+    queryKey: ['ref-schemas', connId, activateRefDatabase],
+    queryFn: () => assetsApi.discoverSchemas(activateRefDatabase, connId).then(r => r.data),
+    enabled: !!activateTarget && shapeScope(activateTarget?.template_shape) === 'cross_table' && !!activateRefDatabase,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  })
+  const { data: refTables } = useQuery({
+    queryKey: ['ref-tables', connId, activateRefDatabase, activateRefSchema],
+    queryFn: () => assetsApi.discoverTables(activateRefDatabase, activateRefSchema, connId).then(r => r.data),
+    enabled: !!activateTarget && shapeScope(activateTarget?.template_shape) === 'cross_table' && !!activateRefDatabase && !!activateRefSchema,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  })
+  const { data: refColumns } = useQuery({
+    queryKey: ['ref-columns', connId, activateRefDatabase, activateRefSchema, activateRefTable],
+    queryFn: () => profilingApi.columns(activateRefDatabase, activateRefSchema, activateRefTable, connId).then(r => r.data.columns),
+    enabled: !!activateTarget && shapeScope(activateTarget?.template_shape) === 'cross_table' && !!activateRefDatabase && !!activateRefSchema && !!activateRefTable,
+    staleTime: 5 * 60 * 1000,
+  })
+
+  const submitActivate = () => {
+    if (!activateTarget) return
+    setActivateError(null)
+
+    const shape = activateTarget.template_shape
+    const scope = shapeScope(shape)
+    const target_config: Record<string, any> = {}
+
+    if (scope === 'column') {
+      if (!activateColumn) {
+        setActivateError('Please pick a column')
+        return
+      }
+      target_config.column = activateColumn
+    } else if (scope === 'multi_column') {
+      if (activateColumns.length < 2) {
+        setActivateError('Pick at least 2 columns for a composite key')
+        return
+      }
+      target_config.columns = activateColumns
+    } else if (scope === 'cross_table') {
+      if (!activateColumn) {
+        setActivateError('Pick the source column to check')
+        return
+      }
+      if (!activateRefDatabase || !activateRefSchema || !activateRefTable || !activateRefColumn) {
+        setActivateError('Pick the referenced database, schema, table, and column')
+        return
+      }
+      target_config.column = activateColumn
+      target_config.ref_database = activateRefDatabase
+      target_config.ref_schema = activateRefSchema
+      target_config.ref_table = activateRefTable
+      target_config.ref_column = activateRefColumn
+    } else if (scope === 'anomaly') {
+      // Anomaly rules need an asset_id + metric_name from METRIC_BASELINES
+      // (populated by prior scans). Manually configuring one from this
+      // panel would ship a broken instance — surface a clear message and
+      // send the user to Rule Library, which has the asset picker.
+      setActivateError('Anomaly rules must be configured in Rule Library after at least 14 scans have populated the baseline for this table.')
+      return
+    }
+    // scope === 'table' → nothing to add; python_handler runs table-wide.
+
+    const threshold_config: Record<string, any> = {}
+    for (const f of thresholdFieldsForShape(shape)) {
+      const raw = (activateThresholds[f.key] || '').trim()
+      if (!raw) {
+        if (f.required) {
+          setActivateError(`${f.label} is required`)
+          return
+        }
+        continue
+      }
+      if (f.type === 'number') threshold_config[f.key] = Number(raw)
+      else if (f.type === 'csv') threshold_config[f.key] = raw.split(',').map(v => v.trim()).filter(Boolean)
+      else threshold_config[f.key] = raw
+    }
+
+    activateLibraryMutation.mutate({
+      definition_id: activateTarget.definition_id,
+      target_config,
+      threshold_config,
+    })
+  }
 
   // Sync server instance_review_state → local editable state when run enters review
   const serverReviewState = activeRun?.instance_review_state
@@ -1097,7 +1282,7 @@ export default function AgentWorkflow() {
                       </>
                     )
                   })()}
-                  {' '}Approve or reject AI-generated rules, activate skipped ones, edit new rules, or select several and use bulk actions. Then click Run Pipeline. You can also add more rules by activating them from Available in Library.
+                  {' '}Approve or reject AI-generated rules, edit new rules, or select several and use bulk actions. The right column shows rules that were active last time but are now skipped, plus other library rules you can activate on this table. Then click Run Pipeline.
                 </p>
               </div>
               <button
@@ -1331,144 +1516,417 @@ export default function AgentWorkflow() {
               </div>
             </div>
 
-            {/* Skipped Rules column */}
+            {/* Right column — one "Skipped Rules" panel mirroring the Active
+                Rules layout on the left, with two bifurcated subsections
+                inside: previously-active-now-skipped, and library rules not
+                yet applied to this table. */}
             <div className="p-5">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />
-                  Skipped Rules ({reviewSkipped.length})
-                </h3>
-              </div>
-              {selectedSkippedIds.size > 0 && (
-                <div className="mb-2 flex items-center gap-2 bg-green-50 dark:bg-green-950/40 border border-green-200 dark:border-green-500/40 rounded-lg px-3 py-1.5">
-                  <span className="text-xs font-medium text-green-800 dark:text-green-300">{selectedSkippedIds.size} selected</span>
-                  <button
-                    onClick={() => bulkActivate(selectedSkippedIds)}
-                    className="ml-auto flex items-center gap-1 text-xs px-2.5 py-1 bg-green-600 text-white rounded hover:bg-green-700"
-                  >
-                    <CheckCircle2 className="w-3 h-3" />Activate Selected
-                  </button>
-                  <button
-                    onClick={() => setSelectedSkippedIds(new Set())}
-                    className="text-xs px-2 py-1 text-green-400 hover:text-green-700"
-                  >
-                    Clear
-                  </button>
-                </div>
-              )}
-              <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
-                {reviewSkipped.map(rule => (
-                  <div key={rule.instance_id} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-3 text-sm opacity-75">
-                    <div className="flex items-start justify-between gap-2">
-                      <input
-                        type="checkbox"
-                        checked={selectedSkippedIds.has(rule.instance_id)}
-                        onChange={() => toggleSkippedSelected(rule.instance_id)}
-                        className="mt-1 flex-shrink-0"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
-                          {rule.is_new_definition ? (
-                            <span className="text-xs bg-purple-200 text-purple-700 px-1.5 py-0.5 rounded font-medium">New concept</span>
-                          ) : rule.is_new_instance ? (
-                            <span className="text-xs bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded font-medium">Reused check, new target</span>
-                          ) : (
-                            <span className="text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded font-medium">Existing check</span>
-                          )}
-                          {sourceBadge(rule.source)}
+              {(() => {
+                const previouslyActive = reviewSkipped.filter(r => !r.is_new_instance)
+                const otherSkipped     = reviewSkipped.filter(r =>  r.is_new_instance)
+                const skippedTotal     = reviewSkipped.length + reviewUnusedLibrary.length
+                return (
+                  <>
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-gray-400 inline-block" />
+                        Skipped Rules ({skippedTotal})
+                      </h3>
+                      <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                        Not running this pipeline — activate any you want to include.
+                      </span>
+                    </div>
+
+                    <div className="space-y-5">
+                    {/* ── Bifurcation 1: previously active, now dropped ── */}
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <h4 className="text-xs font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300">
+                          Previously Active — Skipped This Run ({reviewSkipped.length})
+                        </h4>
+                        <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                          Ran last time · Claude dropped them.
+                        </span>
+                      </div>
+                      {selectedSkippedIds.size > 0 && (
+                        <div className="mb-2 flex items-center gap-2 bg-green-50 dark:bg-green-950/40 border border-green-200 dark:border-green-500/40 rounded-lg px-3 py-1.5">
+                          <span className="text-xs font-medium text-green-800 dark:text-green-300">{selectedSkippedIds.size} selected</span>
+                          <button
+                            onClick={() => bulkActivate(selectedSkippedIds)}
+                            className="ml-auto flex items-center gap-1 text-xs px-2.5 py-1 bg-green-600 text-white rounded hover:bg-green-700"
+                          >
+                            <CheckCircle2 className="w-3 h-3" />Activate Selected
+                          </button>
+                          <button
+                            onClick={() => setSelectedSkippedIds(new Set())}
+                            className="text-xs px-2 py-1 text-green-400 hover:text-green-700"
+                          >
+                            Clear
+                          </button>
                         </div>
-                        <p className="text-xs font-medium text-gray-600 dark:text-gray-300 truncate">{rule.name}</p>
-                        {rule.reason && (
-                          <p className="text-xs text-gray-400 dark:text-gray-400 mt-0.5 truncate" title={rule.reason}>
-                            {rule.reason}
-                          </p>
+                      )}
+                      <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                        {[...previouslyActive, ...otherSkipped].map(rule => (
+                          <div key={rule.instance_id} className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-3 text-sm opacity-90">
+                            <div className="flex items-start justify-between gap-2">
+                              <input
+                                type="checkbox"
+                                checked={selectedSkippedIds.has(rule.instance_id)}
+                                onChange={() => toggleSkippedSelected(rule.instance_id)}
+                                className="mt-1 flex-shrink-0"
+                              />
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
+                                  {rule.is_new_definition ? (
+                                    <span className="text-xs bg-purple-200 text-purple-700 px-1.5 py-0.5 rounded font-medium">New concept</span>
+                                  ) : rule.is_new_instance ? (
+                                    <span className="text-xs bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded font-medium">Reused check, new target</span>
+                                  ) : (
+                                    <span className="text-xs bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded font-medium">Existing check</span>
+                                  )}
+                                  {sourceBadge(rule.source)}
+                                </div>
+                                <p className="text-xs font-medium text-gray-600 dark:text-gray-300 truncate">{rule.name}</p>
+                                {rule.reason && (
+                                  <p className="text-xs text-gray-400 dark:text-gray-400 mt-0.5 truncate" title={rule.reason}>
+                                    {rule.reason}
+                                  </p>
+                                )}
+                              </div>
+                              <button
+                                onClick={() => activateRule(rule.instance_id)}
+                                className="flex-shrink-0 text-xs px-1.5 py-1 text-green-600 dark:text-green-400 border border-green-200 dark:border-green-500/40 rounded hover:bg-green-50 dark:hover:bg-green-900/40"
+                                title="Activate this rule"
+                              >
+                                Activate
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                        {reviewSkipped.length === 0 && (
+                          <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No skipped rules.</p>
                         )}
                       </div>
-                      <button
-                        onClick={() => activateRule(rule.instance_id)}
-                        className="flex-shrink-0 text-xs px-1.5 py-1 text-green-600 dark:text-green-400 border border-green-200 dark:border-green-500/40 rounded hover:bg-green-50 dark:hover:bg-green-900/40"
-                        title="Activate this rule"
-                      >
-                        Activate
-                      </button>
                     </div>
-                  </div>
-                ))}
-                {reviewSkipped.length === 0 && (
-                  <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">No skipped rules.</p>
-                )}
-              </div>
+
+                    {/* ── Bifurcation 2: library rules never applied here ── */}
+                    <div className="border-t border-gray-100 dark:border-gray-700 pt-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <h4 className="text-xs font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300">
+                          Other Library Rules — Not Yet Applied Here ({reviewUnusedLibrary.length})
+                        </h4>
+                        <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                          Pick one to add a new check.
+                        </span>
+                      </div>
+                      <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                        {reviewUnusedLibrary.map((d) => (
+                          <div
+                            key={d.definition_id}
+                            className="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 text-sm"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0 flex-1">
+                                <p className="text-xs font-semibold text-gray-800 dark:text-gray-100 truncate" title={d.name}>
+                                  {d.name}
+                                </p>
+                                <div className="flex flex-wrap items-center gap-1 mt-0.5">
+                                  {d.template_shape && (
+                                    <span className="text-[10px] bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 px-1.5 py-0.5 rounded">
+                                      {d.template_shape}
+                                    </span>
+                                  )}
+                                  {d.category && (
+                                    <span className="text-[10px] bg-indigo-50 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 px-1.5 py-0.5 rounded">
+                                      {d.category}
+                                    </span>
+                                  )}
+                                  {d.default_severity && (
+                                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                                      d.default_severity === 'critical' ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300' :
+                                      d.default_severity === 'high'     ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300' :
+                                      d.default_severity === 'medium'   ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300' :
+                                                                          'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+                                    }`}>{d.default_severity}</span>
+                                  )}
+                                </div>
+                                {d.description && (
+                                  <p className="text-[11px] text-gray-500 dark:text-gray-400 line-clamp-2 mt-1" title={d.description}>
+                                    {d.description}
+                                  </p>
+                                )}
+                              </div>
+                              <button
+                                onClick={() => {
+                                  setActivateTarget(d)
+                                  setActivateColumn('')
+                                  setActivateColumns([])
+                                  setActivateRefDatabase('')
+                                  setActivateRefSchema('')
+                                  setActivateRefTable('')
+                                  setActivateRefColumn('')
+                                  setActivateThresholds({})
+                                  setActivateError(null)
+                                }}
+                                className="flex-shrink-0 text-xs px-2 py-1 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/40 rounded hover:bg-blue-50 dark:hover:bg-blue-900/40"
+                                title="Activate on this table"
+                              >
+                                Activate
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                        {reviewUnusedLibrary.length === 0 && (
+                          <p className="text-xs text-gray-400 dark:text-gray-400 text-center py-4">Every library definition is already applied here.</p>
+                        )}
+                      </div>
+                    </div>
+                    </div>
+                  </>
+                )
+              })()}
             </div>
           </div>
+        </div>
+      )}
 
-          {/* ── Available in Library ─────────────────────────────────────────
-              Library definitions with NO instance on this table. Reviewer can
-              activate one to add a new check without going back to the Rule
-              Library page. Activation is stubbed for now — the target/threshold
-              modal + create-instance wiring lands next round. */}
-          {reviewUnusedLibrary.length > 0 && (
-            <div className="border-t border-gray-100 dark:border-gray-700 p-5">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-blue-400 inline-block" />
-                  Available in Library ({reviewUnusedLibrary.length})
-                </h3>
-                <span className="text-[11px] text-gray-500 dark:text-gray-400">
-                  Definitions Claude didn't apply to this table — activate any you want to run.
-                </span>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-80 overflow-y-auto pr-1">
-                {reviewUnusedLibrary.map((d) => (
-                  <div
-                    key={d.definition_id}
-                    className="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 text-sm flex flex-col gap-1"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0 flex-1">
-                        <p className="text-xs font-semibold text-gray-800 dark:text-gray-100 truncate" title={d.name}>
-                          {d.name}
+      {/* ── Activate Library Definition modal ──────────────────────────────── */}
+      {activateTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">
+                Activate Rule
+              </h3>
+              <button onClick={() => setActivateTarget(null)} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+              <span className="font-semibold text-gray-700 dark:text-gray-200">{activateTarget.name}</span>
+              {activateTarget.template_shape && (
+                <span className="ml-2 font-mono bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 rounded">{activateTarget.template_shape}</span>
+              )}
+            </p>
+            {activateTarget.description && (
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">{activateTarget.description}</p>
+            )}
+
+            {(() => {
+              const scope = shapeScope(activateTarget.template_shape)
+              return (
+                <div className="space-y-3">
+                  {/* ── column scope ─────────────────────────────────── */}
+                  {scope === 'column' && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        Column <span className="text-red-500">*</span>
+                      </label>
+                      <select
+                        value={activateColumn}
+                        onChange={e => setActivateColumn(e.target.value)}
+                        className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+                        autoFocus
+                      >
+                        <option value="">{runColumns ? 'Pick a column...' : 'Loading columns...'}</option>
+                        {(runColumns || []).map((c: ColumnMeta) => (
+                          <option key={c.column_name} value={c.column_name}>
+                            {c.column_name} · {c.data_type}{c.is_nullable ? '' : ' · NOT NULL'}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {/* ── multi_column scope: composite key picker ─────── */}
+                  {scope === 'multi_column' && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        Columns forming the composite key <span className="text-red-500">*</span>
+                        <span className="ml-1 font-normal text-gray-400">(pick 2+)</span>
+                      </label>
+                      <div className="border border-gray-300 dark:border-gray-600 rounded-lg max-h-56 overflow-y-auto p-2 bg-white dark:bg-gray-700">
+                        {(runColumns || []).map((c: ColumnMeta) => {
+                          const checked = activateColumns.includes(c.column_name)
+                          return (
+                            <label key={c.column_name} className="flex items-center gap-2 py-1 text-xs text-gray-800 dark:text-gray-200 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => {
+                                  setActivateColumns(prev =>
+                                    prev.includes(c.column_name)
+                                      ? prev.filter(x => x !== c.column_name)
+                                      : [...prev, c.column_name]
+                                  )
+                                }}
+                              />
+                              <span className="font-mono">{c.column_name}</span>
+                              <span className="text-gray-400 dark:text-gray-500">· {c.data_type}</span>
+                            </label>
+                          )
+                        })}
+                        {(!runColumns || runColumns.length === 0) && (
+                          <p className="text-xs text-gray-400 dark:text-gray-500 py-2 text-center">Loading columns...</p>
+                        )}
+                      </div>
+                      {activateColumns.length > 0 && (
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
+                          Selected: <span className="font-mono">{activateColumns.join(', ')}</span>
                         </p>
-                        <div className="flex flex-wrap items-center gap-1 mt-0.5">
-                          {d.template_shape && (
-                            <span className="text-[10px] bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 px-1.5 py-0.5 rounded">
-                              {d.template_shape}
-                            </span>
-                          )}
-                          {d.category && (
-                            <span className="text-[10px] bg-indigo-50 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 px-1.5 py-0.5 rounded">
-                              {d.category}
-                            </span>
-                          )}
-                          {d.default_severity && (
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                              d.default_severity === 'critical' ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300' :
-                              d.default_severity === 'high'     ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300' :
-                              d.default_severity === 'medium'   ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300' :
-                                                                  'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
-                            }`}>{d.default_severity}</span>
-                          )}
+                      )}
+                    </div>
+                  )}
+
+                  {/* ── cross_table scope: source col + ref pickers ──── */}
+                  {scope === 'cross_table' && (
+                    <>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                          Source column (on this table) <span className="text-red-500">*</span>
+                        </label>
+                        <select
+                          value={activateColumn}
+                          onChange={e => setActivateColumn(e.target.value)}
+                          className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+                        >
+                          <option value="">{runColumns ? 'Pick a column...' : 'Loading columns...'}</option>
+                          {(runColumns || []).map((c: ColumnMeta) => (
+                            <option key={c.column_name} value={c.column_name}>
+                              {c.column_name} · {c.data_type}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="pt-2 border-t border-gray-100 dark:border-gray-700">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">
+                          Referenced table
+                        </p>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Database <span className="text-red-500">*</span></label>
+                            <select
+                              value={activateRefDatabase}
+                              onChange={e => {
+                                setActivateRefDatabase(e.target.value)
+                                setActivateRefSchema(''); setActivateRefTable(''); setActivateRefColumn('')
+                              }}
+                              className="w-full text-xs border border-gray-300 dark:border-gray-600 rounded-lg px-2 py-1.5 bg-white dark:bg-gray-700 dark:text-gray-100"
+                            >
+                              <option value="">Pick database...</option>
+                              {refDatabases?.databases.map(db => <option key={db} value={db}>{db}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Schema <span className="text-red-500">*</span></label>
+                            <select
+                              value={activateRefSchema}
+                              onChange={e => {
+                                setActivateRefSchema(e.target.value)
+                                setActivateRefTable(''); setActivateRefColumn('')
+                              }}
+                              disabled={!activateRefDatabase}
+                              className="w-full text-xs border border-gray-300 dark:border-gray-600 rounded-lg px-2 py-1.5 bg-white dark:bg-gray-700 dark:text-gray-100 disabled:bg-gray-100 dark:disabled:bg-gray-800"
+                            >
+                              <option value="">Pick schema...</option>
+                              {refSchemas?.schemas.map(s => <option key={s} value={s}>{s}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Table <span className="text-red-500">*</span></label>
+                            <select
+                              value={activateRefTable}
+                              onChange={e => { setActivateRefTable(e.target.value); setActivateRefColumn('') }}
+                              disabled={!activateRefSchema}
+                              className="w-full text-xs border border-gray-300 dark:border-gray-600 rounded-lg px-2 py-1.5 bg-white dark:bg-gray-700 dark:text-gray-100 disabled:bg-gray-100 dark:disabled:bg-gray-800"
+                            >
+                              <option value="">Pick table...</option>
+                              {refTables?.tables.map(t => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Column <span className="text-red-500">*</span></label>
+                            <select
+                              value={activateRefColumn}
+                              onChange={e => setActivateRefColumn(e.target.value)}
+                              disabled={!activateRefTable}
+                              className="w-full text-xs border border-gray-300 dark:border-gray-600 rounded-lg px-2 py-1.5 bg-white dark:bg-gray-700 dark:text-gray-100 disabled:bg-gray-100 dark:disabled:bg-gray-800"
+                            >
+                              <option value="">Pick column...</option>
+                              {refColumns?.map((c: ColumnMeta) => (
+                                <option key={c.column_name} value={c.column_name}>{c.column_name} · {c.data_type}</option>
+                              ))}
+                            </select>
+                          </div>
                         </div>
                       </div>
-                      <button
-                        onClick={() => window.alert(
-                          `Activation UI is coming in the next update.\n\n"${d.name}"\n\nFor now, activate this definition on this table from the Rule Library page.`
-                        )}
-                        className="flex-shrink-0 text-xs px-2 py-1 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/40 rounded hover:bg-blue-50 dark:hover:bg-blue-900/40"
-                        title="Coming soon"
-                      >
-                        Activate
-                      </button>
-                    </div>
-                    {d.description && (
-                      <p className="text-[11px] text-gray-500 dark:text-gray-400 line-clamp-2" title={d.description}>
-                        {d.description}
+                    </>
+                  )}
+
+                  {/* ── anomaly scope: not configurable here ─────────── */}
+                  {scope === 'anomaly' && (
+                    <div className="rounded-lg border border-amber-200 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-950/40 p-3">
+                      <p className="text-xs text-amber-800 dark:text-amber-300">
+                        <span className="font-semibold">Anomaly rules can't be activated here.</span>
+                        {' '}They rely on rolling baselines from prior scans (MAD windows require ≥14 samples).
+                        Configure this rule from the <span className="font-semibold">Rule Library</span> page,
+                        where the asset + metric picker is available.
                       </p>
-                    )}
-                  </div>
-                ))}
-              </div>
+                    </div>
+                  )}
+
+                  {/* ── table / handler scope: no configuration ──────── */}
+                  {scope === 'table' && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      This rule runs at table scope with no additional configuration.
+                    </p>
+                  )}
+
+                  {/* ── shared thresholds (column scope only in practice) ── */}
+                  {thresholdFieldsForShape(activateTarget.template_shape).map(f => (
+                    <div key={f.key}>
+                      <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        {f.label} {f.required && <span className="text-red-500">*</span>}
+                      </label>
+                      <input
+                        type={f.type === 'number' ? 'number' : 'text'}
+                        value={activateThresholds[f.key] || ''}
+                        onChange={e => setActivateThresholds(t => ({ ...t, [f.key]: e.target.value }))}
+                        className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+                        placeholder={f.type === 'csv' ? 'e.g. active, pending, closed' : ''}
+                      />
+                    </div>
+                  ))}
+                </div>
+              )
+            })()}
+
+            {activateError && (
+              <p className="mt-3 text-xs text-red-600">{activateError}</p>
+            )}
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => setActivateTarget(null)}
+                className="px-4 py-2 text-sm text-gray-600 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={submitActivate}
+                disabled={
+                  activateLibraryMutation.isPending ||
+                  shapeScope(activateTarget.template_shape) === 'anomaly'
+                }
+                className="flex items-center gap-2 px-4 py-2 text-sm bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {activateLibraryMutation.isPending
+                  ? <><Loader2 className="w-4 h-4 animate-spin" />Activating...</>
+                  : <><CheckCircle2 className="w-4 h-4" />Activate</>
+                }
+              </button>
             </div>
-          )}
+          </div>
         </div>
       )}
 

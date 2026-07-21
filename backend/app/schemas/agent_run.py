@@ -101,6 +101,8 @@ class BulkInstanceActionRequest(BaseModel):
 
 class AgentRunListResponse(BaseModel):
     total: int
+    page: int
+    page_size: int
     runs: List[AgentRunResponse]
 
 

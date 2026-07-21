@@ -536,7 +536,10 @@ export interface LineageNode {
   depth?: number;
   is_focus?: boolean;
   is_external?: boolean;
+  direction?: LineageDirection;
 }
+
+export type LineageDirection = 'focus' | 'upstream' | 'downstream';
 
 export interface LineageEdge {
   id: string;
@@ -545,6 +548,7 @@ export interface LineageEdge {
   edge_type?: LineageEdgeType | null;
   discovery_source?: 'get_lineage' | 'object_dependencies' | null;
   count?: number;
+  direction?: LineageDirection;
 }
 
 export interface LineageDatabaseCard {
@@ -568,6 +572,8 @@ export interface LineageGraph {
   discovery_method: 'get_lineage' | 'object_dependencies' | null;
   focus_fqn?: string;
   hops?: number;
+  upstream_count?: number;
+  downstream_count?: number;
 }
 
 export interface LineageRefreshResult {
@@ -825,9 +831,8 @@ export interface AgentRun {
     // Library definitions Claude knew about but that ended up with NO instance
     // on this table — neither existing nor newly proposed. Surfaced so the
     // reviewer can discover applicable checks that the agent didn't apply.
-    // Activation currently stubbed (see AgentWorkflow.tsx "Available in Library"
-    // section) — the target/threshold prompt + create-instance wiring is next
-    // round.
+    // Activation goes through agentRunsApi.activateLibrary, which creates a
+    // pending instance and appends it to active for this run's review.
     unused_library?: Array<{
       definition_id: string;
       name: string;
@@ -1059,14 +1064,39 @@ export const agentRunsApi = {
     api.get<AgentBatch>(`/agent/runs/batch/${batchId}`),
   get: (id: string) =>
     api.get<AgentRun>(`/agent/runs/${id}`),
-  list: () =>
-    api.get<{ total: number; runs: AgentRun[] }>('/agent/runs'),
+  list: (params: {
+    page?: number; page_size?: number;
+    status?: string; origin?: string;
+    database?: string; schema_name?: string; table?: string;
+    search?: string; connection_id?: string;
+  } = {}) => {
+    const q = new URLSearchParams()
+    if (params.page)        q.set('page',          String(params.page))
+    if (params.page_size)   q.set('page_size',      String(params.page_size))
+    if (params.status)      q.set('status',         params.status)
+    if (params.origin)      q.set('origin',         params.origin)
+    if (params.database)    q.set('database',       params.database)
+    if (params.schema_name) q.set('schema_name',    params.schema_name)
+    if (params.table)       q.set('table',          params.table)
+    if (params.search)      q.set('search',         params.search)
+    if (params.connection_id) q.set('connection_id', params.connection_id)
+    return api.get<{ total: number; page: number; page_size: number; runs: AgentRun[] }>(`/agent/runs?${q}`)
+  },
+  filterOptions: () =>
+    api.get<{ databases: string[]; schemas: Record<string, string[]>; tables: Record<string, string[]> }>('/agent/runs/filter-options'),
   reviewRules: (id: string, data: { active: RuleReviewEntry[]; skipped: RuleReviewEntry[] }) =>
     api.post<AgentRun>(`/agent/runs/${id}/review-rules`, data),
   bulkApprove: (id: string, instanceIds: string[]) =>
     api.post<AgentRun>(`/agent/runs/${id}/review-rules/bulk-approve`, { instance_ids: instanceIds }),
   bulkReject: (id: string, instanceIds: string[], reason?: string) =>
     api.post<AgentRun>(`/agent/runs/${id}/review-rules/bulk-reject`, { instance_ids: instanceIds, reason }),
+  activateLibrary: (id: string, data: {
+    definition_id: string;
+    target_config?: Record<string, any>;
+    threshold_config?: Record<string, any>;
+    severity?: string;
+  }) =>
+    api.post<AgentRun>(`/agent/runs/${id}/review-rules/activate-library`, data),
   runPipeline: (id: string) =>
     api.post(`/agent/runs/${id}/run-pipeline`),
   verify: (id: string) =>
@@ -1083,4 +1113,6 @@ export const agentRunsApi = {
     instance_ids?: string[];
   }) =>
     api.post<WorkflowTemplate>(`/agent/runs/${id}/save-as-workflow`, data),
+  cancel: (id: string) =>
+    api.post<AgentRun>(`/agent/runs/${id}/cancel`),
 };
