@@ -114,6 +114,7 @@ class TestIntelligenceLogShape:
         with patch("app.services.agents.rule_intelligence_agent.storage") as mock_storage:
             mock_storage.get_intelligence_logs_for_table.return_value = []
             mock_storage.get_feedback_memo.return_value = None
+            mock_storage.get_feedback_memos_by_bare_name.return_value = {}
             mock_storage.get_review_lessons_for_table.return_value = []
             mock_storage.search_similar_intelligence.return_value = []
             _ = agent._format_past_context(table)
@@ -136,6 +137,7 @@ class TestIntelligenceLogShape:
         with patch("app.services.agents.rule_intelligence_agent.storage") as mock_storage:
             mock_storage.get_intelligence_logs_for_table.side_effect = ConnectionError("boom")
             mock_storage.get_feedback_memo.return_value = None
+            mock_storage.get_feedback_memos_by_bare_name.return_value = {}
             mock_storage.get_review_lessons_for_table.return_value = []
             mock_storage.search_similar_intelligence.return_value = []
             _ = agent._format_past_context(table)

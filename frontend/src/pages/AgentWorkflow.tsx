@@ -9,7 +9,7 @@ import {
   Wrench, CheckCircle2, Loader2, ChevronDown, ChevronRight,
   AlertTriangle, ArrowRight, Clock, Play, ExternalLink,
   RefreshCw, Sparkles, Network, BarChart3,
-  BookmarkPlus, X,
+  BookmarkPlus, X, RotateCcw, Plus,
 } from 'lucide-react'
 
 // ── Pipeline definition ───────────────────────────────────────────────────────
@@ -1983,7 +1983,43 @@ export default function AgentWorkflow() {
       {/* Findings Report — rules that fired vs rules that ran clean (mirrors
           the active/skipped split, but after findings ran) */}
       {findingsOutput && getTask('findings_agent')?.status === 'completed' &&
-       Array.isArray(findingsOutput.rules_used) && (
+       Array.isArray(findingsOutput.rules_used) && (() => {
+        // Incident-lifecycle events for this scan — comes from
+        // scan_finalizer.finalize_scan (created / updated / reopened /
+        // resolved) so the UI can distinguish "1 brand-new problem" from
+        // "1 same problem still failing" from "1 problem came back".
+        // Without this, findings_count=1 for an updated finding reads the
+        // same as a new one, and users can't tell what changed.
+        const lifecycle = (findingsOutput.lifecycle ?? {}) as {
+          created?: number; updated?: number; reopened?: number;
+          resolved?: number; muted?: number;
+          events?: Array<{
+            finding_id: string;
+            event: 'created' | 'updated' | 'reopened' | 'resolved';
+            instance_id: string | null;
+            asset_id: string | null;
+            prev_fail_count: number | null;
+            prev_total_count: number | null;
+            curr_fail_count: number | null;
+            curr_total_count: number | null;
+          }>
+        }
+        const events = lifecycle.events ?? []
+        // Group events by instance_id — one instance may produce one event
+        // per asset. The Findings Report groups by rule NAME already, so
+        // roll up all events under that name here.
+        const eventsByInstance: Record<string, typeof events> = {}
+        for (const evt of events) {
+          if (!evt.instance_id) continue
+          if (!eventsByInstance[evt.instance_id]) eventsByInstance[evt.instance_id] = []
+          eventsByInstance[evt.instance_id].push(evt)
+        }
+        const cCreated = lifecycle.created ?? 0
+        const cUpdated = lifecycle.updated ?? 0
+        const cReopened = lifecycle.reopened ?? 0
+        const cResolved = lifecycle.resolved ?? 0
+        const hasLifecycle = (cCreated + cUpdated + cReopened + cResolved) > 0
+        return (
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
           <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 flex items-start justify-between gap-4">
             <div>
@@ -1997,6 +2033,30 @@ export default function AgentWorkflow() {
                 <span className="text-green-700 dark:text-green-400 font-medium">{findingsOutput.rules_unused_count} clean</span>
                 {findingsOutput.findings_count != null && <> · {findingsOutput.findings_count} findings</>}
               </p>
+              {hasLifecycle && (
+                <p className="text-xs mt-1 flex flex-wrap gap-x-3 gap-y-1" title="What actually changed this scan — a static findings count hides whether a problem is new, still failing, or came back.">
+                  {cCreated > 0 && (
+                    <span className="inline-flex items-center gap-1 text-red-700 dark:text-red-300 font-medium">
+                      <Plus className="w-3 h-3" /> {cCreated} new
+                    </span>
+                  )}
+                  {cUpdated > 0 && (
+                    <span className="inline-flex items-center gap-1 text-orange-700 dark:text-orange-300 font-medium">
+                      <RefreshCw className="w-3 h-3" /> {cUpdated} still failing
+                    </span>
+                  )}
+                  {cReopened > 0 && (
+                    <span className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-300 font-medium">
+                      <RotateCcw className="w-3 h-3" /> {cReopened} reopened
+                    </span>
+                  )}
+                  {cResolved > 0 && (
+                    <span className="inline-flex items-center gap-1 text-green-700 dark:text-green-400 font-medium">
+                      <CheckCircle2 className="w-3 h-3" /> {cResolved} auto-resolved
+                    </span>
+                  )}
+                </p>
+              )}
               {executedInstanceIds.length > 0 && (
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
                   Tick the rules you want to keep in the saved workflow template.
@@ -2052,6 +2112,27 @@ export default function AgentWorkflow() {
                         return out
                       })
                     }
+                    // Roll up lifecycle events across every instance under
+                    // this rule name. Same rule fired on multiple columns
+                    // could have mixed events (one new, one still failing);
+                    // count each kind so the badge is accurate.
+                    const evtBuckets = { created: 0, updated: 0, reopened: 0 }
+                    const evtDeltas: string[] = []
+                    for (const id of ids) {
+                      for (const e of (eventsByInstance[id] ?? [])) {
+                        if (e.event === 'created')  evtBuckets.created += 1
+                        if (e.event === 'updated')  evtBuckets.updated += 1
+                        if (e.event === 'reopened') evtBuckets.reopened += 1
+                        // "was 5 → now 8" — only meaningful when the fail
+                        // count actually moved. Skip metadata-shape rules
+                        // where every scan is 1/1.
+                        if ((e.event === 'updated' || e.event === 'reopened') &&
+                            e.prev_fail_count != null && e.curr_fail_count != null &&
+                            e.prev_fail_count !== e.curr_fail_count) {
+                          evtDeltas.push(`${e.prev_fail_count} → ${e.curr_fail_count}`)
+                        }
+                      }
+                    }
                     return (
                       <div key={name} className="flex items-start gap-2 text-sm rounded-lg border border-orange-200 dark:border-orange-500/30 bg-orange-50/40 dark:bg-orange-500/10 p-2.5">
                         <input
@@ -2063,9 +2144,34 @@ export default function AgentWorkflow() {
                           title="Include in saved workflow"
                         />
                         <div className="min-w-0 flex-1">
-                          <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 truncate">{name}</p>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 truncate">{name}</p>
+                            {evtBuckets.created > 0 && (
+                              <span className="inline-flex items-center gap-0.5 text-[10px] font-medium bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-300 px-1.5 py-0.5 rounded"
+                                title="Brand-new incident this scan">
+                                <Plus className="w-2.5 h-2.5" /> new{evtBuckets.created > 1 ? ` ×${evtBuckets.created}` : ''}
+                              </span>
+                            )}
+                            {evtBuckets.updated > 0 && (
+                              <span className="inline-flex items-center gap-0.5 text-[10px] font-medium bg-orange-100 dark:bg-orange-500/20 text-orange-700 dark:text-orange-300 px-1.5 py-0.5 rounded"
+                                title="Existing incident, still failing this scan">
+                                <RefreshCw className="w-2.5 h-2.5" /> still failing{evtBuckets.updated > 1 ? ` ×${evtBuckets.updated}` : ''}
+                              </span>
+                            )}
+                            {evtBuckets.reopened > 0 && (
+                              <span className="inline-flex items-center gap-0.5 text-[10px] font-medium bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 px-1.5 py-0.5 rounded"
+                                title="Was resolved, failing again">
+                                <RotateCcw className="w-2.5 h-2.5" /> reopened{evtBuckets.reopened > 1 ? ` ×${evtBuckets.reopened}` : ''}
+                              </span>
+                            )}
+                          </div>
                           {g.instances.length > 1 && (
                             <p className="text-xs text-gray-500 dark:text-gray-400">{g.instances.length} instances</p>
+                          )}
+                          {evtDeltas.length > 0 && (
+                            <p className="text-[11px] text-gray-500 dark:text-gray-400 font-mono">
+                              was {evtDeltas.join(', ')} failing rows
+                            </p>
                           )}
                         </div>
                         {activeRun?.scan_id && (
@@ -2138,7 +2244,8 @@ export default function AgentWorkflow() {
             </div>
           </div>
         </div>
-      )}
+        )
+      })()}
 
       {/* ── Save as Workflow modal ─────────────────────────────────────────── */}
       {saveWfOpen && (

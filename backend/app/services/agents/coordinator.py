@@ -258,20 +258,31 @@ class WorkflowCoordinator:
 
         # ── Anomaly substrate: persist metric snapshots + refresh baselines ──
         # Best-effort — never blocks the scan. Feeds AnomalyProposalAgent
-        # once sample_count >= 14 (see metric_snapshots.py).
+        # once sample_count >= 14 (see metric_snapshots.py). Runs in a daemon
+        # thread because record_metric_snapshots issues ~4× Snowflake round-
+        # trips per (column, metric) pair (INSERT snapshot + SELECT window +
+        # DELETE baseline + INSERT baseline), which serialised inline was
+        # adding 20-50s of dead time between the parallel node group and
+        # RuleIntelligenceAgent. AnomalyProposalAgent runs later in the
+        # pipeline (post-findings), so it doesn't need these baselines to be
+        # ready by RuleIntelligence time; the thread has plenty of headroom
+        # to finish before the anomaly sweep looks at them.
         if profiler_result and table_asset is not None:
-            try:
-                from app.services.metric_snapshots import record_metric_snapshots
-                record_metric_snapshots(
-                    scan_id=scan.id,
-                    asset_id=table_asset.id,
-                    database_name=run.database,
-                    schema_name=run.schema_name,
-                    table_name=run.table,
-                    facts=profiler_result,
-                )
-            except Exception as e:
-                logger.warning(f"[Coordinator] Metric snapshot capture failed: {e}")
+            _snap_args = dict(
+                scan_id=scan.id,
+                asset_id=table_asset.id,
+                database_name=run.database,
+                schema_name=run.schema_name,
+                table_name=run.table,
+                facts=profiler_result,
+            )
+            def _record_snapshots_bg():
+                try:
+                    from app.services.metric_snapshots import record_metric_snapshots
+                    record_metric_snapshots(**_snap_args)
+                except Exception as _snap_err:
+                    logger.warning(f"[Coordinator] Metric snapshot capture failed: {_snap_err}")
+            threading.Thread(target=_record_snapshots_bg, daemon=True).start()
 
         # ── Sweep stale pending proposals from prior runs ─────────────────────
         # A pending instance from an earlier run that was never approved
@@ -707,10 +718,11 @@ class WorkflowCoordinator:
                 severity_overrides=severity_overrides,
                 run_id=run.id,
             )
-            # len(findings) is CREATED-only under the new lifecycle
-            # (list_findings_by_scan filters on SCAN_ID, which for UPDATE /
-            # REOPEN branches still points at the original scan). Read the
-            # authoritative count FindingsAgent just wrote onto SCANS instead.
+            # Read the authoritative count FindingsAgent just wrote onto SCANS
+            # (created + updated + reopened). len(findings) now matches this,
+            # since list_findings_by_scan was fixed to match on LAST_SCAN_ID
+            # too — but the SCANS row is still the source of truth if any
+            # future divergence sneaks in.
             active_count = getattr(storage.get_scan(scan.id), "findings_count", None) or len(findings)
             storage.update_agent_run(self.run_id, findings_count=active_count)
 
@@ -739,6 +751,11 @@ class WorkflowCoordinator:
                 for iid in approved_instance_ids if iid not in fired_instance_ids
             ]
 
+            # Per-finding lifecycle events so the UI can render "1 new · 1
+            # reopened · 0 updated (was N → now M)" instead of a static count
+            # that hides whether the same problem just carried over. Fields
+            # match scan_finalizer.finalize_scan's events shape.
+            lifecycle = getattr(scan, "lifecycle_stats", {}) or {}
             self._complete_task(findings_task, output={
                 "findings_count":     len(findings),
                 "severity_breakdown": sev_breakdown,
@@ -749,6 +766,14 @@ class WorkflowCoordinator:
                 "rules_unused_count": len(rules_unused),
                 "rules_used":         rules_used,
                 "rules_unused":       rules_unused,
+                "lifecycle": {
+                    "created":  lifecycle.get("created", 0),
+                    "updated":  lifecycle.get("updated", 0),
+                    "reopened": lifecycle.get("reopened", 0),
+                    "resolved": lifecycle.get("resolved", 0),
+                    "muted":    lifecycle.get("muted", 0),
+                    "events":   lifecycle.get("events", []),
+                },
             })
         except Exception as e:
             self._fail_task(findings_task, str(e))
@@ -1084,11 +1109,20 @@ class WorkflowCoordinator:
             # reopened + updated) for the true active-incident count.
             active_count = getattr(storage.get_scan(scan.id), "findings_count", None) or len(findings)
             storage.update_agent_run(self.run_id, findings_count=active_count)
+            lifecycle = getattr(scan, "lifecycle_stats", {}) or {}
             self._complete_task(findings_task, output={
                 "findings_count": active_count,
                 "rules_applied": len(approved_instance_ids),
                 "patterns_skipped": len(skipped_patterns),
                 "skipped_reasons": skipped_patterns,
+                "lifecycle": {
+                    "created":  lifecycle.get("created", 0),
+                    "updated":  lifecycle.get("updated", 0),
+                    "reopened": lifecycle.get("reopened", 0),
+                    "resolved": lifecycle.get("resolved", 0),
+                    "muted":    lifecycle.get("muted", 0),
+                    "events":   lifecycle.get("events", []),
+                },
             })
         except Exception as e:
             self._fail_task(findings_task, str(e))
