@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -220,4 +220,197 @@ def reject_proposal(proposal_id: str, body: RejectIn):
          "by": body.decided_by or "user",
          "reason": (body.reason or "")[:2000]},
     )
+    # Un-enroll the monitored metric if nothing else is actively watching it.
+    # Only un-enroll auto-seeded rows — a user-enrolled metric shouldn't
+    # disappear because they rejected the AI's proposal on it.
+    _maybe_unenroll_on_reject(row)
     return {"ok": True}
+
+
+def _maybe_unenroll_on_reject(row: dict) -> None:
+    """Best-effort unenrollment when the last live signal for a (asset, col,
+    metric) tuple goes away. Silent on failure."""
+    try:
+        asset_id = row.get("ASSET_ID")
+        metric = row.get("METRIC_NAME")
+        col = row.get("COLUMN_NAME")
+        if not (asset_id and metric):
+            return
+        # Refuse to unenroll user-enrolled or auto_table rows.
+        catalog_rows = sf.query(
+            """
+            SELECT ENROLLMENT_SOURCE FROM MONITORED_METRICS
+            WHERE ASSET_ID = %(a)s AND METRIC_NAME = %(m)s
+              AND (
+                (COLUMN_NAME IS NULL AND %(c)s IS NULL)
+                OR COLUMN_NAME = %(c)s
+              )
+            """,
+            {"a": asset_id, "m": metric, "c": col},
+        )
+        if not catalog_rows:
+            return
+        source = catalog_rows[0].get("ENROLLMENT_SOURCE")
+        if source in ("user", "auto_table"):
+            return
+        storage.unenroll_metric(asset_id, col, metric)
+    except Exception as e:
+        logger.debug(f"[proposals] unenroll-on-reject failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Batch endpoints — one HTTP request drives many proposals through the
+# approve/reject path. Same per-proposal logic as the singular versions,
+# but with a few Snowflake round-trip cuts per item:
+#   * skip storage.approve_instance (we already created active + is_active
+#     directly, so the follow-up UPDATE is a no-op for this flow);
+#   * skip the get_instance readback (we already have the id);
+#   * PARTIAL SUCCESS is fine — the response reports per-id outcome so
+#     the UI can decide what to retry.
+# For 13 anomaly proposals this cuts wall-clock roughly in half vs 13
+# separate calls to /approve.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class BatchApproveIn(BaseModel):
+    proposal_ids: List[str]
+    decided_by: Optional[str] = None
+
+
+def _approve_one_fast(proposal_id: str, decided_by: str) -> Dict[str, Any]:
+    """Approve one proposal with the trimmed Snowflake path used by the
+    batch endpoint. Returns {ok, instance_id?, error?} — never raises so a
+    single bad row doesn't sink the whole batch."""
+    try:
+        row = _get_proposal(proposal_id)
+        if not row:
+            return {"id": proposal_id, "ok": False, "error": "not found"}
+        if row["STATUS"] != "pending":
+            return {"id": proposal_id, "ok": False,
+                    "error": f"already {row['STATUS']}"}
+
+        target_config = _parse_json(row.get("TARGET_CONFIG")) or {}
+        threshold_config = _parse_json(row.get("THRESHOLD_CONFIG")) or {}
+        template_shape = row.get("TEMPLATE_SHAPE")
+        if not template_shape:
+            return {"id": proposal_id, "ok": False, "error": "missing template_shape"}
+
+        definition = storage.get_definition_by_template_shape(template_shape)
+        if not definition:
+            return {"id": proposal_id, "ok": False,
+                    "error": f"no definition for shape {template_shape}"}
+
+        table_asset = storage.get_asset(row["ASSET_ID"]) if row.get("ASSET_ID") else None
+        if table_asset is None:
+            return {"id": proposal_id, "ok": False, "error": "asset not found"}
+
+        from app.services import rule_sql_templates
+        try:
+            rule_sql = rule_sql_templates.render_template(
+                template_shape,
+                table_asset.database_name, table_asset.schema_name, table_asset.table_name,
+                target_config, threshold_config,
+            )
+        except Exception as e:
+            return {"id": proposal_id, "ok": False, "error": f"render failed: {e}"}
+
+        scope = "column" if row.get("COLUMN_NAME") else "table"
+        fingerprint = storage._sha256(
+            f"anomaly|{definition.id}|{table_asset.id}|{json.dumps(target_config, sort_keys=True)}"
+        )
+        existing = storage.get_instance_by_fingerprint(fingerprint)
+        if existing:
+            instance_id = existing.id
+        else:
+            # create_instance already inserts with status='active', is_active=True,
+            # so we skip the follow-up storage.approve_instance UPDATE (which would
+            # just set them to the same values plus approved_at) — saves 2 more
+            # Snowflake calls per proposal.
+            instance = storage.create_instance(
+                definition_id=definition.id,
+                scope=scope,
+                database_name=table_asset.database_name,
+                schema_name=table_asset.schema_name,
+                table_name=table_asset.table_name,
+                fingerprint=fingerprint,
+                severity=row.get("SEVERITY") or definition.default_severity or "medium",
+                target_config=target_config,
+                threshold_config=threshold_config,
+                rule_sql=rule_sql,
+                rationale=row.get("RATIONALE"),
+                status="active",
+                is_active=True,
+                owner="anomaly_proposal_agent",
+                created_by=decided_by,
+                source_run_id=row.get("SOURCE_RUN_ID"),
+            )
+            instance_id = instance.id
+
+        sf.execute(
+            """
+            UPDATE PENDING_PROPOSALS
+            SET STATUS = 'approved',
+                DECIDED_BY = %(by)s,
+                DECIDED_AT = CURRENT_TIMESTAMP(),
+                INSTANCE_ID = %(iid)s
+            WHERE ID = %(id)s
+            """,
+            {"id": proposal_id, "by": decided_by, "iid": instance_id},
+        )
+        return {"id": proposal_id, "ok": True, "instance_id": instance_id}
+    except Exception as e:
+        logger.exception(f"approve batch item {proposal_id} failed")
+        return {"id": proposal_id, "ok": False, "error": str(e)[:500]}
+
+
+@router.post("/approve-batch")
+def approve_proposals_batch(body: BatchApproveIn):
+    if not body.proposal_ids:
+        return {"results": [], "approved": 0, "failed": 0}
+    decided_by = body.decided_by or "user"
+    results = [_approve_one_fast(pid, decided_by) for pid in body.proposal_ids]
+    approved = sum(1 for r in results if r.get("ok"))
+    failed = len(results) - approved
+    return {"results": results, "approved": approved, "failed": failed}
+
+
+class BatchRejectIn(BaseModel):
+    proposal_ids: List[str]
+    reason: Optional[str] = None
+    decided_by: Optional[str] = None
+
+
+@router.post("/reject-batch")
+def reject_proposals_batch(body: BatchRejectIn):
+    if not body.proposal_ids:
+        return {"results": [], "rejected": 0, "failed": 0}
+    decided_by = body.decided_by or "user"
+    reason = (body.reason or "")[:2000]
+    results: List[Dict[str, Any]] = []
+    for pid in body.proposal_ids:
+        try:
+            row = _get_proposal(pid)
+            if not row:
+                results.append({"id": pid, "ok": False, "error": "not found"})
+                continue
+            if row["STATUS"] != "pending":
+                results.append({"id": pid, "ok": False,
+                                "error": f"already {row['STATUS']}"})
+                continue
+            sf.execute(
+                """
+                UPDATE PENDING_PROPOSALS
+                SET STATUS = 'rejected',
+                    DECIDED_BY = %(by)s,
+                    DECIDED_AT = CURRENT_TIMESTAMP(),
+                    DECISION_REASON = %(reason)s
+                WHERE ID = %(id)s
+                """,
+                {"id": pid, "by": decided_by, "reason": reason},
+            )
+            results.append({"id": pid, "ok": True})
+        except Exception as e:
+            logger.exception(f"reject batch item {pid} failed")
+            results.append({"id": pid, "ok": False, "error": str(e)[:500]})
+    rejected = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "rejected": rejected, "failed": len(results) - rejected}

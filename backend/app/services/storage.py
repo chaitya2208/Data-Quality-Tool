@@ -102,6 +102,21 @@ def get_asset(asset_id: str) -> Optional[SimpleNamespace]:
     return _asset_from_row(rows[0]) if rows else None
 
 
+def get_assets_by_ids(asset_ids: list[str]) -> Dict[str, SimpleNamespace]:
+    """Batch-fetch assets in ONE query, keyed by id. Same N+1 fix as
+    get_definitions_by_ids / get_instances_by_ids — callers resolving an
+    asset row per finding in a loop issued one query per finding."""
+    if not asset_ids:
+        return {}
+    unique_ids = list(dict.fromkeys(asset_ids))
+    placeholders = ", ".join(f"%(id_{i})s" for i in range(len(unique_ids)))
+    params = {f"id_{i}": a_id for i, a_id in enumerate(unique_ids)}
+    rows = sf_session.query(
+        f"SELECT * FROM ASSETS WHERE ID IN ({placeholders})", params,
+    )
+    return {row["ID"]: _asset_from_row(row) for row in rows}
+
+
 def get_asset_by_fqn(fqn: str) -> Optional[SimpleNamespace]:
     rows = sf_session.query("SELECT * FROM ASSETS WHERE FQN = %(fqn)s", {"fqn": fqn})
     return _asset_from_row(rows[0]) if rows else None
@@ -360,7 +375,7 @@ def create_finding(
     title: str,
     description: str,
     severity: str,
-    status: str = "detected",
+    status: str = "open",
     context: Optional[dict] = None,
     evidence: Optional[dict] = None,
 ) -> SimpleNamespace:
@@ -392,7 +407,7 @@ def create_finding(
 
 def create_findings_bulk(findings_data: list[dict]) -> list[SimpleNamespace]:
     """Insert many finding dicts (same shape as create_finding's kwargs, plus
-    optional 'status' defaulting to 'detected'). Returns the created findings."""
+    optional 'status' defaulting to 'open'). Returns the created findings."""
     created = []
     for fd in findings_data:
         created.append(
@@ -403,7 +418,7 @@ def create_findings_bulk(findings_data: list[dict]) -> list[SimpleNamespace]:
                 title=fd["title"],
                 description=fd["description"],
                 severity=fd["severity"],
-                status=fd.get("status", "detected"),
+                status=fd.get("status", "open"),
                 context=fd.get("context"),
                 evidence=fd.get("evidence"),
             )
@@ -548,15 +563,36 @@ def update_finding_evidence(finding_id: str, evidence: dict) -> None:
     )
 
 
-# Open (non-closed) finding statuses — anything not here is considered resolved/
-# closed and won't be superseded or shown under "Detected".
-_OPEN_FINDING_STATUSES = ("detected", "validated", "in_progress")
+_OPEN_FINDING_STATUSES = ("open", "reopened")
+
+
+def list_open_findings_for_assets(asset_ids: set[str]) -> list[SimpleNamespace]:
+    """All open (open/reopened) findings for a set of asset ids in ONE query.
+    Used by VerificationAgent to scope verification to the table being checked
+    regardless of which scan originally created each finding — necessary because
+    the lifecycle model updates findings in place across rescans, so a finding's
+    SCAN_ID always reflects the originating scan, not the most-recent one."""
+    if not asset_ids:
+        return []
+    in_open = ", ".join(f"'{s}'" for s in _OPEN_FINDING_STATUSES)
+    unique_ids = list(asset_ids)
+    placeholders = ", ".join(f"%(a{n})s" for n in range(len(unique_ids)))
+    params = {f"a{n}": aid for n, aid in enumerate(unique_ids)}
+    rows = sf_session.query(
+        f"""
+        SELECT * FROM FINDINGS
+        WHERE ASSET_ID IN ({placeholders})
+          AND STATUS IN ({in_open})
+        """,
+        params,
+    )
+    return [_finding_from_row(r) for r in rows]
 
 
 def findings_with_asset_not_closed(
     connection_id: Optional[str] = None,
 ) -> list[tuple[SimpleNamespace, SimpleNamespace]]:
-    """(finding, asset) pairs for every finding not RESOLVED/CLOSED — dashboard chart.
+    """(finding, asset) pairs for every finding not RESOLVED — dashboard chart.
     Optionally scoped to one connection via the FINDINGS → SCANS.CONNECTION_ID join."""
     params: dict = {}
     conn_sql = ""
@@ -568,7 +604,7 @@ def findings_with_asset_not_closed(
                a.TABLE_NAME AS A_TABLE_NAME, a.FQN AS A_FQN
         FROM FINDINGS f
         JOIN ASSETS a ON a.ID = f.ASSET_ID
-        WHERE f.STATUS NOT IN ('resolved', 'closed', 'superseded')
+        WHERE f.STATUS NOT IN ('resolved')
         {conn_sql}
         """,
         params,
@@ -1764,10 +1800,12 @@ def get_agent_run_by_scan(scan_id: str) -> Optional[SimpleNamespace]:
 
 
 def count_open_findings_for_scan(scan_id: str) -> int:
-    """Number of still-open (detected/validated/in_progress) findings involved
-    in a scan. Used to decide whether resolving a finding has cleared a run's
-    whole queue. Matches on SCAN_ID (created here) OR LAST_SCAN_ID (updated/
-    reopened here) — see list_findings_by_scan for the same reasoning."""
+    """Number of still-open (open/reopened) findings involved in a scan.
+    Matches on SCAN_ID (created here) OR LAST_SCAN_ID (updated/reopened here)
+    — the finalizer's UPDATE/REOPEN branches preserve the original SCAN_ID
+    and only advance LAST_SCAN_ID, so filtering on SCAN_ID alone would miss
+    still-open findings this scan re-detected. Used to decide whether
+    resolving a finding has cleared a run's whole queue."""
     if not scan_id:
         return 0
     in_open = ", ".join(f"'{s}'" for s in _OPEN_FINDING_STATUSES)
@@ -2893,8 +2931,8 @@ def get_lessons_for_synthesis(
 # updated across scans. See services/scan_finalizer.py for the state machine.
 # ═══════════════════════════════════════════════════════════════════════════
 
-_LIFECYCLE_OPEN = ("detected", "validated", "in_progress", "assigned", "acknowledged")
-_LIFECYCLE_RESOLVED = ("resolved", "false_positive", "wont_fix", "closed")
+_LIFECYCLE_OPEN = ("open", "reopened")
+_LIFECYCLE_RESOLVED = ("resolved",)
 _FAIL_HISTORY_MAX = 50
 
 
@@ -2986,18 +3024,37 @@ def apply_finding_update(
         "fail_count": int(fail_count),
         "total_count": int(total_count),
     })
+    # Rebuild the count portion of description so it stays in sync with the
+    # current scan — e.g. "10 of 100 rows fail this check." → "7 of 100 rows
+    # fail this check." on the next run. We only rewrite the count prefix;
+    # any appended detail sentence (column name, AI hint) is preserved.
+    import re as _re
+    existing_desc = existing.description or ""
+    if total_count > 0:
+        new_count_prefix = f"{int(fail_count)} of {int(total_count)} rows fail this check."
+        updated_desc = _re.sub(
+            r'^\d+ of \d+ rows fail this check\.', new_count_prefix, existing_desc
+        )
+        if updated_desc == existing_desc and not existing_desc.startswith(new_count_prefix):
+            # Description doesn't have the expected prefix — leave it alone.
+            updated_desc = existing_desc
+    else:
+        updated_desc = existing_desc
+
     set_clauses = [
         "LAST_SEEN_AT = CURRENT_TIMESTAMP()",
         "LAST_SCAN_ID = %(last_scan_id)s",
         "CURRENT_FAIL_COUNT = %(fail_count)s",
         "CURRENT_TOTAL_COUNT = %(total_count)s",
         "FAIL_HISTORY = PARSE_JSON(%(fail_history)s)",
+        "DESCRIPTION = %(description)s",
         "UPDATED_AT = CURRENT_TIMESTAMP()",
     ]
     params = {
         "id": finding_id, "last_scan_id": scan_id,
         "fail_count": int(fail_count), "total_count": int(total_count),
         "fail_history": json.dumps(hist, default=_json_default),
+        "description": updated_desc,
     }
     if severity:
         set_clauses.append("SEVERITY = %(severity)s"); params["severity"] = severity
@@ -3033,7 +3090,7 @@ def reopen_finding(
     severity: Optional[str] = None, evidence: Optional[dict] = None,
 ) -> SimpleNamespace:
     """REOPEN branch: recently-resolved finding failing again. Revive it
-    (reopened_count++, status='detected') instead of creating a duplicate;
+    (reopened_count++, status='reopened') instead of creating a duplicate;
     first_detected_at stays put so the original break is preserved."""
     existing = get_finding(finding_id)
     if not existing:
@@ -3045,14 +3102,27 @@ def reopen_finding(
         "total_count": int(total_count),
         "event": "reopened",
     })
+    import re as _re
+    existing_desc = existing.description or ""
+    if total_count > 0:
+        new_count_prefix = f"{int(fail_count)} of {int(total_count)} rows fail this check."
+        updated_desc = _re.sub(
+            r'^\d+ of \d+ rows fail this check\.', new_count_prefix, existing_desc
+        )
+        if updated_desc == existing_desc and not existing_desc.startswith(new_count_prefix):
+            updated_desc = existing_desc
+    else:
+        updated_desc = existing_desc
+
     set_clauses = [
-        "STATUS = 'detected'",
+        "STATUS = 'reopened'",
         "REOPENED_COUNT = COALESCE(REOPENED_COUNT, 0) + 1",
         "LAST_SEEN_AT = CURRENT_TIMESTAMP()",
         "LAST_SCAN_ID = %(scan_id)s",
         "CURRENT_FAIL_COUNT = %(fail_count)s",
         "CURRENT_TOTAL_COUNT = %(total_count)s",
         "FAIL_HISTORY = PARSE_JSON(%(fail_history)s)",
+        "DESCRIPTION = %(description)s",
         "RESOLVED_AT = NULL", "CLOSED_AT = NULL", "RESOLUTION_NOTES = NULL",
         "UPDATED_AT = CURRENT_TIMESTAMP()",
     ]
@@ -3060,6 +3130,7 @@ def reopen_finding(
         "id": finding_id, "scan_id": scan_id,
         "fail_count": int(fail_count), "total_count": int(total_count),
         "fail_history": json.dumps(hist, default=_json_default),
+        "description": updated_desc,
     }
     if severity:
         set_clauses.append("SEVERITY = %(severity)s"); params["severity"] = severity
@@ -3096,7 +3167,7 @@ def create_finding_with_lifecycle(
              CURRENT_FAIL_COUNT, CURRENT_TOTAL_COUNT, FAIL_HISTORY, REOPENED_COUNT)
         SELECT
             %(id)s, %(asset_id)s, %(scan_id)s, %(instance_id)s, %(title)s, %(description)s,
-            'detected', %(severity)s,
+            'open', %(severity)s,
             PARSE_JSON(%(context)s), PARSE_JSON(%(evidence)s),
             CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), %(scan_id)s,
             %(fail_count)s, %(total_count)s, PARSE_JSON(%(fail_history)s), 0
@@ -3270,11 +3341,15 @@ def list_maintenance_proposals(
 
 
 def has_pending_maintenance_proposal(instance_id: str, action: str) -> bool:
+    """True if a proposal for (instance, action) is already pending OR was
+    previously dismissed. Dismissed proposals stay suppressed forever so the
+    weekly sweep doesn't nag the user with the same suggestion after they've
+    said no."""
     rows = sf_session.query(
         """
         SELECT ID FROM MAINTENANCE_PROPOSALS
         WHERE INSTANCE_ID = %(iid)s AND ACTION = %(action)s
-          AND STATUS = 'pending'
+          AND STATUS IN ('pending', 'dismissed')
         LIMIT 1
         """,
         {"iid": instance_id, "action": action},
@@ -3299,6 +3374,116 @@ def decide_maintenance_proposal(
          "by": decided_by or "user",
          "reason": (reason or "")[:2000] if reason else None},
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MONITORED_METRICS — opt-in catalog gating what lands in METRIC_SNAPSHOTS.
+# Row exists ⇒ this (asset, column, metric) is being tracked.
+# No row ⇒ profiler value is discarded on the way to the snapshot table.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Universal table-level metrics — auto-enrolled the first time we see an asset.
+# Adding to this list means every existing + future asset gains that metric.
+DEFAULT_TABLE_LEVEL_METRICS = ("row_count", "freshness_lag_hours")
+
+
+def _col_pred_and_params(column_name: Optional[str], base_params: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    """Build a portable column-name predicate that handles the NULL-vs-value case
+    without relying on Snowflake IS NOT DISTINCT FROM semantics."""
+    params = dict(base_params)
+    if column_name is None:
+        return "COLUMN_NAME IS NULL", params
+    params["col"] = column_name
+    return "COLUMN_NAME = %(col)s", params
+
+
+def is_metric_monitored(asset_id: str, column_name: Optional[str], metric_name: str) -> bool:
+    pred, params = _col_pred_and_params(
+        column_name, {"asset": asset_id, "metric": metric_name},
+    )
+    rows = sf_session.query(
+        f"""
+        SELECT ID FROM MONITORED_METRICS
+        WHERE ASSET_ID = %(asset)s AND METRIC_NAME = %(metric)s AND {pred}
+        LIMIT 1
+        """,
+        params,
+    )
+    return bool(rows)
+
+
+def list_monitored_metrics(asset_id: str) -> list[dict]:
+    rows = sf_session.query(
+        """
+        SELECT COLUMN_NAME, METRIC_NAME, ENROLLMENT_SOURCE, ENROLLED_BY, ENROLLED_AT
+        FROM MONITORED_METRICS
+        WHERE ASSET_ID = %(a)s
+        ORDER BY METRIC_NAME, COLUMN_NAME
+        """,
+        {"a": asset_id},
+    )
+    return [
+        {
+            "column_name": r.get("COLUMN_NAME"),
+            "metric_name": r["METRIC_NAME"],
+            "enrollment_source": r.get("ENROLLMENT_SOURCE"),
+            "enrolled_by": r.get("ENROLLED_BY"),
+            "enrolled_at": r.get("ENROLLED_AT"),
+        }
+        for r in rows
+    ]
+
+
+def get_monitored_metric_set(asset_id: str) -> set[tuple[Optional[str], str]]:
+    """Fast dedup-membership set — used by record_metric_snapshots to filter
+    the profiler's output in Python without one query per candidate."""
+    rows = sf_session.query(
+        "SELECT COLUMN_NAME, METRIC_NAME FROM MONITORED_METRICS WHERE ASSET_ID = %(a)s",
+        {"a": asset_id},
+    )
+    return {(r.get("COLUMN_NAME"), r["METRIC_NAME"]) for r in rows}
+
+
+def enroll_metric(
+    asset_id: str, column_name: Optional[str], metric_name: str,
+    source: str, enrolled_by: Optional[str] = None,
+) -> bool:
+    """Idempotent enroll. Returns True on insert, False if already present."""
+    if is_metric_monitored(asset_id, column_name, metric_name):
+        return False
+    sf_session.execute(
+        """
+        INSERT INTO MONITORED_METRICS
+            (ID, ASSET_ID, COLUMN_NAME, METRIC_NAME, ENROLLMENT_SOURCE, ENROLLED_BY)
+        SELECT %(id)s, %(a)s, %(col)s, %(m)s, %(src)s, %(by)s
+        """,
+        {"id": _new_id(), "a": asset_id, "col": column_name,
+         "m": metric_name, "src": source, "by": enrolled_by},
+    )
+    return True
+
+
+def unenroll_metric(asset_id: str, column_name: Optional[str], metric_name: str) -> None:
+    pred, params = _col_pred_and_params(
+        column_name, {"asset": asset_id, "metric": metric_name},
+    )
+    sf_session.execute(
+        f"""
+        DELETE FROM MONITORED_METRICS
+        WHERE ASSET_ID = %(asset)s AND METRIC_NAME = %(metric)s AND {pred}
+        """,
+        params,
+    )
+
+
+def ensure_default_table_metrics(asset_id: str, enrolled_by: str = "auto_table") -> int:
+    """Called once per (scan, asset) to guarantee row_count / freshness_lag_hours
+    are enrolled. Idempotent — no-op if already enrolled."""
+    added = 0
+    for metric in DEFAULT_TABLE_LEVEL_METRICS:
+        if enroll_metric(asset_id, None, metric, "auto_table", enrolled_by):
+            added += 1
+    return added
 
 
 # ═══════════════════════════════════════════════════════════════════════════

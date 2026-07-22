@@ -6,11 +6,12 @@ import type { ColumnMeta, TableProfile, TopValue, ColumnProfile, HealthDot } fro
 import { useConnection } from '../ConnectionContext'
 import {
   Database, Table2, Columns3, BarChart3, Loader2, ChevronRight,
-  KeyRound, Hash, AlertCircle, ShieldCheck, History,
+  KeyRound, Hash, AlertCircle, ShieldCheck, History, Activity,
 } from 'lucide-react'
 import DataHealthPanel, { ColumnStatusDot } from './DataHealthPanel'
+import MetricsPanel from './MetricsPanel'
 
-type ExplorerTab = 'overview' | 'stats' | 'health'
+type ExplorerTab = 'overview' | 'stats' | 'health' | 'metrics'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -318,7 +319,24 @@ export default function DataExplorer() {
   const [profile, setProfile] = useState<TableProfile | null>(
     () => profileCache.get(fqnKey(selectedDatabase, selectedSchema, selectedTable)) ?? null
   )
-  const [tab, setTab] = useState<ExplorerTab>('overview')
+  // Initial tab: dashboards or other pages can request a specific tab by
+  // stashing it in localStorage before navigating here (matches the same
+  // pattern used for db/schema/table selection). The cleanup MUST be in a
+  // useEffect, not the initializer — StrictMode double-invokes useState
+  // initializers in dev, so removing the key there would fire the tab hint
+  // only on the first pass and drop back to 'overview' on the second.
+  const [tab, setTab] = useState<ExplorerTab>(() => {
+    try {
+      const requested = localStorage.getItem('dq_explorer_tab')
+      if (requested && ['overview', 'stats', 'health', 'metrics'].includes(requested)) {
+        return requested as ExplorerTab
+      }
+    } catch {}
+    return 'overview'
+  })
+  useEffect(() => {
+    try { localStorage.removeItem('dq_explorer_tab') } catch {}
+  }, [])
 
   const { selectedId: connId } = useConnection()
 
@@ -450,6 +468,7 @@ export default function DataExplorer() {
             { id: 'stats',    label: 'Column Stats', icon: BarChart3 },
             { id: 'health',   label: 'Data Health', icon: ShieldCheck,
               badge: health && health.rules_failing > 0 ? health.rules_failing : undefined },
+            { id: 'metrics',  label: 'Metrics', icon: Activity },
           ] as const).map(t => {
             const Icon = t.icon
             const active = tab === t.id
@@ -507,6 +526,11 @@ export default function DataExplorer() {
       {/* ── Data Health tab ────────────────────────────────────────────────── */}
       {selectedTable && tab === 'health' && (
         <DataHealthPanel database={selectedDatabase!} schema={selectedSchema!} table={selectedTable} />
+      )}
+
+      {/* ── Metrics tab ─────────────────────────────────────────────────────── */}
+      {selectedTable && tab === 'metrics' && (
+        <MetricsPanel database={selectedDatabase!} schema={selectedSchema!} table={selectedTable} />
       )}
 
       {/* ── Overview tab: meta strip + columns table ──────────────────────── */}

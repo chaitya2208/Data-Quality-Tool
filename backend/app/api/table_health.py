@@ -131,10 +131,10 @@ def get_fleet_overview(connection_id: Optional[str] = None, days: int = 30, top_
         f"""
         SELECT
             I.DATABASE_NAME AS DB, I.SCHEMA_NAME AS SC, I.TABLE_NAME AS TB,
-            COUNT_IF(F.STATUS IN ('detected','validated','in_progress','assigned','acknowledged')) AS OPEN_CT,
-            COUNT_IF(F.STATUS IN ('detected','validated','in_progress','assigned','acknowledged')
+            COUNT_IF(F.STATUS IN ('open','reopened')) AS OPEN_CT,
+            COUNT_IF(F.STATUS IN ('open','reopened')
                      AND COALESCE(F.REOPENED_COUNT, 0) > 0) AS FLAP_CT,
-            MIN(CASE WHEN F.STATUS IN ('detected','validated','in_progress','assigned','acknowledged')
+            MIN(CASE WHEN F.STATUS IN ('open','reopened')
                      THEN F.FIRST_DETECTED_AT END) AS OLDEST_OPEN_AT
         FROM FINDINGS F
         JOIN RULE_INSTANCES I ON I.ID = F.INSTANCE_ID
@@ -227,6 +227,16 @@ def get_table_health(database: str, schema: str, table: str):
 
     for inst in instances:
         defn = definitions.get(inst.definition_id)
+
+        # Schema drift instances are auto-provisioned system instances that only
+        # matter when drift is actively occurring. Hide them when they have no
+        # open finding — showing "yet to run" for 5 silent drift monitors is
+        # misleading noise.
+        open_finding = open_findings_by_instance.get(inst.id)
+        is_drift = (inst.target_config or {}).get("kind") == "schema_drift"
+        if is_drift and not open_finding:
+            continue
+
         executions = executions_by_instance.get(inst.id, [])
         latest = executions[0] if executions else None
         history = list(reversed(executions))  # oldest → newest for sparkline
@@ -252,10 +262,6 @@ def get_table_health(database: str, schema: str, table: str):
             prev = column_worst.get(c, "green")
             if STATUS_RANK[dot] > STATUS_RANK[prev]:
                 column_worst[c] = dot
-
-        # Enrich with the open finding's lifecycle data (if any) so the panel
-        # can show "failing for 3 days" + flapping badges per rule.
-        open_finding = open_findings_by_instance.get(inst.id)
         first_detected_at = open_finding.first_detected_at if open_finding else None
         reopened_count    = open_finding.reopened_count if open_finding else 0
         current_fail_count  = open_finding.current_fail_count if open_finding else None
@@ -379,7 +385,7 @@ def get_table_health_history(database: str, schema: str, table: str, days: int =
 
 def _count_open_findings(asset_id: str) -> int:
     """Count findings for an asset that are still open (lifecycle-open)."""
-    OPEN_STATUSES = ("detected", "validated", "in_progress", "assigned", "acknowledged")
+    OPEN_STATUSES = ("open", "reopened")
     total = 0
     for st in OPEN_STATUSES:
         t, _ = storage.list_findings(asset_id=asset_id, status=st, limit=1)

@@ -15,15 +15,17 @@ retries on its next cadence rather than hot-looping.
 """
 import threading
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 TICK_SECONDS = 60
+MAINTENANCE_INTERVAL = timedelta(days=7)
 
 _lock = threading.Lock()
 _timer: threading.Timer | None = None
 _running = False
+_last_maintenance_run: datetime | None = None
 
 
 def start() -> None:
@@ -65,8 +67,27 @@ def _tick() -> None:
         # A failure reading the schedule list (e.g. Snowflake unreachable) must
         # not stop the loop — log and re-arm for the next tick.
         logger.warning(f"[Scheduler] Tick failed: {e}")
+    try:
+        _maybe_run_maintenance()
+    except Exception as e:
+        logger.warning(f"[Scheduler] Maintenance sweep tick failed: {e}")
     finally:
         _arm()
+
+
+def _maybe_run_maintenance() -> None:
+    """Weekly MaintenanceAgent sweep — piggybacked on the same tick loop.
+    First tick after startup runs it; then every MAINTENANCE_INTERVAL after.
+    On failure the timestamp still advances so we don't hot-loop a broken sweep.
+    """
+    global _last_maintenance_run
+    now = datetime.now()
+    if _last_maintenance_run is not None and (now - _last_maintenance_run) < MAINTENANCE_INTERVAL:
+        return
+    _last_maintenance_run = now
+    from app.services.agents import maintenance_agent
+    result = maintenance_agent.run()
+    logger.info(f"[Scheduler] Maintenance sweep: {result}")
 
 
 def _process_due() -> None:

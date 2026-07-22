@@ -190,7 +190,7 @@ def _finding(
         "title": title,
         "description": description,
         "severity": severity,
-        "status": "detected",
+        "status": "open",
         "context": ctx,
         "evidence": ev,
     }

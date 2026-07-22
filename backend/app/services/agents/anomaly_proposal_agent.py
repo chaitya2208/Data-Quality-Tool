@@ -9,11 +9,15 @@ rule IF:
   - No prior PENDING_PROPOSALS row for the same target is already
     pending or was previously rejected (memo-style suppression).
 
-Routing:
-  - Agentic run (run.schedule_id is None): create RULE_INSTANCES rows with
-    status='pending' so they surface in the existing inline approval UI.
-  - Scheduled run (run.schedule_id set): create PENDING_PROPOSALS rows +
-    one NOTIFICATIONS entry so the dashboard bell picks them up.
+Routing (unified):
+  - Both agentic and scheduled runs write PENDING_PROPOSALS rows + one
+    NOTIFICATIONS entry. The Rule Library's "AI-proposed anomaly rules
+    awaiting review" section reads from PENDING_PROPOSALS, so this is the
+    single surface for reviewing anomaly proposals regardless of run type.
+    Historical note: agentic runs used to create pending RULE_INSTANCES
+    directly, but no UI surfaced those (the run had already left
+    awaiting_rule_review by the time the sweep fired), so proposals were
+    effectively orphaned.
 
 No Claude calls in Tier A — the rules are deterministic from baseline
 stats. LLM-authored rationale can be layered on later.
@@ -246,13 +250,17 @@ def run_for_scan(run: Any, table_asset: Any, scan_id: str) -> Dict[str, Any]:
     capped = candidates[:_MAX_PROPOSALS_PER_SCAN]
 
     is_scheduled = bool(getattr(run, "schedule_id", None))
+    # Route BOTH paths through PENDING_PROPOSALS + a notification. Previously
+    # the agentic path wrote pending RULE_INSTANCES that no UI surfaced —
+    # the Rule Library's pending panel filters to source='user' and the run
+    # has already left awaiting_rule_review by the time this fires, so the
+    # in-run review UI misses them too. Unifying on PENDING_PROPOSALS means
+    # anomaly proposals always show up in the purple "AI-proposed anomaly
+    # rules awaiting review" section regardless of run type.
     proposed = 0
     for c in capped:
         try:
-            if is_scheduled:
-                _emit_pending_proposal(run, table_asset, scan_id, c)
-            else:
-                _emit_inline_pending_instance(run, table_asset, c)
+            _emit_pending_proposal(run, table_asset, scan_id, c)
             proposed += 1
         except Exception as e:
             logger.warning(
@@ -260,7 +268,7 @@ def run_for_scan(run: Any, table_asset: Any, scan_id: str) -> Dict[str, Any]:
                 f"{c['metric_name']}/{c['column_name']}: {e}"
             )
 
-    if is_scheduled and proposed > 0:
+    if proposed > 0:
         try:
             _create_notification(run, table_asset, proposed)
         except Exception as e:
@@ -268,34 +276,6 @@ def run_for_scan(run: Any, table_asset: Any, scan_id: str) -> Dict[str, Any]:
 
     return {"proposed": proposed, "candidates": len(candidates),
             "scheduled": is_scheduled}
-
-
-def _emit_inline_pending_instance(run: Any, table_asset: Any, c: Dict[str, Any]) -> None:
-    """Agentic run — create a RULE_INSTANCES row with status='pending' so
-    the standard inline approval UI picks it up alongside RuleIntelligence
-    proposals."""
-    rule_sql = _rendered_sql(
-        c["template_shape"], c["target_config"], c["threshold_config"], table_asset,
-    )
-    fingerprint = _fingerprint(c["definition_id"], table_asset.id, c["target_config"])
-    scope = "column" if c["column_name"] else "table"
-    storage.create_instance(
-        definition_id=c["definition_id"],
-        scope=scope,
-        database_name=table_asset.database_name,
-        schema_name=table_asset.schema_name,
-        table_name=table_asset.table_name,
-        fingerprint=fingerprint,
-        severity=c["severity"],
-        target_config=c["target_config"],
-        threshold_config=c["threshold_config"],
-        rule_sql=rule_sql,
-        rationale=c["rationale"],
-        status="pending",
-        is_active=False,
-        created_by="anomaly_proposal_agent",
-        source_run_id=run.id,
-    )
 
 
 def _emit_pending_proposal(run: Any, table_asset: Any, scan_id: str,
@@ -341,7 +321,7 @@ def _emit_pending_proposal(run: Any, table_asset: Any, scan_id: str,
 def _create_notification(run: Any, table_asset: Any, count: int) -> None:
     notification_id = storage._new_id()
     fqn = f"{table_asset.database_name}.{table_asset.schema_name}.{table_asset.table_name}"
-    title = f"{count} new anomaly rule{'s' if count > 1 else ''} proposed for {fqn}"
+    title = f"{count} new anomaly rule{'s' if count > 1 else ''} proposed for {fqn}"[:500]
     body = (
         "Scheduled scan detected mature baselines and proposed anomaly-detection "
         "rules. Review and approve to start monitoring."

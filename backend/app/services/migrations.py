@@ -280,6 +280,67 @@ _MIGRATIONS = [
          CREATED_AT       TIMESTAMP_TZ(9) DEFAULT CURRENT_TIMESTAMP()
      )
      """),
+    # Opt-in catalog for anomaly-tracked metrics. Gates METRIC_SNAPSHOTS inserts
+    # so we only persist metrics someone (auto or user) has enrolled. Backfill
+    # runs after this to seed rows from existing baselines — nothing already
+    # tracked disappears when the gate turns on.
+    #
+    # ENROLLMENT_SOURCE: 'auto_table' (row_count/freshness on every asset),
+    #                    'anomaly_proposal' (AnomalyProposalAgent proposed it),
+    #                    'user' (manual "Track metric" button).
+    ("create_monitored_metrics",
+     """
+     CREATE TABLE IF NOT EXISTS MONITORED_METRICS (
+         ID                 VARCHAR(36) NOT NULL PRIMARY KEY,
+         ASSET_ID           VARCHAR(36) NOT NULL,
+         COLUMN_NAME        VARCHAR(255),
+         METRIC_NAME        VARCHAR(100) NOT NULL,
+         ENROLLMENT_SOURCE  VARCHAR(50)  NOT NULL,
+         ENROLLED_BY        VARCHAR(255),
+         ENROLLED_AT        TIMESTAMP_TZ(9) DEFAULT CURRENT_TIMESTAMP()
+     )
+     """),
+    # Backfill: seed the catalog from every (asset, column, metric) that
+    # already has a baseline. Runs once; subsequent runs are no-ops because of
+    # the anti-join. Uses 'anomaly_proposal' as the source label — anything in
+    # a baseline was either auto-tracked or came from a prior proposal cycle.
+    ("backfill_monitored_metrics_from_baselines",
+     """
+     INSERT INTO MONITORED_METRICS
+         (ID, ASSET_ID, COLUMN_NAME, METRIC_NAME, ENROLLMENT_SOURCE, ENROLLED_BY)
+     SELECT
+         UUID_STRING(), b.ASSET_ID, b.COLUMN_NAME, b.METRIC_NAME,
+         'anomaly_proposal', 'backfill'
+     FROM METRIC_BASELINES b
+     LEFT JOIN MONITORED_METRICS m
+         ON  m.ASSET_ID    = b.ASSET_ID
+         AND m.METRIC_NAME = b.METRIC_NAME
+         AND (
+             (m.COLUMN_NAME IS NULL AND b.COLUMN_NAME IS NULL)
+             OR m.COLUMN_NAME = b.COLUMN_NAME
+         )
+     WHERE m.ID IS NULL
+     """),
+    # Auto-enroll the two universally-valuable table-level metrics for every
+    # existing asset. New assets get these enrolled inline the first time
+    # record_metric_snapshots runs for them.
+    ("backfill_monitored_metrics_table_level",
+     """
+     INSERT INTO MONITORED_METRICS
+         (ID, ASSET_ID, COLUMN_NAME, METRIC_NAME, ENROLLMENT_SOURCE, ENROLLED_BY)
+     SELECT
+         UUID_STRING(), a.ID, NULL, mn.METRIC_NAME, 'auto_table', 'backfill'
+     FROM ASSETS a
+     CROSS JOIN (
+         SELECT 'row_count' AS METRIC_NAME
+         UNION ALL SELECT 'freshness_lag_hours'
+     ) mn
+     LEFT JOIN MONITORED_METRICS m
+         ON m.ASSET_ID    = a.ID
+        AND m.METRIC_NAME = mn.METRIC_NAME
+        AND m.COLUMN_NAME IS NULL
+     WHERE m.ID IS NULL
+     """),
     (
         "create_rule_intelligence_search",
         # Cortex Search — requires CORTEX_USER privilege.
@@ -395,6 +456,18 @@ _MIGRATIONS = [
             COMMENT         VARCHAR(2000),
             INDEXED_AT      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
         )
+        """,
+    ),
+    (
+        # Data migration: old finding statuses (false_positive, wont_fix,
+        # assigned, validated, detected, etc.) were removed from the UI/enum.
+        # Any row that isn't one of the three current valid values and isn't
+        # 'superseded' (a lifecycle-internal marker) should be treated as open.
+        "backfill_legacy_finding_statuses",
+        """
+        UPDATE FINDINGS
+        SET STATUS = 'open', UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE STATUS NOT IN ('open', 'reopened', 'resolved', 'superseded')
         """,
     ),
 ]

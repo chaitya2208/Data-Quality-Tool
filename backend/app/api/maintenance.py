@@ -58,21 +58,49 @@ def _instance_summary(instance_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _to_out(p: Any) -> Dict[str, Any]:
+def _to_out(
+    p: Any,
+    instances: Optional[Dict[str, Any]] = None,
+    definitions: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if instances is not None:
+        inst = instances.get(p.instance_id)
+        if inst is not None:
+            defn = (definitions or {}).get(inst.definition_id)
+            summary: Optional[Dict[str, Any]] = {
+                "id": inst.id,
+                "database_name": inst.database_name,
+                "schema_name": inst.schema_name,
+                "table_name": inst.table_name,
+                "severity": inst.severity,
+                "status": inst.status,
+                "definition_name": getattr(defn, "name", None),
+                "definition_id": inst.definition_id,
+            }
+        else:
+            summary = None
+    else:
+        summary = _instance_summary(p.instance_id)
     return MaintenanceProposalOut(
         id=p.id, instance_id=p.instance_id, action=p.action,
         reason=p.reason, evidence=p.evidence, status=p.status,
         decision_reason=p.decision_reason, decided_by=p.decided_by,
         decided_at=str(p.decided_at) if p.decided_at else None,
         created_at=str(p.created_at) if p.created_at else None,
-        instance_summary=_instance_summary(p.instance_id),
+        instance_summary=summary,
     ).model_dump()
 
 
 @router.get("/pending")
 def list_pending(limit: int = 200):
     proposals = storage.list_maintenance_proposals(status="pending", limit=limit)
-    return {"items": [_to_out(p) for p in proposals]}
+    if not proposals:
+        return {"items": []}
+    instance_ids = list({p.instance_id for p in proposals})
+    instances = storage.get_instances_by_ids(instance_ids)
+    definition_ids = list({inst.definition_id for inst in instances.values() if inst.definition_id})
+    definitions = storage.get_definitions_by_ids(definition_ids) if definition_ids else {}
+    return {"items": [_to_out(p, instances, definitions) for p in proposals]}
 
 
 @router.get("/{proposal_id}")
@@ -113,10 +141,48 @@ def approve(proposal_id: str, body: ApproveIn):
         storage.update_instance(
             p.instance_id, status=new_status, is_active=new_active,
         )
+        # Retiring (not pausing) an anomaly instance should un-enroll the
+        # underlying metric so we stop capturing snapshots for it. Pausing
+        # is temporary — keep the enrollment so history keeps flowing.
+        if new_status == "retired":
+            _maybe_unenroll_instance_metric(inst)
     storage.decide_maintenance_proposal(
         proposal_id, status="approved", decided_by=body.decided_by,
     )
     return {"ok": True, "instance_id": p.instance_id, "new_status": new_status}
+
+
+def _maybe_unenroll_instance_metric(inst: Any) -> None:
+    """If this rule instance is anomaly-shaped (target_config carries asset_id
+    + metric_name), un-enroll the corresponding MONITORED_METRICS row unless a
+    user enrolled it manually."""
+    try:
+        tc = inst.target_config or {}
+        asset_id = tc.get("asset_id")
+        metric = tc.get("metric_name")
+        col = tc.get("column")
+        if not (asset_id and metric):
+            return
+        from app.services.snowflake_session import session as sf
+        rows = sf.query(
+            """
+            SELECT ENROLLMENT_SOURCE FROM MONITORED_METRICS
+            WHERE ASSET_ID = %(a)s AND METRIC_NAME = %(m)s
+              AND (
+                (COLUMN_NAME IS NULL AND %(c)s IS NULL)
+                OR COLUMN_NAME = %(c)s
+              )
+            """,
+            {"a": asset_id, "m": metric, "c": col},
+        )
+        if not rows:
+            return
+        source = rows[0].get("ENROLLMENT_SOURCE")
+        if source in ("user", "auto_table"):
+            return
+        storage.unenroll_metric(asset_id, col, metric)
+    except Exception as e:
+        logger.debug(f"[maintenance] unenroll-on-retire failed: {e}")
 
 
 class DismissIn(BaseModel):

@@ -234,7 +234,7 @@ export default function DataHealthPanel({
                 <th className="px-3 py-2 font-medium">Columns</th>
                 <th className="px-3 py-2 font-medium">Pass rate</th>
                 <th className="px-3 py-2 font-medium">Recent runs</th>
-                <th className="px-3 py-2 font-medium">Last run</th>
+                {/* <th className="px-3 py-2 font-medium">Last run</th> */}
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-50 dark:divide-gray-700/50">
@@ -284,7 +284,7 @@ export default function DataHealthPanel({
                     <span className="text-xs text-gray-400 ml-1">({r.total_runs})</span>
                   </td>
                   <td className="px-3 py-2"><Sparkline history={r.history} /></td>
-                  <td className="px-3 py-2 text-xs text-gray-500 dark:text-gray-300">{fmtRelTime(r.last_executed_at)}</td>
+                  {/* <td className="px-3 py-2 text-xs text-gray-500 dark:text-gray-300">{fmtRelTime(r.last_executed_at)}</td> */}
                 </tr>
               ))}
             </tbody>
@@ -304,3 +304,4 @@ export function ColumnStatusDot({ status }: { status: HealthDot | undefined }) {
               : 'No rules on this column'
   return <span className={`inline-block w-2 h-2 rounded-full ${DOT_TONE[s]}`} title={label} />
 }
+

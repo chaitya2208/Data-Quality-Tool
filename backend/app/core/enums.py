@@ -24,13 +24,22 @@ class ScanType(str, enum.Enum):
 
 
 class FindingStatus(str, enum.Enum):
-    DETECTED = "detected"
-    ASSIGNED = "assigned"
-    IN_PROGRESS = "in_progress"
+    OPEN = "open"
+    REOPENED = "reopened"
     RESOLVED = "resolved"
-    CLOSED = "closed"
-    FALSE_POSITIVE = "false_positive"
-    WONT_FIX = "wont_fix"
+    # Future: FALSE_POSITIVE = "false_positive"
+    #
+    # A finding should be marked false_positive when the rule logic is correct
+    # but the specific instance is intentionally allowed (e.g. a table that
+    # deliberately has no owner because it's a temp scratch space). Unlike
+    # RESOLVED (which the scan engine can auto-set when the data cleans up),
+    # FALSE_POSITIVE would be a human-set terminal state that the lifecycle
+    # machine skips on rescan — the rule keeps executing and logging executions,
+    # but no new incident is opened or reopened for that (instance, asset) pair.
+    # Implement by: (1) adding FALSE_POSITIVE here, (2) adding it to
+    # _LIFECYCLE_RESOLVED in storage.py so find_recently_resolved_finding
+    # does NOT reopen it, (3) treating it as "closed" in all open-status SQL
+    # sets, and (4) adding a PATCH endpoint or UI action to set it.
 
 
 class RuleSeverity(str, enum.Enum):

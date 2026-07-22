@@ -88,7 +88,13 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
           )}
 
           <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-1">{finding.title}</h3>
-          <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">{finding.description}</p>
+          {/* Strip the leading "N of M rows fail this check." sentence — the live
+              current_fail_count chip below shows the up-to-date count. Showing
+              both causes a stale-vs-live mismatch that confuses users. */}
+          {(() => {
+            const stripped = (finding.description ?? '').replace(/^\d+ of \d+ rows fail this check\.\s*/, '')
+            return stripped ? <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">{stripped}</p> : null
+          })()}
 
           {/* AI Explanation */}
           {ai && (
@@ -130,7 +136,7 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
                   : <ChevronRight className="w-3.5 h-3.5" />
                 }
                 <TableIcon className="w-3.5 h-3.5" />
-                {sampleRows.length} sample failing row{sampleRows.length !== 1 ? 's' : ''}
+                {sampleRows.length} sample row{sampleRows.length !== 1 ? 's' : ''} (of {(finding.current_fail_count ?? sampleRows.length).toLocaleString()} failing)
               </button>
               {showSamples && (
                 <div className="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-700">
@@ -425,14 +431,9 @@ export default function Findings() {
   }[s] ?? 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   const stColor = (s: string) => ({
-    detected:       'bg-red-50 text-red-700 border-red-200',
-    validated:      'bg-orange-50 text-orange-700 border-orange-200',
-    in_progress:    'bg-blue-50 text-blue-700 border-blue-200',
-    resolved:       'bg-green-50 text-green-700 border-green-200',
-    false_positive: 'bg-gray-100 text-gray-500 border-gray-300',
-    wont_fix:       'bg-yellow-50 text-yellow-700 border-yellow-200',
-    closed:         'bg-gray-50 text-gray-500 border-gray-200',
-    superseded:     'bg-purple-50 text-purple-600 border-purple-200',
+    open:     'bg-red-50 text-red-700 border-red-200',
+    reopened: 'bg-orange-50 text-orange-700 border-orange-200',
+    resolved: 'bg-green-50 text-green-700 border-green-200',
   }[s] ?? 'bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   return (
@@ -549,14 +550,9 @@ export default function Findings() {
             <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Statuses</option>
-              <option value="detected">Detected</option>
-              <option value="validated">Validated</option>
-              <option value="in_progress">In Progress</option>
+              <option value="open">Open</option>
+              <option value="reopened">Reopened</option>
               <option value="resolved">Resolved</option>
-              <option value="false_positive">False Positive</option>
-              <option value="wont_fix">Won't Fix</option>
-              <option value="closed">Closed</option>
-              <option value="superseded">Superseded</option>
             </select>
           </div>
         </div>

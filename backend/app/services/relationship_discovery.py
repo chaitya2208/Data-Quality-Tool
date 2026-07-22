@@ -11,11 +11,17 @@ missing input: a persisted, per-schema relationship catalog Claude (and the
 deterministic candidate generator in rule_intelligence_agent.py) can draw
 real targets from.
 
-Naming-convention based, not domain-specific: an FK-shaped column (ends in
-_ID, not its own table's surrogate key) is matched against PK-shaped columns
-(same regex dynamic_rules.py/profiler_agent.py already use) in every other
-table in the schema. This generalizes to any schema using conventional
-naming — it does not encode anything about what CUSTOMERS/ORDERS/etc. mean.
+Naming-convention based, not domain-specific. Two candidate-generation paths:
+
+  1. Exact name match — ORDERS.CUSTOMER_ID → CUSTOMERS.CUSTOMER_ID.
+     FK-shaped column (_ID, _KEY, _REF suffix) matches the same name in
+     another table's PK-shaped columns. Handles the majority of schemas that
+     carry the full entity name in both the FK and PK column.
+
+  2. Prefix match — ORDERS.CUSTOMER_ID → CUSTOMERS.ID.
+     FK column {PREFIX}_ID where the referenced table's name is the
+     plural/singular form of PREFIX and carries a bare ID PK. Handles
+     schemas that use bare ID as the surrogate key (Django, Rails style).
 
 Cached per (database, schema) with a TTL so a schema-scope batch run only
 pays discovery cost once, on the first table, not once per table.
@@ -38,7 +44,9 @@ ORPHAN_CONFIRM_THRESHOLD = 0.90      # orphan_rate >= this ⇒ not a real FK, ma
 
 # Same PK-shape pattern as profiler_agent.py / dynamic_rules.py.
 _PK_SHAPE_RE = re.compile(r"(^ID$|_ID$|^PK_|_PK$|_KEY$|_SEQ$|_SURROGATE)", re.I)
-_FK_SHAPE_RE = re.compile(r"_ID$", re.I)
+# Extended to _KEY and _REF suffixes in addition to _ID — catches columns like
+# CUSTOMER_KEY, PRODUCT_REF that follow a FK naming convention but not _ID.
+_FK_SHAPE_RE = re.compile(r"(_ID|_KEY|_REF)$", re.I)
 
 # Snowflake INFORMATION_SCHEMA.DATA_TYPE values, grouped into join-compatible
 # families. A name-matched FK/PK pair whose two columns fall in DIFFERENT
@@ -143,9 +151,10 @@ def _cache_covers_table(
 def _fresh_enough(rows: List[Any], ttl_hours: int) -> bool:
     if not rows:
         return False
-    oldest_check = min(r.last_verified_at for r in rows if r.last_verified_at)
-    if oldest_check is None:
+    timestamps = [r.last_verified_at for r in rows if r.last_verified_at]
+    if not timestamps:
         return False
+    oldest_check = min(timestamps)
     if oldest_check.tzinfo is None:
         oldest_check = oldest_check.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) - oldest_check < timedelta(hours=ttl_hours)
@@ -179,8 +188,22 @@ def _discover(database: str, schema_name: str) -> List[Any]:
     # PRODUCT_CATALOG whose PK (PRODUCT_ID) doesn't share the table's name.
     pk_shaped = _resolve_pk_ownership_by_relative_uniqueness(database, schema_name, pk_shaped_by_name)
 
-    candidates = _build_candidates(fk_shaped, pk_shaped)
-    logger.info(f"[RelationshipDiscovery] {len(candidates)} name-match candidates found")
+    all_tables = list(columns_by_table.keys())
+    exact_candidates = _build_candidates(fk_shaped, pk_shaped)
+    prefix_candidates = _build_prefix_candidates(fk_shaped, pk_shaped, all_tables)
+    # Deduplicate: prefix match may overlap with exact match on some schemas.
+    seen = {(c["from_table"], c["from_column"], c["to_table"], c["to_column"])
+            for c in exact_candidates}
+    for c in prefix_candidates:
+        key = (c["from_table"], c["from_column"], c["to_table"], c["to_column"])
+        if key not in seen:
+            exact_candidates.append(c)
+            seen.add(key)
+    candidates = exact_candidates
+    logger.info(
+        f"[RelationshipDiscovery] {len(candidates)} candidates found "
+        f"(includes {len(prefix_candidates)} prefix-match)"
+    )
 
     row_counts = _fetch_row_counts(database, schema_name)
 
@@ -227,7 +250,19 @@ def _discover(database: str, schema_name: str) -> List[Any]:
         )
         verified_count += 1
         if orphan_result is None:
-            continue  # query failed (e.g. type mismatch) — not a real candidate
+            # Query failed (genuine SQL error / type mismatch) — discard.
+            continue
+        if orphan_result == "empty":
+            # Child table has zero rows — can't compute an orphan rate yet.
+            # Save as confirmed/name_match_unverified so the relationship is
+            # not silently lost; it will be re-verified on the next discovery
+            # run once data arrives.
+            catalog_rows.append({
+                "from_table": cand["from_table"], "from_column": cand["from_column"],
+                "to_table": cand["to_table"], "to_column": cand["to_column"],
+                "status": "confirmed", "confidence": "name_match_unverified",
+            })
+            continue
 
         orphan_rate, total, orphans = orphan_result
         status = "rejected" if orphan_rate >= ORPHAN_CONFIRM_THRESHOLD else "confirmed"
@@ -299,19 +334,50 @@ def _resolve_pk_ownership_by_relative_uniqueness(
 
 
 def _own_pk_names(table: str) -> set:
-    """Rough singularization guess for 'this table's own surrogate key',
-    same heuristic dynamic_rules.py::check_fk_without_constraint uses — a
-    FK-shaped column matching this is excluded from FK candidates (it's the
-    table's own PK, not a reference to something else)."""
-    table_upper = table.upper().rstrip("S")
-    return {f"{table_upper}_ID", "SURROGATE_KEY", "ROW_ID", "RECORD_ID"}
+    """Returns the set of column name strings that are most likely this
+    table's OWN surrogate key, so they are excluded from the FK candidate
+    list (they reference nothing external).
+
+    Covers four cases:
+      1. Full table name + _ID  : ORDERS → ORDERS_ID
+      2. Singular + _ID         : ORDERS → ORDER_ID  (strip trailing S)
+      3. Acronym + _ID          : PRODUCT_CATEGORIES → PC_ID
+      4. Universal surrogate names: SURROGATE_KEY, ROW_ID, RECORD_ID, ID
+
+    The old approach (rstrip("S")) produced CATEGORIE_ID for CATEGORIES and
+    STATU_ID for STATUS — both wrong. The new approach adds the full-name
+    form so CATEGORIES_ID is also excluded, and keeps the simple strip-S
+    form for the common ORDERS→ORDER_ID case without breaking it.
+    """
+    t = table.upper()
+    names = {
+        f"{t}_ID",           # full name: ORDERS_ID
+        f"{t}_KEY",          # full name: ORDERS_KEY
+        "SURROGATE_KEY", "ROW_ID", "RECORD_ID", "ID",
+    }
+    # Simple strip-S singularization (ORDERS→ORDER, CUSTOMERS→CUSTOMER).
+    # Guard: only apply when the stripped form ends in a consonant — this
+    # blocks irregular plurals like CATEGORIES→CATEGORIE (ends in E) and
+    # STATUS→STATU (ends in U) while correctly handling ORDERS→ORDER (R),
+    # CUSTOMERS→CUSTOMER (R), PRODUCTS→PRODUCT (T), USERS→USER (R).
+    _VOWELS = set("AEIOU")
+    stripped = t[:-1] if t.endswith("S") else t
+    if stripped != t and len(stripped) >= 3 and stripped[-1] not in _VOWELS:
+        names.add(f"{stripped}_ID")
+        names.add(f"{stripped}_KEY")
+    # Acronym: first letter of each underscore-delimited word.
+    # PRODUCT_CATEGORIES → PC_ID, ORDER_ITEMS → OI_ID.
+    parts = t.split("_")
+    if len(parts) >= 2:
+        acronym = "".join(p[0] for p in parts if p)
+        names.add(f"{acronym}_ID")
+        names.add(f"{acronym}_KEY")
+    return names
 
 
 def _build_candidates(fk_shaped: Dict[str, List[str]], pk_shaped: Dict[str, List[str]]) -> List[dict]:
-    """FK-shaped column name matches a PK-shaped column name in a DIFFERENT
-    table -> candidate relationship. Exact name match only (e.g.
-    CUSTOMER_ID -> CUSTOMER_ID) — deliberately conservative to keep
-    candidate count bounded without needing fuzzy matching."""
+    """Exact name match: FK column name == PK column name in a different table.
+    E.g. ORDERS.CUSTOMER_ID → CUSTOMERS.CUSTOMER_ID."""
     candidates = []
     for from_table, fk_cols in fk_shaped.items():
         for fk_col in fk_cols:
@@ -324,6 +390,72 @@ def _build_candidates(fk_shaped: Dict[str, List[str]], pk_shaped: Dict[str, List
                             "from_table": from_table, "from_column": fk_col,
                             "to_table": to_table, "to_column": pk_col,
                         })
+    return candidates
+
+
+# Suffixes stripped from FK columns to extract the entity prefix for
+# prefix matching. Order matters: longer suffixes checked first so
+# CUSTOMER_REF_ID doesn't match as prefix=CUSTOMER_REF.
+_FK_SUFFIXES = ("_ID", "_KEY", "_REF")
+
+# Bare PK column names that a prefix-match target table may use.
+_BARE_PK_NAMES = {"ID", "PK", "KEY", "SEQ"}
+
+
+def _build_prefix_candidates(
+    fk_shaped: Dict[str, List[str]],
+    pk_shaped: Dict[str, List[str]],
+    all_tables: List[str],
+) -> List[dict]:
+    """Prefix match: ORDERS.CUSTOMER_ID → CUSTOMERS.ID.
+
+    For an FK column like CUSTOMER_ID, strip the suffix (_ID/_KEY/_REF) to
+    get the entity prefix (CUSTOMER). Then look for a table whose name is
+    the singular or plural form of that prefix (CUSTOMER or CUSTOMERS) and
+    which owns a bare PK column (ID, PK, KEY, SEQ). This covers schemas
+    that use bare surrogate keys (Django/Rails style) rather than carrying
+    the full entity name in the PK column.
+
+    Deliberately conservative — only fires when:
+      - There is exactly one candidate table for the prefix (no ambiguity).
+      - That table appears in pk_shaped (has at least one PK-shaped column).
+      - That table actually has a bare ID/PK/KEY/SEQ column in pk_shaped.
+    """
+    # Build a quick lookup: uppercase table name -> original table name
+    table_name_map = {t.upper(): t for t in all_tables}
+
+    candidates = []
+    for from_table, fk_cols in fk_shaped.items():
+        for fk_col in fk_cols:
+            col_upper = fk_col.upper()
+            prefix = None
+            for suffix in _FK_SUFFIXES:
+                if col_upper.endswith(suffix):
+                    prefix = col_upper[: -len(suffix)]
+                    break
+            if not prefix:
+                continue
+
+            # Candidate table names: exact prefix and simple plural (+S).
+            candidate_table_names = {prefix, prefix + "S"}
+            matched_tables = [
+                table_name_map[n] for n in candidate_table_names
+                if n in table_name_map
+            ]
+            # Skip if ambiguous (both CUSTOMER and CUSTOMERS exist).
+            if len(matched_tables) != 1:
+                continue
+            to_table = matched_tables[0]
+            if to_table == from_table:
+                continue
+            # Target table must have PK-shaped columns and one must be bare.
+            pk_cols_for_target = pk_shaped.get(to_table, [])
+            bare_pks = [c for c in pk_cols_for_target if c.upper() in _BARE_PK_NAMES]
+            for bare_pk in bare_pks:
+                candidates.append({
+                    "from_table": from_table, "from_column": fk_col,
+                    "to_table": to_table, "to_column": bare_pk,
+                })
     return candidates
 
 
@@ -363,7 +495,7 @@ def _fetch_row_counts(database: str, schema_name: str) -> Dict[str, int]:
         logger.warning(f"[RelationshipDiscovery] Could not fetch row counts for {database}.{schema_name}: {e}")
         return {}
     return {
-        (r.get("name") or r.get("NAME") or ""): int(r.get("rows") or r.get("ROWS") or 0)
+        (r.get("name") or r.get("NAME") or "").upper(): int(r.get("rows") or r.get("ROWS") or 0)
         for r in rows
     }
 
@@ -372,13 +504,16 @@ def _verify_orphan_rate(
     database: str, schema_name: str,
     from_table: str, from_column: str, to_table: str, to_column: str,
     row_counts: Dict[str, int],
-) -> Optional[tuple]:
-    """Returns (orphan_rate, sample_total, sample_orphans), or None if the
-    verification query itself fails (e.g. incompatible types — not a real
-    FK candidate, just a name collision)."""
+):
+    """Returns one of:
+      - (orphan_rate, sample_total, sample_orphans)  — normal result
+      - "empty"   — child table has zero rows; relationship preserved as
+                    name_match_unverified, not discarded
+      - None      — query failed (SQL error / type mismatch); discard candidate
+    """
     from_fqn = f"{database}.{schema_name}.{from_table}"
     to_fqn = f"{database}.{schema_name}.{to_table}"
-    from_rows = row_counts.get(from_table, 0)
+    from_rows = row_counts.get(from_table.upper(), 0)
 
     source_expr = f"{from_fqn}"
     if from_rows > LARGE_TABLE_ROW_GUARD:
@@ -403,5 +538,5 @@ def _verify_orphan_rate(
     total = rows[0].get("TOTAL") or 0
     orphans = rows[0].get("ORPHANS") or 0
     if total == 0:
-        return None
+        return "empty"
     return orphans / total, total, orphans

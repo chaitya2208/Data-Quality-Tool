@@ -264,7 +264,13 @@ export default function FindingDetailDrawer({
             <div>
               <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-1.5">
                 <TableIcon className="w-4 h-4" />
-                Sample failing rows ({sampleRows.length})
+                Sample rows
+                <span className="text-xs font-normal text-gray-400">
+                  {sampleRows.length} shown
+                  {finding.current_fail_count != null && finding.current_fail_count > sampleRows.length
+                    ? ` of ${finding.current_fail_count.toLocaleString()} failing`
+                    : ''}
+                </span>
               </h3>
               <div className="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-700">
                 <table className="text-xs w-full">

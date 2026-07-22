@@ -2,11 +2,12 @@ import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { workflowsApi, agentRunsApi, assetsApi, ruleLibraryApi, type WorkflowTemplate, type RulePattern } from '../api/client'
+import { ScheduleModal } from './Schedules'
 import { useConnection } from '../ConnectionContext'
 import {
   BookOpen, Play, Pencil, Trash2, X, Save,
   ChevronDown, ChevronRight, Database, AlertTriangle, Loader2,
-  Plus, Search,
+  Plus, Search, Clock,
 } from 'lucide-react'
 
 // ── Searchable combobox ───────────────────────────────────────────────────────
@@ -103,27 +104,39 @@ function RunModal({
 }) {
   const navigate = useNavigate()
   const { selectedId } = useConnection()
+
+  const hasOrigin = !!(workflow.origin_database && workflow.origin_schema && workflow.origin_table)
+  // Default to re-running on the exact origin — that's the common case.
+  // "different" lets the user pick another target for the rare cross-table apply.
+  const [mode, setMode] = useState<'origin' | 'different'>(hasOrigin ? 'origin' : 'different')
   const [scope, setScope] = useState<'table' | 'schema' | 'database'>('table')
   const [database, setDatabase] = useState('')
   const [schemaName, setSchemaName] = useState('')
   const [table, setTable] = useState('')
 
+  // Effective target the run will use.
+  const effDatabase   = mode === 'origin' ? (workflow.origin_database  ?? '') : database
+  const effSchemaName = mode === 'origin' ? (workflow.origin_schema    ?? '') : schemaName
+  const effTable      = mode === 'origin' ? (workflow.origin_table     ?? '') : table
+  const effScope: 'table' | 'schema' | 'database' = mode === 'origin' ? 'table' : scope
+
   const { data: dbData, isFetching: dbLoading } = useQuery({
     queryKey: ['databases', selectedId],
     queryFn: () => assetsApi.discoverDatabases(selectedId).then(r => r.data),
+    enabled: mode === 'different',
     staleTime: 5 * 60_000,
   })
   const { data: schemaData, isFetching: schemaLoading, isError: schemaError } = useQuery({
     queryKey: ['schemas', selectedId, database],
     queryFn: () => assetsApi.discoverSchemas(database, selectedId).then(r => r.data),
-    enabled: !!database,
+    enabled: mode === 'different' && !!database,
     staleTime: 5 * 60_000,
     retry: false,
   })
   const { data: tableData, isFetching: tableLoading, isError: tableError } = useQuery({
     queryKey: ['tables', selectedId, database, schemaName],
     queryFn: () => assetsApi.discoverTables(database, schemaName, selectedId).then(r => r.data),
-    enabled: !!database && !!schemaName && scope === 'table',
+    enabled: mode === 'different' && !!database && !!schemaName && scope === 'table',
     staleTime: 5 * 60_000,
     retry: false,
   })
@@ -132,19 +145,21 @@ function RunModal({
   const schemas   = schemaData?.schemas ?? []
   const tables    = tableData?.tables ?? []
 
-  const canRun = !!database && (
-    scope === 'database' ||
-    (scope === 'schema' && !!schemaName) ||
-    (scope === 'table' && !!schemaName && !!table)
-  )
+  const canRun = mode === 'origin'
+    ? hasOrigin
+    : !!database && (
+        scope === 'database' ||
+        (scope === 'schema' && !!schemaName) ||
+        (scope === 'table' && !!schemaName && !!table)
+      )
 
   const runMutation = useMutation({
     mutationFn: () =>
       agentRunsApi.startBatch({
-        scope,
-        database,
-        schema_name: schemaName || undefined,
-        table: table || undefined,
+        scope: effScope,
+        database: effDatabase,
+        schema_name: effSchemaName || undefined,
+        table: effTable || undefined,
         connection_id: selectedId,
         workflow_template_id: workflow.id,
       }),
@@ -176,61 +191,99 @@ function RunModal({
           Column-scoped rules are skipped if the column doesn't exist on the target table.
         </p>
 
-        <div className="space-y-3">
-          <div>
-            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Scope</label>
-            <select
-              value={scope}
-              onChange={e => setScope(e.target.value as any)}
-              className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
-            >
-              <option value="table">Single table</option>
-              <option value="schema">All tables in schema</option>
-              <option value="database">All tables in database</option>
-            </select>
+        {hasOrigin && (
+          <div className="mb-4 space-y-2">
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300">Target</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setMode('origin')}
+                className={`text-left px-3 py-2 rounded-lg border text-xs ${
+                  mode === 'origin'
+                    ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/30 text-primary-800 dark:text-primary-200'
+                    : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/50'
+                }`}
+              >
+                <div className="font-medium">Re-run on origin table</div>
+                <div className="mt-0.5 font-mono text-[11px] break-all">
+                  {workflow.origin_database}.{workflow.origin_schema}.{workflow.origin_table}
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode('different')}
+                className={`text-left px-3 py-2 rounded-lg border text-xs ${
+                  mode === 'different'
+                    ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/30 text-primary-800 dark:text-primary-200'
+                    : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/50'
+                }`}
+              >
+                <div className="font-medium">Different target</div>
+                <div className="mt-0.5 text-[11px] text-gray-500 dark:text-gray-400">
+                  Pick another table, schema, or database.
+                </div>
+              </button>
+            </div>
           </div>
+        )}
 
-          <div>
-            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Database</label>
-            <Combobox
-              value={database}
-              onChange={v => { setDatabase(v); setSchemaName(''); setTable('') }}
-              options={databases}
-              placeholder="Search databases…"
-              loading={dbLoading}
-            />
-          </div>
-
-          {(scope === 'table' || scope === 'schema') && (
+        {mode === 'different' && (
+          <div className="space-y-3">
             <div>
-              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Schema</label>
+              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Scope</label>
+              <select
+                value={scope}
+                onChange={e => setScope(e.target.value as any)}
+                className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 dark:text-gray-100"
+              >
+                <option value="table">Single table</option>
+                <option value="schema">All tables in schema</option>
+                <option value="database">All tables in database</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Database</label>
               <Combobox
-                value={schemaName}
-                onChange={v => { setSchemaName(v); setTable('') }}
-                options={schemas}
-                placeholder={database ? 'Search schemas…' : 'Select a database first'}
-                loading={schemaLoading}
-                disabled={!database}
-                error={schemaError}
+                value={database}
+                onChange={v => { setDatabase(v); setSchemaName(''); setTable('') }}
+                options={databases}
+                placeholder="Search databases…"
+                loading={dbLoading}
               />
             </div>
-          )}
 
-          {scope === 'table' && (
-            <div>
-              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Table</label>
-              <Combobox
-                value={table}
-                onChange={setTable}
-                options={tables}
-                placeholder={schemaName ? 'Search tables…' : 'Select a schema first'}
-                loading={tableLoading}
-                disabled={!schemaName}
-                error={tableError}
-              />
-            </div>
-          )}
-        </div>
+            {(scope === 'table' || scope === 'schema') && (
+              <div>
+                <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Schema</label>
+                <Combobox
+                  value={schemaName}
+                  onChange={v => { setSchemaName(v); setTable('') }}
+                  options={schemas}
+                  placeholder={database ? 'Search schemas…' : 'Select a database first'}
+                  loading={schemaLoading}
+                  disabled={!database}
+                  error={schemaError}
+                />
+              </div>
+            )}
+
+            {scope === 'table' && (
+              <div>
+                <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Table</label>
+                <Combobox
+                  value={table}
+                  onChange={setTable}
+                  options={tables}
+                  placeholder={schemaName ? 'Search tables…' : 'Select a schema first'}
+                  loading={tableLoading}
+                  disabled={!schemaName}
+                  error={tableError}
+                />
+              </div>
+            )}
+          </div>
+        )}
 
         {runMutation.isError && (
           <p className="mt-3 text-xs text-red-600">
@@ -714,6 +767,7 @@ export default function SavedWorkflows() {
   const qc = useQueryClient()
   const [runTarget, setRunTarget] = useState<WorkflowTemplate | null>(null)
   const [editTarget, setEditTarget] = useState<WorkflowTemplate | null>(null)
+  const [scheduleTarget, setScheduleTarget] = useState<WorkflowTemplate | null>(null)
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
 
@@ -780,11 +834,21 @@ export default function SavedWorkflows() {
                     {wf.description}
                   </p>
                 )}
-                <div className="flex items-center gap-3 mt-2 text-xs text-gray-400">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-xs text-gray-400">
                   <span className="flex items-center gap-1">
                     <Database className="w-3.5 h-3.5" />
                     {wf.pattern_count} rule pattern{wf.pattern_count !== 1 ? 's' : ''}
                   </span>
+                  {wf.origin_database && (
+                    <span
+                      className="font-mono text-gray-500 dark:text-gray-300 break-all"
+                      title="Table this workflow was created from"
+                    >
+                      {wf.origin_database}
+                      {wf.origin_schema ? `.${wf.origin_schema}` : ''}
+                      {wf.origin_table ? `.${wf.origin_table}` : ''}
+                    </span>
+                  )}
                   <span>Saved {new Date(wf.created_at).toLocaleDateString()}</span>
                   {wf.created_by && <span>by {wf.created_by}</span>}
                 </div>
@@ -822,6 +886,14 @@ export default function SavedWorkflows() {
                 >
                   <Play className="w-3.5 h-3.5" />
                   Run
+                </button>
+                <button
+                  onClick={() => setScheduleTarget(wf)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-primary-700 dark:text-primary-300 bg-primary-50 dark:bg-primary-900/30 border border-primary-200 dark:border-primary-800 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/50 transition-colors"
+                  title="Create a schedule that runs this workflow on a cadence"
+                >
+                  <Clock className="w-3.5 h-3.5" />
+                  Schedule
                 </button>
                 <button
                   onClick={() => setEditTarget(wf)}
@@ -869,6 +941,13 @@ export default function SavedWorkflows() {
       {runTarget && <RunModal workflow={runTarget} onClose={() => setRunTarget(null)} />}
       {editTarget && <EditModal workflow={editTarget} onClose={() => setEditTarget(null)} />}
       {createOpen && <CreateModal onClose={() => setCreateOpen(false)} />}
+      {scheduleTarget && (
+        <ScheduleModal
+          existing={null}
+          prefillWorkflowId={scheduleTarget.id}
+          onClose={() => setScheduleTarget(null)}
+        />
+      )}
     </div>
   )
 }

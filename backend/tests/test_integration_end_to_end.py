@@ -294,8 +294,7 @@ class TestFindingLifecycleOnRealData:
 
         _run_scan(db, sch, tbl, connection_id)
         before = _findings_for(db, sch, tbl)
-        open_before = [f for f in before if f.get("STATUS") in
-                        ("detected", "validated", "in_progress")]
+        open_before = [f for f in before if f.get("STATUS") in ("open", "reopened")]
         assert open_before, "No open findings — nothing to resolve"
 
         # Fix: update every NULL CUSTOMER_ID to a valid number
@@ -305,10 +304,7 @@ class TestFindingLifecycleOnRealData:
         after = _findings_for(db, sch, tbl)
 
         # At least one previously-open finding should now be resolved
-        resolved_ids = {
-            f["ID"] for f in after
-            if f.get("STATUS") in ("resolved", "closed")
-        }
+        resolved_ids = {f["ID"] for f in after if f.get("STATUS") == "resolved"}
         original_open_ids = {f["ID"] for f in open_before}
         assert resolved_ids & original_open_ids, (
             "No open finding was auto-resolved after data fix — RESOLVE branch broken"
@@ -338,11 +334,11 @@ class TestFindingLifecycleOnRealData:
         time.sleep(1)
         _run_scan(db, sch, tbl, connection_id, approve_all=False)
 
-        # Same finding should now be status='detected' with reopened_count=1
+        # Same finding should now be status='reopened' with reopened_count=1
         reopened = [
             f for f in _findings_for(db, sch, tbl)
             if f["ID"] in {r["ID"] for r in resolved_findings}
-            and f.get("STATUS") == "detected"
+            and f.get("STATUS") == "reopened"
         ]
         assert reopened, "Failing rule after resolve did not reopen finding — REOPEN broken"
         assert reopened[0].get("REOPENED_COUNT", 0) >= 1

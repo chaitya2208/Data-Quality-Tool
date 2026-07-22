@@ -839,7 +839,7 @@ export default function AgentWorkflow() {
   })
 
   const liveResolved  = liveFindings?.findings.filter(
-    f => ['resolved', 'false_positive', 'wont_fix', 'closed'].includes(f.status)
+    f => f.status === 'resolved'
   ).length ?? null
   const liveTotal     = liveFindings?.findings.length ?? activeRun?.findings_count ?? 0
   const liveRemaining = liveTotal - (liveResolved ?? 0)

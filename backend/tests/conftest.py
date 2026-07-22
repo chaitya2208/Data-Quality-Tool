@@ -126,7 +126,7 @@ def make_finding(
     instance_id: str = "inst-abc",
     asset_id: str = "asset-abc",
     scan_id: str = "scan-abc",
-    status: str = "detected",
+    status: str = "open",
     severity: str = "medium",
     fail_count: int = 5,
     total_count: int = 100,
@@ -284,8 +284,7 @@ class FakeStorage:
     def find_open_finding(self, instance_id, asset_id):
         for f in self.findings.values():
             if (f.instance_id == instance_id and f.asset_id == asset_id
-                    and f.status in ("detected", "validated", "in_progress",
-                                     "assigned", "acknowledged")):
+                    and f.status in ("open", "reopened")):
                 return f
         return None
 
@@ -294,7 +293,7 @@ class FakeStorage:
         candidates = [
             f for f in self.findings.values()
             if f.instance_id == instance_id and f.asset_id == asset_id
-            and f.status in ("resolved", "false_positive", "wont_fix", "closed")
+            and f.status in ("resolved",)
             and (f.resolved_at or datetime.datetime.utcnow()) >= window
         ]
         candidates.sort(key=lambda f: f.resolved_at or datetime.datetime.min, reverse=True)
@@ -333,7 +332,7 @@ class FakeStorage:
     def reopen_finding(self, finding_id, scan_id, fail_count, total_count,
                        severity=None, evidence=None):
         f = self.findings[finding_id]
-        f.status = "detected"
+        f.status = "reopened"
         f.reopened_count = (f.reopened_count or 0) + 1
         f.last_seen_at = datetime.datetime.utcnow()
         f.last_scan_id = scan_id
