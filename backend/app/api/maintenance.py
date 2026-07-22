@@ -141,10 +141,48 @@ def approve(proposal_id: str, body: ApproveIn):
         storage.update_instance(
             p.instance_id, status=new_status, is_active=new_active,
         )
+        # Retiring (not pausing) an anomaly instance should un-enroll the
+        # underlying metric so we stop capturing snapshots for it. Pausing
+        # is temporary — keep the enrollment so history keeps flowing.
+        if new_status == "retired":
+            _maybe_unenroll_instance_metric(inst)
     storage.decide_maintenance_proposal(
         proposal_id, status="approved", decided_by=body.decided_by,
     )
     return {"ok": True, "instance_id": p.instance_id, "new_status": new_status}
+
+
+def _maybe_unenroll_instance_metric(inst: Any) -> None:
+    """If this rule instance is anomaly-shaped (target_config carries asset_id
+    + metric_name), un-enroll the corresponding MONITORED_METRICS row unless a
+    user enrolled it manually."""
+    try:
+        tc = inst.target_config or {}
+        asset_id = tc.get("asset_id")
+        metric = tc.get("metric_name")
+        col = tc.get("column")
+        if not (asset_id and metric):
+            return
+        from app.services.snowflake_session import session as sf
+        rows = sf.query(
+            """
+            SELECT ENROLLMENT_SOURCE FROM MONITORED_METRICS
+            WHERE ASSET_ID = %(a)s AND METRIC_NAME = %(m)s
+              AND (
+                (COLUMN_NAME IS NULL AND %(c)s IS NULL)
+                OR COLUMN_NAME = %(c)s
+              )
+            """,
+            {"a": asset_id, "m": metric, "c": col},
+        )
+        if not rows:
+            return
+        source = rows[0].get("ENROLLMENT_SOURCE")
+        if source in ("user", "auto_table"):
+            return
+        storage.unenroll_metric(asset_id, col, metric)
+    except Exception as e:
+        logger.debug(f"[maintenance] unenroll-on-retire failed: {e}")
 
 
 class DismissIn(BaseModel):

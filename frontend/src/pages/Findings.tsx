@@ -88,7 +88,13 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
           )}
 
           <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-1">{finding.title}</h3>
-          <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">{finding.description}</p>
+          {/* Strip the leading "N of M rows fail this check." sentence — the live
+              current_fail_count chip below shows the up-to-date count. Showing
+              both causes a stale-vs-live mismatch that confuses users. */}
+          {(() => {
+            const stripped = (finding.description ?? '').replace(/^\d+ of \d+ rows fail this check\.\s*/, '')
+            return stripped ? <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">{stripped}</p> : null
+          })()}
 
           {/* AI Explanation */}
           {ai && (
@@ -130,7 +136,7 @@ function FindingCard({ finding, selected, onSelect, onRuleFilter, onTableFilter,
                   : <ChevronRight className="w-3.5 h-3.5" />
                 }
                 <TableIcon className="w-3.5 h-3.5" />
-                {sampleRows.length} sample failing row{sampleRows.length !== 1 ? 's' : ''}
+                {sampleRows.length} sample row{sampleRows.length !== 1 ? 's' : ''} (of {(finding.current_fail_count ?? sampleRows.length).toLocaleString()} failing)
               </button>
               {showSamples && (
                 <div className="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-700">

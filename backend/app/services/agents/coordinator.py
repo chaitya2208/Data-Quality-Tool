@@ -828,7 +828,7 @@ class WorkflowCoordinator:
         # find status='completed' and no-op, but skipping saves the timer.
         if next_status == "awaiting_fixes":
             from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
-            schedule_verify(run.id)
+            schedule_verify(run.id, table_fqn=f"{run.database}.{run.schema_name}.{run.table}".upper())
         # Note: batch already advanced when this run reached rule review — do not
         # advance again here, or a table could be skipped.
 
@@ -1116,7 +1116,7 @@ class WorkflowCoordinator:
         self._advance_batch()
 
         from app.services.agents.auto_verify_scheduler import schedule as schedule_verify
-        schedule_verify(run.id)
+        schedule_verify(run.id, table_fqn=f"{run.database}.{run.schema_name}.{run.table}".upper())
 
     # ── Feedback synthesis (background) ──────────────────────────────────────
 

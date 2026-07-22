@@ -102,30 +102,105 @@ def _extract_metrics(
         })
 
     # ── Per-column metrics. Sourced from ProfilingAgent's column_stats,
-    # which today produces {total, nulls, null_pct, distinct, top_values,
-    # tail_values}. Numeric summary stats (mean/p50/p95) aren't emitted
-    # yet — when they are, add them here without a schema change. ────
+    # which produces {total, nulls, null_pct, distinct, top_values,
+    # tail_values, data_type, min_value, max_value, avg_value, stddev,
+    # duplicate_count, pattern_match_pct}. Not every metric is meaningful
+    # for every column — the type-check helpers below gate emission so
+    # we don't push "mean" for a VARCHAR column. Enrollment gate later in
+    # record_metric_snapshots drops anything not being tracked, so
+    # emitting a superset here is cheap. ─────────────────────────────
     for col, stats in column_stats.items():
         if not isinstance(stats, dict):
             continue
-        null_pct = _coerce_float(stats.get("null_pct"))
+
+        data_type = str(stats.get("data_type") or "").upper()
+        is_numeric = any(
+            data_type.startswith(p) for p in
+            ("NUMBER", "INT", "BIGINT", "SMALLINT", "TINYINT",
+             "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL")
+        )
+        is_string = any(
+            data_type.startswith(p) for p in
+            ("VARCHAR", "STRING", "TEXT", "CHAR")
+        )
+
+        total = _coerce_float(stats.get("total"))
+        nulls = _coerce_float(stats.get("nulls"))
         distinct = _coerce_float(stats.get("distinct"))
 
+        null_pct = _coerce_float(stats.get("null_pct"))
         if null_pct is not None:
             null_pct = max(0.0, min(100.0, null_pct))
-            rows.append({
-                "column_name": col,
-                "metric_name": "null_pct",
-                "metric_value": null_pct,
-                "metric_meta": None,
-            })
+            rows.append({"column_name": col, "metric_name": "null_pct",
+                         "metric_value": null_pct, "metric_meta": None})
+
         if distinct is not None:
-            rows.append({
-                "column_name": col,
-                "metric_name": "distinct_count",
-                "metric_value": distinct,
-                "metric_meta": None,
-            })
+            rows.append({"column_name": col, "metric_name": "distinct_count",
+                         "metric_value": distinct, "metric_meta": None})
+
+        # ── Universal (any type) ──────────────────────────────────
+        # duplicate_pct = 1 − (distinct / non_null_total). Signals repetition
+        # regardless of type. Skip when non-null total is 0 (all nulls).
+        if total is not None and nulls is not None and distinct is not None:
+            non_null = total - nulls
+            if non_null > 0:
+                dup_pct = max(0.0, min(100.0, (1.0 - distinct / non_null) * 100.0))
+                rows.append({"column_name": col, "metric_name": "duplicate_pct",
+                             "metric_value": dup_pct, "metric_meta": None})
+
+        # ── Numeric-only ──────────────────────────────────────────
+        if is_numeric:
+            avg = _coerce_float(stats.get("avg_value"))
+            std = _coerce_float(stats.get("stddev"))
+            mn = _coerce_float(stats.get("min_value"))
+            mx = _coerce_float(stats.get("max_value"))
+            if avg is not None:
+                rows.append({"column_name": col, "metric_name": "mean",
+                             "metric_value": avg, "metric_meta": None})
+            if std is not None:
+                rows.append({"column_name": col, "metric_name": "stddev",
+                             "metric_value": std, "metric_meta": None})
+            if mn is not None:
+                rows.append({"column_name": col, "metric_name": "min_value",
+                             "metric_value": mn, "metric_meta": None})
+            if mx is not None:
+                rows.append({"column_name": col, "metric_name": "max_value",
+                             "metric_value": mx, "metric_meta": None})
+
+        # ── String-only ───────────────────────────────────────────
+        # avg_length / max_length are derived from top_values samples when the
+        # profiler didn't compute them directly. Cheap: bounded to top_values.
+        if is_string:
+            tvs = stats.get("top_values") or []
+            lengths = [len(str(t.get("value") or "")) for t in tvs if isinstance(t, dict)]
+            if lengths:
+                # Weight by count so avg reflects actual data distribution, not
+                # just the top-value list.
+                total_len = 0
+                total_ct = 0
+                for t in tvs:
+                    v = t.get("value") if isinstance(t, dict) else None
+                    ct = t.get("count") if isinstance(t, dict) else None
+                    if v is None or ct is None:
+                        continue
+                    total_len += len(str(v)) * int(ct)
+                    total_ct += int(ct)
+                if total_ct > 0:
+                    rows.append({
+                        "column_name": col, "metric_name": "avg_length",
+                        "metric_value": total_len / total_ct, "metric_meta": None,
+                    })
+                rows.append({
+                    "column_name": col, "metric_name": "max_length",
+                    "metric_value": float(max(lengths)), "metric_meta": None,
+                })
+
+        # ── Pattern conformity (email/phone/etc, deterministic) ────
+        pattern_pct = _coerce_float(stats.get("pattern_match_pct"))
+        if pattern_pct is not None:
+            pattern_pct = max(0.0, min(100.0, pattern_pct))
+            rows.append({"column_name": col, "metric_name": "pattern_match_pct",
+                         "metric_value": pattern_pct, "metric_meta": None})
 
     # ── Per-column: observed closed-set. Stored under a synthetic
     # metric_name so the AnomalyProposalAgent can find them for
@@ -143,6 +218,62 @@ def _extract_metrics(
         })
 
     return rows
+
+
+# ── Per-column auto-seeding ─────────────────────────────────────────────
+# Which metrics get auto-enrolled for a *column* on first observation. The
+# rule: enroll when the value carries signal — a column that's always all-null
+# doesn't need null_pct monitoring, a column with 0 distinct values isn't
+# worth tracking distinct_count for. Users can always add anything manually.
+
+def _column_metric_worth_tracking(metric_name: str, value: float) -> bool:
+    if metric_name == "null_pct":
+        # 0% null forever isn't interesting; 100% null column is dead — skip both.
+        return 0.5 <= value <= 99.5
+    if metric_name == "distinct_count":
+        # Constant column (distinct=1) or empty (0) — skip.
+        return value >= 2
+    if metric_name == "duplicate_pct":
+        # 0% dup on primary keys is expected; 100% on constants — skip both.
+        return 1.0 <= value <= 99.0
+    if metric_name in {"mean", "stddev", "min_value", "max_value",
+                       "avg_length", "max_length", "pattern_match_pct",
+                       "observed_categories"}:
+        # These carry signal from any finite non-null value.
+        return True
+    return False
+
+
+def _auto_seed_column_metrics(asset_id: str, extracted_rows: List[Dict[str, Any]]) -> int:
+    """Enroll per-column metrics that clear the worth-tracking gate.
+    Idempotent — no-op for already-enrolled (column, metric) pairs."""
+    added = 0
+    seen: set = set()
+    for r in extracted_rows:
+        col = r.get("column_name")
+        if col is None:  # table-level already handled elsewhere
+            continue
+        metric = r["metric_name"]
+        key = (col, metric)
+        if key in seen:
+            continue
+        seen.add(key)
+        v = _coerce_float(r.get("metric_value"))
+        if v is None:
+            continue
+        if not _column_metric_worth_tracking(metric, v):
+            continue
+        try:
+            if storage.enroll_metric(asset_id, col, metric, "auto_column", "auto_seed"):
+                added += 1
+        except Exception as exc:
+            logger.debug(
+                f"[MetricSnapshots] auto-enroll failed asset={asset_id} "
+                f"col={col} metric={metric}: {exc}"
+            )
+    if added:
+        logger.info(f"[MetricSnapshots] auto-enrolled {added} per-column metric(s) for asset={asset_id}")
+    return added
 
 
 def record_metric_snapshots(
@@ -165,6 +296,46 @@ def record_metric_snapshots(
         logger.warning(f"[MetricSnapshots] extract failed for scan={scan_id}: {exc}")
         return 0
 
+    if not rows:
+        return 0
+
+    # Ensure the universal table-level metrics are enrolled for this asset
+    # before we filter. First scan on a fresh asset seeds them here.
+    try:
+        storage.ensure_default_table_metrics(asset_id)
+    except Exception as exc:
+        logger.warning(f"[MetricSnapshots] default-metric enroll failed asset={asset_id}: {exc}")
+
+    # Auto-seed per-column enrollments — deterministic gate on the profiler
+    # values so we track columns that *actually vary*. First scan a column
+    # produces meaningful stats, its per-column metrics enroll here.
+    # Everything constant, all-null, or single-valued stays unenrolled.
+    try:
+        _auto_seed_column_metrics(asset_id, rows)
+    except Exception as exc:
+        logger.warning(f"[MetricSnapshots] auto-seed failed asset={asset_id}: {exc}")
+
+    # Enrollment gate: only persist metrics someone (auto or user) opted into.
+    # Everything else the profiler emits stays transient — no snapshot row, no
+    # baseline. This is the ~90% storage cut vs. the old capture-everything path.
+    try:
+        monitored = storage.get_monitored_metric_set(asset_id)
+    except Exception as exc:
+        logger.warning(f"[MetricSnapshots] enrollment lookup failed asset={asset_id}: {exc}")
+        monitored = set()
+    if not monitored:
+        # Nothing enrolled for this asset yet. ensure_default_table_metrics
+        # above should have seeded row_count / freshness — an empty set means
+        # the enrollment call failed and we'd write nothing anyway.
+        return 0
+
+    before = len(rows)
+    rows = [r for r in rows if (r["column_name"], r["metric_name"]) in monitored]
+    if len(rows) < before:
+        logger.debug(
+            f"[MetricSnapshots] filtered {before - len(rows)} non-enrolled "
+            f"metric(s) for asset={asset_id}"
+        )
     if not rows:
         return 0
 

@@ -19,15 +19,20 @@ logger = logging.getLogger(__name__)
 
 AUTO_VERIFY_INTERVAL_SECONDS = 5 * 60  # 5 minutes
 
+MAX_CONSECUTIVE_FAILURES = 5
+
 _lock: threading.Lock = threading.Lock()
-_active_timers: Dict[str, threading.Timer] = {}  # run_id → Timer
+_active_timers: Dict[str, threading.Timer] = {}    # run_id → Timer
+_failure_counts: Dict[str, int] = {}               # run_id → consecutive failure count
+_table_to_run: Dict[str, str] = {}                 # table_fqn → run_id (latest active run per table)
 
 
-def schedule(run_id: str, delay: float = None) -> None:
+def schedule(run_id: str, delay: float = None, table_fqn: str = None) -> None:
     """
     Schedule an auto-verify for run_id after `delay` seconds. When `delay` is
     omitted, use the configured interval (Settings → auto_verify_interval_min).
-    Cancels any existing timer for this run first.
+    Cancels any existing timer for this run first, and any prior run on the
+    same table (table_fqn) so only the newest run's scheduler is alive.
     """
     if delay is None:
         try:
@@ -35,11 +40,25 @@ def schedule(run_id: str, delay: float = None) -> None:
             delay = settings_service.get_auto_verify_interval_seconds()
         except Exception:
             delay = AUTO_VERIFY_INTERVAL_SECONDS
+
+    # Cancel any prior run on the same table before registering this one
+    if table_fqn:
+        with _lock:
+            prior_run_id = _table_to_run.get(table_fqn)
+        if prior_run_id and prior_run_id != run_id:
+            logger.info(
+                f"[AutoVerify] Cancelling prior run {prior_run_id} for table {table_fqn} "
+                f"— superseded by run {run_id}"
+            )
+            cancel(prior_run_id)
+
     cancel(run_id)
     timer = threading.Timer(delay, _fire, args=[run_id])
     timer.daemon = True
     with _lock:
         _active_timers[run_id] = timer
+        if table_fqn:
+            _table_to_run[table_fqn] = run_id
     timer.start()
     logger.info(f"[AutoVerify] Scheduled for run {run_id} in {delay:.0f}s")
 
@@ -48,6 +67,11 @@ def cancel(run_id: str) -> None:
     """Cancel the pending auto-verify for a run (called on manual verify or completion)."""
     with _lock:
         timer = _active_timers.pop(run_id, None)
+        _failure_counts.pop(run_id, None)
+        # Remove table → run mapping if it still points at this run
+        stale_keys = [k for k, v in _table_to_run.items() if v == run_id]
+        for k in stale_keys:
+            del _table_to_run[k]
     if timer:
         timer.cancel()
         logger.debug(f"[AutoVerify] Cancelled for run {run_id}")
@@ -83,6 +107,10 @@ def _fire(run_id: str) -> None:
             output={**result, "auto_verified": True},
         )
 
+        # Reset failure counter on success
+        with _lock:
+            _failure_counts.pop(run_id, None)
+
         if result.get("fully_resolved"):
             storage.update_agent_run(run_id, status="completed", completed_at=datetime.utcnow())
             logger.info(f"[AutoVerify] Run {run_id} fully resolved — marked COMPLETED")
@@ -94,12 +122,24 @@ def _fire(run_id: str) -> None:
             schedule(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
 
     except Exception as e:
-        logger.error(f"[AutoVerify] Failed for run {run_id}: {e}")
+        with _lock:
+            failures = _failure_counts.get(run_id, 0) + 1
+            _failure_counts[run_id] = failures
+
+        logger.error(f"[AutoVerify] Failed for run {run_id} (attempt {failures}/{MAX_CONSECUTIVE_FAILURES}): {e}")
         try:
             t = storage.get_agent_task(run_id, "verification_agent")
             if t and t.status == "running":
                 storage.update_agent_task(t.id, status="failed", error_message=str(e)[:1024])
         except Exception:
             pass
-        # Still re-schedule even on failure so it keeps trying
-        schedule(run_id, AUTO_VERIFY_INTERVAL_SECONDS)
+
+        if failures >= MAX_CONSECUTIVE_FAILURES:
+            logger.warning(
+                f"[AutoVerify] Run {run_id} hit {MAX_CONSECUTIVE_FAILURES} consecutive failures — "
+                f"stopping auto-verify. Fix the underlying issue and manually verify to resume."
+            )
+            with _lock:
+                _failure_counts.pop(run_id, None)
+        else:
+            schedule(run_id, AUTO_VERIFY_INTERVAL_SECONDS)

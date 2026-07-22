@@ -203,6 +203,99 @@ def metric_history(
     }
 
 
+@router.get("/fleet/breaches")
+def fleet_metric_breaches(min_deviations: float = 2.0, limit: int = 50):
+    """Every (asset, column, metric) where the latest snapshot deviates
+    ≥ min_deviations MADs from its baseline median. One JOIN across latest
+    snapshot × baseline. Ordered worst-first so the dashboard highlights the
+    most urgent issues first.
+
+    Excludes rows where MAD is 0 (would divide by zero and would trigger every
+    scan on constant metrics) and rows below the baseline maturity gate
+    (SAMPLE_COUNT >= 14) — matches the MetricsPanel status logic."""
+    if min_deviations <= 0:
+        raise HTTPException(400, "min_deviations must be > 0")
+    capped_limit = max(1, min(limit, 500))
+
+    rows = sf.query(
+        """
+        WITH latest AS (
+            SELECT ASSET_ID, COLUMN_NAME, METRIC_NAME, METRIC_VALUE, CAPTURED_AT
+            FROM METRIC_SNAPSHOTS
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY ASSET_ID, METRIC_NAME, COALESCE(COLUMN_NAME, '')
+                ORDER BY CAPTURED_AT DESC
+            ) = 1
+        )
+        SELECT
+            b.ASSET_ID,
+            b.COLUMN_NAME,
+            b.METRIC_NAME,
+            b.MEDIAN_VALUE,
+            b.MAD_VALUE,
+            b.SAMPLE_COUNT,
+            l.METRIC_VALUE      AS LATEST_VALUE,
+            l.CAPTURED_AT       AS LATEST_AT,
+            a.DATABASE_NAME,
+            a.SCHEMA_NAME,
+            a.TABLE_NAME,
+            ABS(l.METRIC_VALUE - b.MEDIAN_VALUE) / b.MAD_VALUE AS DEVIATIONS
+        FROM METRIC_BASELINES b
+        JOIN latest l
+            ON  l.ASSET_ID    = b.ASSET_ID
+            AND l.METRIC_NAME = b.METRIC_NAME
+            AND (
+                (l.COLUMN_NAME IS NULL AND b.COLUMN_NAME IS NULL)
+                OR l.COLUMN_NAME = b.COLUMN_NAME
+            )
+        JOIN ASSETS a
+            ON a.ID = b.ASSET_ID
+        WHERE b.SAMPLE_COUNT >= 14
+          AND b.MAD_VALUE IS NOT NULL
+          AND b.MAD_VALUE > 0
+          AND b.MEDIAN_VALUE IS NOT NULL
+          AND l.METRIC_VALUE IS NOT NULL
+          AND (ABS(l.METRIC_VALUE - b.MEDIAN_VALUE) / b.MAD_VALUE) >= %(min_dev)s
+        ORDER BY DEVIATIONS DESC
+        LIMIT %(lim)s
+        """,
+        {"min_dev": float(min_deviations), "lim": capped_limit},
+    )
+
+    breaches: List[Dict[str, Any]] = []
+    tables_seen: set = set()
+    for r in rows:
+        dev = r.get("DEVIATIONS")
+        try:
+            dev_f = float(dev) if dev is not None else 0.0
+        except (TypeError, ValueError):
+            dev_f = 0.0
+        severity = "breached" if dev_f >= 3.0 else "watch"
+        fqn = f"{r['DATABASE_NAME']}.{r['SCHEMA_NAME']}.{r['TABLE_NAME']}"
+        tables_seen.add(r["ASSET_ID"])
+        breaches.append({
+            "asset_id":      r["ASSET_ID"],
+            "database_name": r["DATABASE_NAME"],
+            "schema_name":   r["SCHEMA_NAME"],
+            "table_name":    r["TABLE_NAME"],
+            "fqn":           fqn,
+            "column_name":   r.get("COLUMN_NAME"),
+            "metric_name":   r["METRIC_NAME"],
+            "latest_value":  r.get("LATEST_VALUE"),
+            "median":        r.get("MEDIAN_VALUE"),
+            "mad":           r.get("MAD_VALUE"),
+            "deviations":    dev_f,
+            "severity":      severity,
+            "latest_at":     _serialize(r.get("LATEST_AT")),
+        })
+
+    return {
+        "breaches": breaches,
+        "tables_affected": len(tables_seen),
+        "total": len(breaches),
+    }
+
+
 @router.get("/asset/{asset_id}")
 def list_asset_metrics(asset_id: str, sparkline_points: int = 20):
     """Every (column, metric) pair we have a baseline for on this asset — plus
@@ -273,6 +366,104 @@ def list_asset_metrics(asset_id: str, sparkline_points: int = 20):
             "baseline_updated_at": _serialize(b.get("UPDATED_AT")),
         })
     return {"metrics": out}
+
+
+# ── Manual enrollment / catalog ─────────────────────────────────────────
+
+# Metric catalog: which metric types the profiler can compute, plus which
+# column types each is meaningful for. UI uses this to filter the picker so
+# users can't try to track `mean` on a VARCHAR column. Kept as a plain dict
+# here — matches the emission logic in metric_snapshots._extract_metrics.
+
+_METRIC_CATALOG = [
+    {"metric_name": "row_count",            "scope": "table",   "compatible": [],
+     "label": "Row count",                  "description": "Total rows at each scan."},
+    {"metric_name": "freshness_lag_hours",  "scope": "table",   "compatible": [],
+     "label": "Freshness lag (hrs)",        "description": "Age of newest row in the freshest datetime column."},
+    {"metric_name": "null_pct",             "scope": "column",  "compatible": ["any"],
+     "label": "Null %",                     "description": "Percent NULL values in this column."},
+    {"metric_name": "distinct_count",       "scope": "column",  "compatible": ["any"],
+     "label": "Distinct count",             "description": "Number of distinct values."},
+    {"metric_name": "duplicate_pct",        "scope": "column",  "compatible": ["any"],
+     "label": "Duplicate %",                "description": "1 − distinct / non-null. High = lots of repetition."},
+    {"metric_name": "observed_categories",  "scope": "column",  "compatible": ["categorical"],
+     "label": "Observed categories",        "description": "Set of category values. Fires when a value disappears."},
+    {"metric_name": "mean",                 "scope": "column",  "compatible": ["numeric"],
+     "label": "Mean",                       "description": "Arithmetic mean of numeric values."},
+    {"metric_name": "stddev",               "scope": "column",  "compatible": ["numeric"],
+     "label": "Standard deviation",         "description": "Spread around the mean."},
+    {"metric_name": "min_value",            "scope": "column",  "compatible": ["numeric"],
+     "label": "Minimum",                    "description": "Smallest observed value."},
+    {"metric_name": "max_value",            "scope": "column",  "compatible": ["numeric"],
+     "label": "Maximum",                    "description": "Largest observed value."},
+    {"metric_name": "avg_length",           "scope": "column",  "compatible": ["string"],
+     "label": "Average length",             "description": "Weighted average character length."},
+    {"metric_name": "max_length",           "scope": "column",  "compatible": ["string"],
+     "label": "Maximum length",             "description": "Longest observed character length."},
+    {"metric_name": "pattern_match_pct",    "scope": "column",  "compatible": ["email", "phone"],
+     "label": "Pattern match %",            "description": "% of rows matching the detected format regex."},
+]
+
+
+@router.get("/catalog")
+def metric_catalog():
+    """Static catalog of all metric types + their column compatibility. UI
+    reads this to render the 'Add metric' picker."""
+    return {"metrics": _METRIC_CATALOG}
+
+
+@router.get("/asset/{asset_id}/monitored")
+def list_monitored(asset_id: str):
+    """Every (column, metric) currently enrolled for this asset, plus source."""
+    asset = storage.get_asset(asset_id)
+    if asset is None:
+        raise HTTPException(404, f"asset {asset_id} not found")
+    return {"monitored": storage.list_monitored_metrics(asset_id)}
+
+
+class MonitorIn(BaseModel):
+    column_name: Optional[str] = None
+    metric_name: str
+    enrolled_by: Optional[str] = None
+
+
+@router.post("/asset/{asset_id}/monitor")
+def enroll(asset_id: str, body: MonitorIn):
+    """Manual enrollment. Idempotent — same (column, metric) can be POSTed
+    repeatedly without creating duplicates."""
+    asset = storage.get_asset(asset_id)
+    if asset is None:
+        raise HTTPException(404, f"asset {asset_id} not found")
+
+    known = {m["metric_name"] for m in _METRIC_CATALOG}
+    if body.metric_name not in known:
+        raise HTTPException(400, f"Unknown metric_name: {body.metric_name}")
+
+    catalog_entry = next(m for m in _METRIC_CATALOG if m["metric_name"] == body.metric_name)
+    if catalog_entry["scope"] == "table" and body.column_name is not None:
+        raise HTTPException(400, f"{body.metric_name} is table-level; do not supply column_name")
+    if catalog_entry["scope"] == "column" and body.column_name is None:
+        raise HTTPException(400, f"{body.metric_name} requires a column_name")
+
+    inserted = storage.enroll_metric(
+        asset_id, body.column_name, body.metric_name,
+        source="user", enrolled_by=body.enrolled_by or "user",
+    )
+    return {"ok": True, "already_enrolled": not inserted}
+
+
+class UnmonitorIn(BaseModel):
+    column_name: Optional[str] = None
+    metric_name: str
+
+
+@router.delete("/asset/{asset_id}/monitor")
+def unenroll(asset_id: str, body: UnmonitorIn):
+    asset = storage.get_asset(asset_id)
+    if asset is None:
+        raise HTTPException(404, f"asset {asset_id} not found")
+    storage.unenroll_metric(asset_id, body.column_name, body.metric_name)
+    return {"ok": True}
 
 
 class ThresholdIn(BaseModel):

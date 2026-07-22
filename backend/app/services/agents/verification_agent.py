@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime
 from typing import Set, Tuple, Any, Dict
 
 from app.services import storage
@@ -7,9 +6,6 @@ from app.services.scan_service import ScanService
 from app.services.rule_engine import RuleEngine
 
 logger = logging.getLogger(__name__)
-
-# Statuses that are already considered closed — skip re-checking these
-CLOSED_STATUSES = {"resolved"}
 
 
 class VerificationAgent:
@@ -87,13 +83,17 @@ class VerificationAgent:
         )
         active_instance_ids = {i.id for i in active_instances}
 
-        # Only instances whose definition is also active were actually re-run.
+        # Only instances whose definition was not disabled were actually re-run.
         # Findings for disabled definitions must not be auto-resolved — the rule
-        # was simply skipped, not passed.
+        # was simply skipped, not passed. Mirror rule_engine's guard exactly:
+        # it skips "disabled" only, so "pending"/"rejected" definitions DO run.
+        defs_by_id = storage.get_definitions_by_ids(
+            [inst.definition_id for inst in active_instances]
+        )
         checked_instance_ids: Set[str] = set()
         for inst in active_instances:
-            defn = storage.get_definition(inst.definition_id)
-            if defn and defn.status == "active":
+            defn = defs_by_id.get(inst.definition_id)
+            if defn and defn.status != "disabled":
                 checked_instance_ids.add(inst.id)
 
         try:
@@ -107,7 +107,7 @@ class VerificationAgent:
             instance_id_by_handler_key: Dict[str, str] = {}
             allowed_codes: Set[str] = set()
             for inst in active_instances:
-                defn = storage.get_definition(inst.definition_id)
+                defn = defs_by_id.get(inst.definition_id)
                 if defn and defn.check_kind == "python_handler" and defn.handler_key:
                     instance_id_by_handler_key[defn.handler_key.lower()] = inst.id
                     allowed_codes.add(defn.handler_key.upper())
@@ -146,25 +146,28 @@ class VerificationAgent:
         storage.update_agent_task(task.id, output={"progress": "Checking which findings are now resolved..."})
 
         # ── Step 3: Compare against open findings ─────────────────────────────
-        all_findings = storage.list_findings_by_scan(run.scan_id)
+        # Query ALL open findings for this table's assets — not just the
+        # originating scan's findings. The lifecycle model updates findings in
+        # place across rescans (SCAN_ID never changes after creation), so
+        # findings from prior runs on the same table would be permanently stuck
+        # open if we filtered by scan_id.
+        all_asset_ids = {table_asset.id} | {col.id for col in column_assets}
+        open_findings = storage.list_open_findings_for_assets(all_asset_ids)
+
+        # Batch-fetch asset rows for logging and the legacy (rule_code, fqn) key.
+        # The primary comparison path uses instance_id and never needs this.
+        finding_asset_ids = list({f.asset_id for f in open_findings if f.asset_id})
+        assets_by_id = storage.get_assets_by_ids(finding_asset_ids)
 
         newly_resolved = 0
-        already_resolved = 0
         still_open = 0
         logged_instance_ids: Set[str] = set()
 
-        for finding in all_findings:
-            if finding.status in CLOSED_STATUSES:
-                already_resolved += 1
-                continue
-
+        for finding in open_findings:
             ctx = finding.context or {}
             rule_code = ctx.get("rule_code", "")
-            # Get the asset's FQN (only used for logging + the legacy fallback
-            # key — the primary compare below is by instance_id, immune to any
-            # asset_fqn resolution asymmetry between rule_engine and here).
-            asset = storage.get_asset(finding.asset_id)
-            asset_fqn = asset.fqn if asset else ctx.get("fqn", "")
+            asset = assets_by_id.get(finding.asset_id)
+            asset_fqn = ctx.get("fqn", "") or (asset.fqn if asset else "")
 
             if finding.instance_id:
                 still_firing_now = finding.instance_id in still_firing_instance_ids
@@ -193,7 +196,7 @@ class VerificationAgent:
                 )
                 logged_instance_ids.add(finding.instance_id)
 
-            # Only auto-resolve if the rule was actually re-run (definition active).
+            # Only auto-resolve if the rule was actually re-run (definition not disabled).
             # If the definition is disabled the rule was skipped, not passed.
             rule_was_checked = (
                 finding.instance_id is None or finding.instance_id in checked_instance_ids
@@ -223,22 +226,20 @@ class VerificationAgent:
             else:
                 still_open += 1
 
-        total = len(all_findings)
-        total_resolved = already_resolved + newly_resolved
-        pct = round((total_resolved / total * 100) if total > 0 else 0)
+        total = len(open_findings)
+        pct = round((newly_resolved / total * 100) if total > 0 else 0)
 
         result = {
             "total_findings": total,
-            "resolved": total_resolved,
+            "resolved": newly_resolved,
             "newly_auto_resolved": newly_resolved,
-            "already_resolved": already_resolved,
             "remaining": still_open,
             "resolution_pct": pct,
             "fully_resolved": still_open == 0,
         }
 
         logger.info(
-            f"[VerificationAgent] Done — {total_resolved}/{total} resolved "
-            f"({newly_resolved} new, {already_resolved} prior), {still_open} remaining"
+            f"[VerificationAgent] Done — {newly_resolved}/{total} resolved, "
+            f"{still_open} remaining"
         )
         return result

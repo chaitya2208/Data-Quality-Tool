@@ -319,7 +319,24 @@ export default function DataExplorer() {
   const [profile, setProfile] = useState<TableProfile | null>(
     () => profileCache.get(fqnKey(selectedDatabase, selectedSchema, selectedTable)) ?? null
   )
-  const [tab, setTab] = useState<ExplorerTab>('overview')
+  // Initial tab: dashboards or other pages can request a specific tab by
+  // stashing it in localStorage before navigating here (matches the same
+  // pattern used for db/schema/table selection). The cleanup MUST be in a
+  // useEffect, not the initializer — StrictMode double-invokes useState
+  // initializers in dev, so removing the key there would fire the tab hint
+  // only on the first pass and drop back to 'overview' on the second.
+  const [tab, setTab] = useState<ExplorerTab>(() => {
+    try {
+      const requested = localStorage.getItem('dq_explorer_tab')
+      if (requested && ['overview', 'stats', 'health', 'metrics'].includes(requested)) {
+        return requested as ExplorerTab
+      }
+    } catch {}
+    return 'overview'
+  })
+  useEffect(() => {
+    try { localStorage.removeItem('dq_explorer_tab') } catch {}
+  }, [])
 
   const { selectedId: connId } = useConnection()
 

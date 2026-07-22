@@ -179,6 +179,16 @@ class ProfilingAgent:
                 "distinct": distinct,
                 "top_values": top_values,
                 "tail_values": tail_values,
+                # Extended numeric / text stats — read by metric_snapshots.
+                # Kept optional so the profiler can leave them out (dict.get in
+                # _extract_metrics handles None cleanly).
+                "data_type":    c.get("data_type"),
+                "min_value":    c.get("min_value"),
+                "max_value":    c.get("max_value"),
+                "avg_value":    c.get("avg_value"),
+                "stddev":       c.get("stddev"),
+                "duplicate_count": c.get("duplicate_count"),
+                "pattern_match_pct": c.get("pattern_match_pct"),
             }
 
             # PK-shaped uniqueness signal — only fire when the column NAME

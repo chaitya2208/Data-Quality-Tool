@@ -1131,6 +1131,38 @@ export interface AssetMetricRow {
   baseline_updated_at: string | null;
 }
 
+export interface MetricCatalogEntry {
+  metric_name: string;
+  scope: 'table' | 'column';
+  compatible: string[];
+  label: string;
+  description: string;
+}
+
+export interface MonitoredMetric {
+  column_name: string | null;
+  metric_name: string;
+  enrollment_source: string | null;
+  enrolled_by: string | null;
+  enrolled_at: string | null;
+}
+
+export interface FleetMetricBreach {
+  asset_id: string;
+  database_name: string;
+  schema_name: string;
+  table_name: string;
+  fqn: string;
+  column_name: string | null;
+  metric_name: string;
+  latest_value: number | null;
+  median: number | null;
+  mad: number | null;
+  deviations: number;
+  severity: 'breached' | 'watch';
+  latest_at: string | null;
+}
+
 export const metricsApi = {
   history: (params: { asset_id: string; metric_name: string; column_name?: string | null; limit?: number }) =>
     api.get<MetricHistory>('/metrics/history', { params }),
@@ -1139,6 +1171,18 @@ export const metricsApi = {
   updateThreshold: (instanceId: string, body: { deviations?: number; max_pct_change?: number }) =>
     api.patch<{ ok: boolean; threshold_config: { deviations?: number; max_pct_change?: number } }>(
       `/metrics/instance/${instanceId}/threshold`, body,
+    ),
+  catalog: () =>
+    api.get<{ metrics: MetricCatalogEntry[] }>('/metrics/catalog'),
+  listMonitored: (assetId: string) =>
+    api.get<{ monitored: MonitoredMetric[] }>(`/metrics/asset/${assetId}/monitored`),
+  enroll: (assetId: string, body: { column_name?: string | null; metric_name: string; enrolled_by?: string }) =>
+    api.post<{ ok: boolean; already_enrolled: boolean }>(`/metrics/asset/${assetId}/monitor`, body),
+  unenroll: (assetId: string, body: { column_name?: string | null; metric_name: string }) =>
+    api.delete<{ ok: boolean }>(`/metrics/asset/${assetId}/monitor`, { data: body }),
+  fleetBreaches: (params?: { min_deviations?: number; limit?: number }) =>
+    api.get<{ breaches: FleetMetricBreach[]; tables_affected: number; total: number }>(
+      '/metrics/fleet/breaches', { params },
     ),
 };
 

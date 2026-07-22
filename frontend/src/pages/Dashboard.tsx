@@ -1,9 +1,9 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { findingsApi, agentRunsApi, tableHealthApi, rulesApi } from '../api/client'
+import { findingsApi, agentRunsApi, tableHealthApi, rulesApi, metricsApi } from '../api/client'
 import type { FleetOverview } from '../api/client'
-import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck, RotateCcw, TrendingUp, ShieldAlert } from 'lucide-react'
+import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck, RotateCcw, TrendingUp, ShieldAlert, Activity, ChevronDown } from 'lucide-react'
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip,
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -155,89 +155,81 @@ export default function Dashboard() {
   const StatCard = ({ title, value, icon: Icon, color, href, loading }: any) => (
     <div
       onClick={() => href && navigate(href)}
-      className={`bg-white dark:bg-gray-800 rounded-lg shadow p-6 flex items-center justify-between ${
+      className={`bg-white dark:bg-gray-800 rounded-xl shadow p-4 flex items-center justify-between ${
         href ? 'cursor-pointer hover:shadow-md hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-all' : ''
       }`}
     >
       <div>
-        <p className="text-sm font-medium text-gray-500 dark:text-gray-300">{title}</p>
-        {/* Pulsing skeleton while loading — avoids flashing a misleading 0
-            before the query resolves. */}
+        <p className="text-xs font-medium text-gray-500 dark:text-gray-300">{title}</p>
         {loading ? (
-          <div className="mt-2 h-8 w-16 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+          <div className="mt-1.5 h-7 w-14 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
         ) : (
-          <p className="mt-1 text-3xl font-bold text-gray-900 dark:text-gray-100">{value}</p>
+          <p className="mt-0.5 text-2xl font-bold text-gray-900 dark:text-gray-100">{value}</p>
         )}
-        {href && <p className="text-xs text-primary-600 mt-1">Click to view →</p>}
       </div>
-      <div className={`p-3 rounded-full ${color}`}>
-        <Icon className="w-6 h-6 text-white" />
+      <div className={`p-2.5 rounded-full ${color}`}>
+        <Icon className="w-5 h-5 text-white" />
       </div>
     </div>
   )
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* Header */}
       <div>
-        <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Dashboard</h1>
-        <p className="mt-1 text-gray-500 dark:text-gray-300">Overview of your data quality metrics</p>
+        <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">Dashboard</h1>
+        <p className="mt-0.5 text-sm text-gray-500 dark:text-gray-300">Overview of your data quality metrics</p>
       </div>
 
-      {/* Stat cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-6">
+      {/* ── Unified KPI strip: stat cards + fleet KPIs in one row ── */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
         <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           loading={loadingStats} />
-        <StatCard title="Pending Issues"    value={(stats?.by_status?.open ?? 0) + (stats?.by_status?.reopened ?? 0)} icon={Clock} color="bg-yellow-500" href="/findings?status=open" loading={loadingStats} />
+        <StatCard title="Pending Issues"   value={(stats?.by_status?.open ?? 0) + (stats?.by_status?.reopened ?? 0)} icon={Clock} color="bg-yellow-500" href="/findings?status=open" loading={loadingStats} />
         <StatCard title="Workflow Runs"    value={scopedRuns.length}               icon={CheckCircle} color="bg-green-500"  href="/run-history"        loading={loadingRuns} />
+        <FleetHealthKpis fleet={fleet} loading={loadingFleet} inline />
       </div>
 
-      {/* Rule coverage + fleet table stats */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {/* ── Coverage · Fleet tables · Worst tables · Metric alerts (4 cols) ── */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <InstanceCoveragePanel coverage={coverage} loading={loadingCoverage} />
         <FleetTableStats fleet={fleet} loading={loadingFleet} />
-      </div>
-
-      {/* ── Fleet Health KPI row ─────────────────────────────────────────
-          Overall pass-rate across every rule execution on every table in
-          the last 30 days; open + flapping incident counts across the
-          fleet; oldest currently-open incident. */}
-      <FleetHealthKpis fleet={fleet} loading={loadingFleet} />
-
-      {/* ── Overall trend + Worst tables ─────────────────────────────── */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="lg:col-span-2 bg-white dark:bg-gray-800 rounded-xl shadow p-4 flex flex-col">
-          <div className="flex items-center gap-2 mb-3">
-            <TrendingUp className="w-4 h-4 text-primary-600" />
-            <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet health trend — last 30 days</h2>
-            <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">pass-rate % · failed runs</span>
-          </div>
-          <div className="flex-1 min-h-[180px]">
-            <FleetTrendChart fleet={fleet} axisColor={axisColor} gridColor={gridColor} loading={loadingFleet} />
-          </div>
-        </div>
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
           <div className="flex items-center gap-2 mb-3">
             <AlertCircle className="w-4 h-4 text-red-500" />
             <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Worst tables</h2>
             <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">click to drill in</span>
           </div>
-          <WorstTablesList
-            fleet={fleet} loading={loadingFleet}
-            onOpen={(db, sc, tb) => {
-              // Persist the drill-down so DataExplorer opens with the right selection.
-              try {
-                localStorage.setItem('dq_explorer_db', db)
-                localStorage.setItem('dq_explorer_schema', sc)
-                localStorage.setItem('dq_explorer_table', tb)
-              } catch {}
-              navigate('/explorer')
-            }}
-          />
+          <div className="overflow-y-auto max-h-[200px]">
+            <WorstTablesList
+              fleet={fleet} loading={loadingFleet}
+              onOpen={(db, sc, tb) => {
+                try {
+                  localStorage.setItem('dq_explorer_db', db)
+                  localStorage.setItem('dq_explorer_schema', sc)
+                  localStorage.setItem('dq_explorer_table', tb)
+                } catch {}
+                navigate('/explorer')
+              }}
+            />
+          </div>
+        </div>
+        <MetricAlertsCard />
+      </div>
+
+      {/* ── Trend chart full-width ── */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <TrendingUp className="w-4 h-4 text-primary-600" />
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet health trend — last 30 days</h2>
+          <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">pass-rate % · failed runs</span>
+        </div>
+        <div className="h-[180px]">
+          <FleetTrendChart fleet={fleet} axisColor={axisColor} gridColor={gridColor} loading={loadingFleet} />
         </div>
       </div>
 
       {/* ── Database / Table issues chart ── */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
         {/* Chart header with breadcrumb */}
         <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
           <div className="flex items-center gap-2 min-w-0">
@@ -378,11 +370,11 @@ export default function Dashboard() {
       </div>
 
       {/* Bottom row: severity + status */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
-          <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-4">Findings by Severity</h2>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-3">Findings by Severity</h2>
           {severityData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={260}>
+            <ResponsiveContainer width="100%" height={200}>
               <PieChart>
                 <Pie
                   data={severityData}
@@ -407,14 +399,14 @@ export default function Dashboard() {
               </PieChart>
             </ResponsiveContainer>
           ) : (
-            <div className="h-52 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
+            <div className="h-40 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
           )}
         </div>
 
-        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-6">
-          <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100 mb-4">Findings by Status</h2>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-3">Findings by Status</h2>
           {statusData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={260}>
+            <ResponsiveContainer width="100%" height={200}>
               <BarChart data={statusData} margin={{ top: 4, right: 20, bottom: 4, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={gridColor} />
                 <XAxis dataKey="name" tick={{ fontSize: 12, fill: axisColor }} stroke={axisColor} />
@@ -429,7 +421,7 @@ export default function Dashboard() {
               </BarChart>
             </ResponsiveContainer>
           ) : (
-            <div className="h-52 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
+            <div className="h-40 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
           )}
         </div>
       </div>
@@ -462,12 +454,12 @@ function FleetKpiTile({
   icon: Icon, label, value, tone,
 }: { icon: React.ComponentType<{ className?: string }>; label: string; value: React.ReactNode; tone?: string }) {
   return (
-    <div className="flex-1 min-w-[10rem] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3">
-      <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-gray-400 dark:text-gray-400">
-        <Icon className="w-3.5 h-3.5" />
+    <div className="bg-white dark:bg-gray-800 rounded-xl shadow px-4 py-4">
+      <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-gray-400 dark:text-gray-400">
+        <Icon className="w-3 h-3" />
         {label}
       </div>
-      <div className={`mt-1 text-2xl font-bold tabular-nums ${tone ?? 'text-gray-900 dark:text-gray-100'}`}>{value}</div>
+      <div className={`mt-0.5 text-2xl font-bold tabular-nums ${tone ?? 'text-gray-900 dark:text-gray-100'}`}>{value}</div>
     </div>
   )
 }
@@ -503,21 +495,21 @@ function InstanceCoveragePanel({
       </div>
 
       {loading ? (
-        <div className="h-32 flex items-center justify-center">
-          <div className="w-8 h-8 rounded-full border-2 border-gray-200 dark:border-gray-700 border-t-primary-500 animate-spin" />
+        <div className="h-20 flex items-center justify-center">
+          <div className="w-6 h-6 rounded-full border-2 border-gray-200 dark:border-gray-700 border-t-primary-500 animate-spin" />
         </div>
       ) : active === 0 ? (
-        <p className="text-sm text-gray-400 dark:text-gray-500 text-center py-8">No active instances</p>
+        <p className="text-sm text-gray-400 dark:text-gray-500 text-center py-4">No active instances</p>
       ) : (
-        <div className="flex items-center gap-6">
-          {/* Donut */}
-          <div className="relative flex-shrink-0" style={{ width: 120, height: 120 }}>
+        <div className="flex flex-col gap-3">
+          {/* Donut — fills available width */}
+          <div className="relative w-full h-[120px]">
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie
                   data={donutData}
                   cx="50%" cy="50%"
-                  innerRadius={38} outerRadius={54}
+                  innerRadius="45%" outerRadius="65%"
                   dataKey="value"
                   startAngle={90} endAngle={-270}
                   strokeWidth={0}
@@ -528,7 +520,6 @@ function InstanceCoveragePanel({
                 </Pie>
               </PieChart>
             </ResponsiveContainer>
-            {/* Center label */}
             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
               <span className={`text-xl font-bold ${scoreColor}`}>{passRate}%</span>
               <span className="text-[10px] text-gray-400 dark:text-gray-500 leading-none">healthy</span>
@@ -536,26 +527,23 @@ function InstanceCoveragePanel({
           </div>
 
           {/* Legend */}
-          <div className="flex flex-col gap-3 min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 flex-shrink-0" />
-              <span className="text-sm text-gray-600 dark:text-gray-300 min-w-[56px]">Passing</span>
-              <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{passing}</span>
+          <div className="flex items-center justify-center gap-4">
+            <div className="flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 flex-shrink-0" />
+              <span className="text-xs text-gray-600 dark:text-gray-300">Passing</span>
+              <span className="text-xs font-semibold text-gray-900 dark:text-gray-100">{passing}</span>
             </div>
-            <div className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-red-500 flex-shrink-0" />
-              <span className="text-sm text-gray-600 dark:text-gray-300 min-w-[56px]">Failing</span>
-              <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{failing}</span>
+            <div className="flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-red-500 flex-shrink-0" />
+              <span className="text-xs text-gray-600 dark:text-gray-300">Failing</span>
+              <span className="text-xs font-semibold text-gray-900 dark:text-gray-100">{failing}</span>
             </div>
-            {/* Pass rate bar */}
-            <div className="mt-1">
-              <div className="h-1.5 w-40 rounded-full bg-gray-100 dark:bg-gray-700 overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-emerald-500 transition-all duration-500"
-                  style={{ width: `${passRate}%` }}
-                />
-              </div>
-            </div>
+          </div>
+          <div className="h-1.5 w-full rounded-full bg-gray-100 dark:bg-gray-700 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-emerald-500 transition-all duration-500"
+              style={{ width: `${passRate}%` }}
+            />
           </div>
         </div>
       )}
@@ -582,18 +570,18 @@ function FleetTableStats({ fleet, loading }: { fleet: FleetOverview | undefined;
         <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet tables</h2>
       </div>
       {loading ? (
-        <div className="h-32 flex items-center justify-center">
-          <div className="w-8 h-8 rounded-full border-2 border-gray-200 dark:border-gray-700 border-t-primary-500 animate-spin" />
+        <div className="h-20 flex items-center justify-center">
+          <div className="w-6 h-6 rounded-full border-2 border-gray-200 dark:border-gray-700 border-t-primary-500 animate-spin" />
         </div>
       ) : (
         <div className="divide-y divide-gray-100 dark:divide-gray-700">
           {rows.map(({ label, value, color, icon: Icon }) => (
-            <div key={label} className="flex items-center justify-between py-3">
+            <div key={label} className="flex items-center justify-between py-2">
               <div className="flex items-center gap-2">
-                <Icon className={`w-4 h-4 ${color}`} />
-                <span className="text-sm text-gray-600 dark:text-gray-300">{label}</span>
+                <Icon className={`w-3.5 h-3.5 ${color}`} />
+                <span className="text-xs text-gray-600 dark:text-gray-300">{label}</span>
               </div>
-              <span className={`text-2xl font-bold tabular-nums ${color}`}>{value}</span>
+              <span className={`text-lg font-bold tabular-nums ${color}`}>{value}</span>
             </div>
           ))}
         </div>
@@ -602,22 +590,21 @@ function FleetTableStats({ fleet, loading }: { fleet: FleetOverview | undefined;
   )
 }
 
-function FleetHealthKpis({ fleet, loading }: { fleet: FleetOverview | undefined; loading: boolean }) {
-  if (loading) {
-    return (
-      <div className="flex flex-wrap gap-3">
-        {[0, 1, 2, 3].map(i => (
-          <div key={i} className="flex-1 min-w-[10rem] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3">
-            <div className="h-3 w-20 rounded bg-gray-100 dark:bg-gray-700 animate-pulse" />
-            <div className="mt-2 h-6 w-24 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
-          </div>
-        ))}
-      </div>
-    )
-  }
+function FleetHealthKpis({ fleet, loading, inline }: { fleet: FleetOverview | undefined; loading: boolean; inline?: boolean }) {
   const score = fleet?.overall_health_score ?? null
-  return (
-    <div className="flex flex-wrap gap-3">
+
+  if (loading) {
+    const skeleton = [0, 1, 2, 3].map(i => (
+      <div key={i} className="bg-white dark:bg-gray-800 rounded-xl shadow px-4 py-4">
+        <div className="h-3 w-20 rounded bg-gray-100 dark:bg-gray-700 animate-pulse" />
+        <div className="mt-2 h-6 w-16 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+      </div>
+    ))
+    return inline ? <>{skeleton}</> : <div className="flex flex-wrap gap-3">{skeleton}</div>
+  }
+
+  const tiles = (
+    <>
       <FleetKpiTile icon={ShieldCheck} label="Fleet health score"
         value={score == null ? '—' : `${Math.round(score * 100)}%`}
         tone={healthTone(score)} />
@@ -630,8 +617,9 @@ function FleetHealthKpis({ fleet, loading }: { fleet: FleetOverview | undefined;
       <FleetKpiTile icon={Clock} label="Oldest open"
         value={fmtDaysAgo(fleet?.fleet_oldest_open_at)}
         tone={fleet?.fleet_oldest_open_at ? 'text-red-600' : undefined} />
-    </div>
+    </>
   )
+  return inline ? tiles : <div className="flex flex-wrap gap-3">{tiles}</div>
 }
 
 function FleetTrendChart({
@@ -720,5 +708,161 @@ function WorstTablesList({
         )
       })}
     </ul>
+  )
+}
+
+// ── Metric alerts card ────────────────────────────────────────────────────
+// Fleet-level anomaly-monitoring signal. Distinct from the Findings tile:
+// a metric can be deviating from its baseline without any anomaly-rule
+// instance having produced a finding yet (baseline immature, threshold set
+// higher, or no rule enrolled). This surfaces those pre-finding signals.
+
+// Cap on how many tables to show in the expanded list. If the fleet grows
+// beyond this, the rest fold into a "+ N more" footer. Users needing full
+// visibility go to a dedicated table view; the dashboard stays scannable.
+const METRIC_ALERTS_TABLE_CAP = 8
+
+function MetricAlertsCard() {
+  const navigate = useNavigate()
+  const [expanded, setExpanded] = useState(true)
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ['fleet-metric-breaches'],
+    queryFn: () => metricsApi.fleetBreaches({ min_deviations: 2.0, limit: 200 }).then(r => r.data),
+    staleTime: 60_000,
+  })
+
+  const breaches = data?.breaches ?? []
+  const tablesAffected = data?.tables_affected ?? 0
+  const critical = breaches.filter(b => b.severity === 'breached').length
+  const watching = breaches.filter(b => b.severity === 'watch').length
+
+  // Roll up per table — how many breaches per asset, plus the worst deviation
+  // so we can sort and colour by severity.
+  const perTable = (() => {
+    const acc = new Map<string, {
+      asset_id: string
+      fqn: string
+      database_name: string
+      schema_name: string
+      table_name: string
+      count: number
+      breached: number
+      watching: number
+      worst_dev: number
+    }>()
+    for (const b of breaches) {
+      const cur = acc.get(b.asset_id) ?? {
+        asset_id: b.asset_id, fqn: b.fqn,
+        database_name: b.database_name, schema_name: b.schema_name, table_name: b.table_name,
+        count: 0, breached: 0, watching: 0, worst_dev: 0,
+      }
+      cur.count += 1
+      if (b.severity === 'breached') cur.breached += 1
+      else cur.watching += 1
+      if (b.deviations > cur.worst_dev) cur.worst_dev = b.deviations
+      acc.set(b.asset_id, cur)
+    }
+    return Array.from(acc.values()).sort((a, b) => {
+      if (a.breached !== b.breached) return b.breached - a.breached
+      return b.worst_dev - a.worst_dev
+    })
+  })()
+
+  const shown = perTable.slice(0, METRIC_ALERTS_TABLE_CAP)
+  const hiddenCount = Math.max(0, perTable.length - shown.length)
+
+  function openTable(row: { database_name: string; schema_name: string; table_name: string }) {
+    try {
+      localStorage.setItem('dq_explorer_db',     row.database_name)
+      localStorage.setItem('dq_explorer_schema', row.schema_name)
+      localStorage.setItem('dq_explorer_table',  row.table_name)
+      localStorage.setItem('dq_explorer_tab',    'metrics')
+    } catch {}
+    navigate('/explorer')
+  }
+
+  if (isLoading) {
+    return (
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+        <div className="flex items-center gap-2">
+          <Activity className="w-4 h-4 text-primary-600" />
+          <span className="text-sm text-gray-500 dark:text-gray-400">Loading metric alerts…</span>
+        </div>
+      </div>
+    )
+  }
+  if (isError) return null
+
+  const empty = breaches.length === 0
+
+  return (
+    <div className={`bg-white dark:bg-gray-800 rounded-xl shadow p-4 flex flex-col border ${
+      critical > 0
+        ? 'border-red-200 dark:border-red-800/60'
+        : watching > 0
+          ? 'border-amber-200 dark:border-amber-800/60'
+          : 'border-gray-200 dark:border-gray-700'
+    }`}>
+      {/* Header */}
+      <div className="flex items-center gap-2 mb-3">
+        <Activity className={`w-4 h-4 flex-shrink-0 ${
+          critical > 0 ? 'text-red-500' : watching > 0 ? 'text-amber-500' : 'text-emerald-500'
+        }`} />
+        <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Metric alerts</h2>
+        {!empty && (
+          <button
+            onClick={() => setExpanded(v => !v)}
+            className="ml-auto text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+          >
+            {expanded
+              ? <ChevronDown className="w-4 h-4" />
+              : <ChevronRight className="w-4 h-4" />}
+          </button>
+        )}
+      </div>
+
+      {/* Summary line */}
+      <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+        {empty
+          ? 'All monitored metrics are within their baselines.'
+          : (
+            <>
+              <span className={critical > 0 ? 'text-red-600 dark:text-red-400 font-medium' : ''}>{critical} breached</span>
+              {watching > 0 && <>{' · '}<span className="text-amber-600 dark:text-amber-400 font-medium">{watching} watching</span></>}
+              {' · '}
+              <span>{tablesAffected} table{tablesAffected === 1 ? '' : 's'}</span>
+            </>
+          )
+        }
+      </p>
+
+      {/* Expanded list */}
+      {expanded && !empty && (
+        <div className="overflow-y-auto max-h-[160px] -mx-4 border-t border-gray-100 dark:border-gray-700 divide-y divide-gray-100 dark:divide-gray-700">
+          {shown.map(row => {
+            const isCritical = row.breached > 0
+            return (
+              <button
+                key={row.asset_id}
+                onClick={() => openTable(row)}
+                className="w-full flex items-center gap-2 px-4 py-2 text-left hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors"
+              >
+                <span className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${isCritical ? 'bg-red-500' : 'bg-amber-500'}`} />
+                <span className="min-w-0 flex-1 text-xs font-mono text-gray-700 dark:text-gray-300 truncate">{row.fqn}</span>
+                <span className={`text-[11px] font-medium flex-shrink-0 ${isCritical ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                  {row.count}m
+                </span>
+                <ChevronRight className="w-3 h-3 text-gray-300 flex-shrink-0" />
+              </button>
+            )
+          })}
+          {hiddenCount > 0 && (
+            <div className="px-4 py-1.5 text-[11px] text-gray-400 text-center bg-gray-50/50 dark:bg-gray-900/30">
+              +{hiddenCount} more
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   )
 }

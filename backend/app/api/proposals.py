@@ -220,7 +220,42 @@ def reject_proposal(proposal_id: str, body: RejectIn):
          "by": body.decided_by or "user",
          "reason": (body.reason or "")[:2000]},
     )
+    # Un-enroll the monitored metric if nothing else is actively watching it.
+    # Only un-enroll auto-seeded rows — a user-enrolled metric shouldn't
+    # disappear because they rejected the AI's proposal on it.
+    _maybe_unenroll_on_reject(row)
     return {"ok": True}
+
+
+def _maybe_unenroll_on_reject(row: dict) -> None:
+    """Best-effort unenrollment when the last live signal for a (asset, col,
+    metric) tuple goes away. Silent on failure."""
+    try:
+        asset_id = row.get("ASSET_ID")
+        metric = row.get("METRIC_NAME")
+        col = row.get("COLUMN_NAME")
+        if not (asset_id and metric):
+            return
+        # Refuse to unenroll user-enrolled or auto_table rows.
+        catalog_rows = sf.query(
+            """
+            SELECT ENROLLMENT_SOURCE FROM MONITORED_METRICS
+            WHERE ASSET_ID = %(a)s AND METRIC_NAME = %(m)s
+              AND (
+                (COLUMN_NAME IS NULL AND %(c)s IS NULL)
+                OR COLUMN_NAME = %(c)s
+              )
+            """,
+            {"a": asset_id, "m": metric, "c": col},
+        )
+        if not catalog_rows:
+            return
+        source = catalog_rows[0].get("ENROLLMENT_SOURCE")
+        if source in ("user", "auto_table"):
+            return
+        storage.unenroll_metric(asset_id, col, metric)
+    except Exception as e:
+        logger.debug(f"[proposals] unenroll-on-reject failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────
