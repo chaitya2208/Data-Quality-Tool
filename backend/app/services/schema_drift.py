@@ -85,6 +85,31 @@ def _ensure_drift_definition(handler_key: str) -> Any:
     )
 
 
+def _get_per_table_drift_instance(
+    handler_key: str,
+    database_name: str,
+    schema_name: str,
+    table_name: str,
+) -> Optional[Any]:
+    """Return the existing drift instance for this handler+table, or None.
+    Never creates — used in the PASS loop so we don't provision 5 instances
+    on every scan of every table just to check if they have open findings."""
+    definition = _ensure_drift_definition(handler_key)
+    from app.services.snowflake_session import session as sf
+    rows = sf.query(
+        """
+        SELECT * FROM RULE_INSTANCES
+        WHERE DEFINITION_ID = %(def_id)s
+          AND DATABASE_NAME = %(db)s
+          AND SCHEMA_NAME   = %(sch)s
+          AND TABLE_NAME    = %(tbl)s
+        """,
+        {"def_id": definition.id, "db": database_name,
+         "sch": schema_name, "tbl": table_name},
+    )
+    return storage.get_instance(rows[0]["ID"]) if rows else None
+
+
 def _ensure_per_table_drift_instance(
     handler_key: str,
     database_name: str,

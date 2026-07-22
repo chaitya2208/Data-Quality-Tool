@@ -122,23 +122,23 @@ class FindingsAgent:
             (f.get("context") or {}).get("rule_code", "").lower()
             for f in drift_findings
         }
-        from app.services.schema_drift import DRIFT_HANDLER_KEYS, _ensure_per_table_drift_instance
+        from app.services.schema_drift import DRIFT_HANDLER_KEYS, _get_per_table_drift_instance
         for hk in DRIFT_HANDLER_KEYS:
             if hk in drift_failed_handler_keys:
                 continue  # already accounted for via drift_executed_iids
-            # Only log a PASS if a prior open incident exists — otherwise this
-            # writes a PASSED execution for every drift check on every scan
-            # even when there was never a problem, which is just noise.
-            iid = _ensure_per_table_drift_instance(
+            # Only log a PASS if a prior open incident exists. Use the
+            # read-only getter so we don't eagerly provision all 5 drift
+            # instances on every scan of every table.
+            inst = _get_per_table_drift_instance(
                 hk, table_asset.database_name, table_asset.schema_name,
                 table_asset.table_name,
-            ).id
-            if storage.find_open_finding(iid, table_asset.id):
+            )
+            if inst and storage.find_open_finding(inst.id, table_asset.id):
                 storage.create_execution(
-                    instance_id=iid, status="passed",
+                    instance_id=inst.id, status="passed",
                     scan_id=scan.id, run_id=run_id, evidence=None,
                 )
-                executed_instance_ids.add(iid)
+                executed_instance_ids.add(inst.id)
 
         # Incident lifecycle: UPDATE / RESOLVE / REOPEN / CREATE per
         # (instance, asset). Replaces the old supersede-then-bulk-insert flow.

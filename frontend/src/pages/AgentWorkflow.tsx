@@ -101,14 +101,17 @@ function sourceBadge(source: RuleReviewEntry['source']) {
 
 type RunStatus = 'pending' | 'running' | 'awaiting_rule_review' | 'awaiting_fixes' | 'completed' | 'failed'
 
-function isPolling(status: RunStatus) {
-  // 'pending' MUST be here: a freshly-created run is always 'pending' for the
-  // moment before the background coordinator flips it to 'running'. If the UI
-  // catches that first 'pending' and pending isn't polled, refetchInterval
-  // returns false and the view freezes on 'pending' forever even though the
-  // backend advances normally.
-  return status === 'pending' || status === 'running' ||
-         status === 'awaiting_rule_review' || status === 'awaiting_fixes'
+function pollInterval(status: RunStatus): number | false {
+  // Active pipeline stages need a fast cadence so the UI feels live.
+  // 'pending' must be included — a freshly-created run sits there briefly
+  // before the coordinator flips it to 'running'; without it the view
+  // freezes on 'pending' forever.
+  if (status === 'pending' || status === 'running' || status === 'awaiting_rule_review') return 2000
+  // awaiting_fixes is a long-lived waiting state — nothing changes on the
+  // server more often than the auto-verify interval (5 min). 30s is plenty
+  // to pick up a verification result without hammering the backend.
+  if (status === 'awaiting_fixes') return 30_000
+  return false
 }
 
 function fixIssuesStatus(runStatus: RunStatus): string {
@@ -425,7 +428,7 @@ export default function AgentWorkflow() {
     retry: false,
     refetchInterval: (query) => {
       const s = query.state.data?.status as RunStatus | undefined
-      return s && isPolling(s) ? 2000 : false
+      return s ? pollInterval(s) : false
     },
   })
 

@@ -268,11 +268,11 @@ class ScanService:
             for hk in schema_drift.DRIFT_HANDLER_KEYS:
                 if hk in drift_failed_handlers:
                     continue
-                iid = schema_drift._ensure_per_table_drift_instance(
+                inst = schema_drift._get_per_table_drift_instance(
                     hk, database, schema, table,
-                ).id
-                if storage.find_open_finding(iid, table_asset.id):
-                    failed_iids.add(iid)
+                )
+                if inst and storage.find_open_finding(inst.id, table_asset.id):
+                    failed_iids.add(inst.id)
             stats = finalize_scan(
                 scan_id=scan.id,
                 asset_id_for_passed=table_asset.id,

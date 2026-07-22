@@ -16,6 +16,16 @@ logging.basicConfig(
 for _noisy_logger in ("snowflake.connector", "boto3", "botocore", "urllib3"):
     logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
+# Suppress uvicorn access log lines for the notifications unread-count poll.
+# The bell hits /notifications/unread-count every 60s; access-logging a
+# SELECT COUNT(*) on every tick produces more noise than signal.
+class _SuppressUnreadCountAccess(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/notifications/unread-count" not in msg
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressUnreadCountAccess())
+
 logger = logging.getLogger(__name__)
 
 
