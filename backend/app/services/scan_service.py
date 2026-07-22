@@ -122,10 +122,18 @@ class ScanService:
         except Exception as e:
             logger.warning(f"[MetadataAgent] drift detection failed for {table_fqn}: {e}")
             drift_findings = []
-        # Attach as a plain attribute — the downstream FindingsAgent looks for
-        # this via getattr(scan, "drift_findings", []) and merges it into
-        # findings_data before finalize_scan.
+        # Attach as a plain attribute for the in-memory template path AND
+        # persist to SCAN_RESULTS so the agentic path (which re-fetches the
+        # scan row after the rule-review pause) can recover them. Without the
+        # persisted copy the setattr is lost on the next storage.get_scan().
         setattr(scan, "drift_findings", drift_findings)
+        if drift_findings:
+            try:
+                existing_results = scan.scan_results or {}
+                existing_results["drift_findings"] = drift_findings
+                storage.update_scan(scan.id, scan_results=existing_results)
+            except Exception as e:
+                logger.warning(f"[MetadataAgent] Could not persist drift findings to scan_results: {e}")
 
         logger.info(
             f"[MetadataAgent] Done: {table_fqn} — {len(column_assets)} columns"

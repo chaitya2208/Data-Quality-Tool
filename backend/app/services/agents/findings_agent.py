@@ -85,7 +85,15 @@ class FindingsAgent:
         # instance_ids are threaded into executed_instance_ids so the
         # finalizer's PASS branch can auto-resolve a drift incident once the
         # schema is stable again (e.g. a removed column re-added).
-        drift_findings = list(getattr(scan, "drift_findings", []) or [])
+        # Template path attaches drift_findings via setattr on the live scan
+        # object; agentic path re-fetches scan from storage after the review
+        # pause, which drops the attribute. Fall back to scan_results, where
+        # scan_metadata_only persists a durable copy.
+        drift_findings = list(
+            getattr(scan, "drift_findings", None)
+            or (scan.scan_results or {}).get("drift_findings", [])
+            or []
+        )
         drift_executed_iids: Set[str] = {
             f["instance_id"] for f in drift_findings if f.get("instance_id")
         }

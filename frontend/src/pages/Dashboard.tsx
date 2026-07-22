@@ -216,15 +216,71 @@ export default function Dashboard() {
         <MetricAlertsCard />
       </div>
 
-      {/* ── Trend chart full-width ── */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
-        <div className="flex items-center gap-2 mb-3">
-          <TrendingUp className="w-4 h-4 text-primary-600" />
-          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet health trend — last 30 days</h2>
-          <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">pass-rate % · failed runs</span>
+      {/* ── Trend chart + severity + status side-by-side ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 lg:col-span-2">
+          <div className="flex items-center gap-2 mb-3">
+            <TrendingUp className="w-4 h-4 text-primary-600" />
+            <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet health trend — last 30 days</h2>
+            <span className="ml-auto text-xs text-gray-400 dark:text-gray-400">pass-rate % · failed runs</span>
+          </div>
+          <div className="h-[180px]">
+            <FleetTrendChart fleet={fleet} axisColor={axisColor} gridColor={gridColor} loading={loadingFleet} />
+          </div>
         </div>
-        <div className="h-[180px]">
-          <FleetTrendChart fleet={fleet} axisColor={axisColor} gridColor={gridColor} loading={loadingFleet} />
+
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 lg:col-span-1">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-3">Findings by Severity</h2>
+          {severityData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <PieChart>
+                <Pie
+                  data={severityData}
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={55}
+                  outerRadius={90}
+                  paddingAngle={3}
+                  dataKey="value"
+                >
+                  {severityData.map((entry, i) => (
+                    <Cell key={i} fill={entry.color} />
+                  ))}
+                </Pie>
+                <Tooltip
+                  formatter={(v: any) => [`${v} issues`]}
+                  contentStyle={theme === 'dark' ? { backgroundColor: '#1f2937', border: '1px solid #374151', borderRadius: 8, color: '#f3f4f6' } : undefined}
+                  labelStyle={theme === 'dark' ? { color: '#f3f4f6' } : undefined}
+                  itemStyle={theme === 'dark' ? { color: '#f3f4f6' } : undefined}
+                />
+                <Legend iconType="circle" iconSize={10} />
+              </PieChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-40 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
+          )}
+        </div>
+
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 lg:col-span-1">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-3">Findings by Status</h2>
+          {statusData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={statusData} margin={{ top: 4, right: 20, bottom: 4, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={gridColor} />
+                <XAxis dataKey="name" tick={{ fontSize: 12, fill: axisColor }} stroke={axisColor} />
+                <YAxis tick={{ fontSize: 12, fill: axisColor }} stroke={axisColor} />
+                <Tooltip
+                  cursor={{ fill: theme === 'dark' ? '#374151' : '#f3f4f6' }}
+                  contentStyle={theme === 'dark' ? { backgroundColor: '#1f2937', border: '1px solid #374151', borderRadius: 8, color: '#f3f4f6' } : undefined}
+                  labelStyle={theme === 'dark' ? { color: '#f3f4f6' } : undefined}
+                  itemStyle={theme === 'dark' ? { color: '#f3f4f6' } : undefined}
+                />
+                <Bar dataKey="value" fill="#3b82f6" radius={[4, 4, 0, 0]} name="Findings" />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-40 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
+          )}
         </div>
       </div>
 
@@ -367,63 +423,6 @@ export default function Dashboard() {
             </div>
           </div>
         )}
-      </div>
-
-      {/* Bottom row: severity + status */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
-          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-3">Findings by Severity</h2>
-          {severityData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={200}>
-              <PieChart>
-                <Pie
-                  data={severityData}
-                  cx="50%"
-                  cy="50%"
-                  innerRadius={55}
-                  outerRadius={90}
-                  paddingAngle={3}
-                  dataKey="value"
-                >
-                  {severityData.map((entry, i) => (
-                    <Cell key={i} fill={entry.color} />
-                  ))}
-                </Pie>
-                <Tooltip
-                  formatter={(v: any) => [`${v} issues`]}
-                  contentStyle={theme === 'dark' ? { backgroundColor: '#1f2937', border: '1px solid #374151', borderRadius: 8, color: '#f3f4f6' } : undefined}
-                  labelStyle={theme === 'dark' ? { color: '#f3f4f6' } : undefined}
-                  itemStyle={theme === 'dark' ? { color: '#f3f4f6' } : undefined}
-                />
-                <Legend iconType="circle" iconSize={10} />
-              </PieChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="h-40 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
-          )}
-        </div>
-
-        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
-          <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-3">Findings by Status</h2>
-          {statusData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={statusData} margin={{ top: 4, right: 20, bottom: 4, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={gridColor} />
-                <XAxis dataKey="name" tick={{ fontSize: 12, fill: axisColor }} stroke={axisColor} />
-                <YAxis tick={{ fontSize: 12, fill: axisColor }} stroke={axisColor} />
-                <Tooltip
-                  cursor={{ fill: theme === 'dark' ? '#374151' : '#f3f4f6' }}
-                  contentStyle={theme === 'dark' ? { backgroundColor: '#1f2937', border: '1px solid #374151', borderRadius: 8, color: '#f3f4f6' } : undefined}
-                  labelStyle={theme === 'dark' ? { color: '#f3f4f6' } : undefined}
-                  itemStyle={theme === 'dark' ? { color: '#f3f4f6' } : undefined}
-                />
-                <Bar dataKey="value" fill="#3b82f6" radius={[4, 4, 0, 0]} name="Findings" />
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="h-40 flex items-center justify-center text-gray-400 dark:text-gray-400">No findings yet</div>
-          )}
-        </div>
       </div>
 
     </div>
