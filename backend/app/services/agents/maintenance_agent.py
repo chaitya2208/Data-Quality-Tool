@@ -21,10 +21,12 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services import storage
+from app.services.snowflake_session import session as sf
 
 logger = logging.getLogger(__name__)
 
 RETIRE_QUIET_DAYS = 90
+RETIRE_MIN_RUNS = 3
 FLAPPING_REOPEN_THRESHOLD = 4
 _EXECUTION_LOOKBACK = 200
 
@@ -92,7 +94,7 @@ def _evaluate_retire_and_flapping(
             if getattr(e, "executed_at", None) and
             (e.executed_at if e.executed_at.tzinfo else e.executed_at.replace(tzinfo=datetime.timezone.utc)) >= cutoff
         )
-        if recent_runs > 0:
+        if recent_runs >= RETIRE_MIN_RUNS:
             out.append((
                 "retire_candidate",
                 f"No failures in the last {RETIRE_QUIET_DAYS} days "
@@ -114,12 +116,15 @@ def _detect_superseded(instances: List[Any]) -> List[Tuple[str, str, str, dict]]
         key = (inst.definition_id, _asset_fqn(inst), _target_key(inst))
         groups.setdefault(key, []).append(inst)
 
+    import datetime
+    _EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
     out: List[Tuple[str, str, str, dict]] = []
     for key, group in groups.items():
         if len(group) < 2:
             continue
-        # Newest wins; older ones are superseded.
-        ordered = sorted(group, key=lambda i: getattr(i, "created_at", None) or 0, reverse=True)
+        # Newest wins; older ones are superseded. NULL created_at (shouldn't
+        # happen in practice) sorts to the bottom.
+        ordered = sorted(group, key=lambda i: getattr(i, "created_at", None) or _EPOCH, reverse=True)
         winner = ordered[0]
         for older in ordered[1:]:
             out.append((
@@ -134,20 +139,59 @@ def _detect_superseded(instances: List[Any]) -> List[Tuple[str, str, str, dict]]
     return out
 
 
-def _detect_obsolete_target(inst: Any, asset_cache: Dict[str, Any]) -> Optional[Tuple[str, str, dict]]:
+def _detect_obsolete_target(inst: Any, asset_by_fqn: Dict[str, Any]) -> Optional[Tuple[str, str, dict]]:
     fqn = _asset_fqn(inst)
-    if fqn in asset_cache:
-        asset = asset_cache[fqn]
-    else:
-        asset = storage.get_asset_by_fqn(fqn)
-        asset_cache[fqn] = asset
-    if asset is None:
+    if asset_by_fqn.get(fqn) is None:
         return (
             "obsolete_target",
             f"Referenced asset {fqn} no longer exists — rule cannot run.",
             {"asset_fqn": fqn},
         )
     return None
+
+
+def _prefetch_assets_by_fqn(fqns: List[str]) -> Dict[str, Any]:
+    """Batch-load ASSETS for a set of FQNs. Missing FQNs map to None so callers
+    can distinguish 'not fetched yet' from 'fetched, does not exist'."""
+    result: Dict[str, Any] = {fqn: None for fqn in fqns}
+    if not fqns:
+        return result
+    placeholders = ", ".join(f"%(f{n})s" for n in range(len(fqns)))
+    params = {f"f{n}": fqn for n, fqn in enumerate(fqns)}
+    rows = sf.query(
+        f"SELECT * FROM ASSETS WHERE FQN IN ({placeholders})",
+        params,
+    )
+    for r in rows:
+        result[r["FQN"]] = storage._asset_from_row(r)
+    return result
+
+
+def _prefetch_findings_by_asset(asset_ids: List[str]) -> Dict[str, List[Any]]:
+    """One query fetching non-superseded findings for a set of assets, bucketed
+    by instance_id. Rules use per-instance reopened_count, so we filter to
+    findings that carry an INSTANCE_ID."""
+    by_instance: Dict[str, List[Any]] = {}
+    if not asset_ids:
+        return by_instance
+    placeholders = ", ".join(f"%(a{n})s" for n in range(len(asset_ids)))
+    params = {f"a{n}": aid for n, aid in enumerate(asset_ids)}
+    rows = sf.query(
+        f"""
+        SELECT * FROM FINDINGS
+        WHERE ASSET_ID IN ({placeholders})
+          AND STATUS <> 'superseded'
+          AND INSTANCE_ID IS NOT NULL
+        """,
+        params,
+    )
+    for r in rows:
+        try:
+            f = storage._finding_from_row(r)
+        except Exception:
+            continue
+        by_instance.setdefault(f.instance_id, []).append(f)
+    return by_instance
 
 
 def run() -> Dict[str, Any]:
@@ -159,19 +203,14 @@ def run() -> Dict[str, Any]:
     instance_ids = [i.id for i in instances]
     exec_by_iid = storage.list_executions_for_instances(instance_ids, limit_per_instance=_EXECUTION_LOOKBACK)
 
-    # Findings — one query per instance is a lot; fetch open + resolved
-    # incidents at once and bucket in-Python. Reuse existing list_findings.
-    findings_by_iid: Dict[str, List[Any]] = {}
-    for inst in instances:
-        # Small helper: query findings by asset then filter to instance.
-        asset = storage.get_asset_by_fqn(_asset_fqn(inst))
-        if asset is None:
-            findings_by_iid[inst.id] = []
-            continue
-        _t, fs = storage.list_findings(asset_id=asset.id, limit=5000)
-        findings_by_iid[inst.id] = [f for f in fs if getattr(f, "instance_id", None) == inst.id]
+    # Batch-fetch: one query for all referenced assets, one for all findings
+    # attached to those assets. Buckets by instance in Python instead of
+    # firing 2N queries.
+    unique_fqns = sorted({_asset_fqn(i) for i in instances})
+    asset_by_fqn = _prefetch_assets_by_fqn(unique_fqns)
+    live_asset_ids = [a.id for a in asset_by_fqn.values() if a is not None]
+    findings_by_iid = _prefetch_findings_by_asset(live_asset_ids)
 
-    asset_cache: Dict[str, Any] = {}
     created = 0
     by_action: Dict[str, int] = {}
 
@@ -180,7 +219,7 @@ def run() -> Dict[str, Any]:
         executions = exec_by_iid.get(inst.id, [])
         findings = findings_by_iid.get(inst.id, [])
 
-        obsolete = _detect_obsolete_target(inst, asset_cache)
+        obsolete = _detect_obsolete_target(inst, asset_by_fqn)
         if obsolete:
             action, reason, evidence = obsolete
             if not _skip(inst.id, action):
@@ -207,8 +246,41 @@ def run() -> Dict[str, Any]:
         by_action[action] = by_action.get(action, 0) + 1
 
     logger.info(f"[MaintenanceAgent] scanned={len(instances)} created={created} by_action={by_action}")
+    if created > 0:
+        try:
+            _emit_summary_notification(created, by_action)
+        except Exception as e:
+            logger.warning(f"[MaintenanceAgent] notification create failed: {e}")
     return {
         "scanned": len(instances),
         "proposals_created": created,
         "by_action": by_action,
     }
+
+
+_ACTION_LABEL = {
+    "retire_candidate": "retire",
+    "flapping": "flapping",
+    "superseded": "superseded",
+    "obsolete_target": "obsolete",
+}
+
+
+def _emit_summary_notification(created: int, by_action: Dict[str, int]) -> None:
+    parts = [f"{n} {_ACTION_LABEL.get(a, a)}" for a, n in sorted(by_action.items()) if n]
+    breakdown = ", ".join(parts) if parts else "cleanup"
+    title = f"{created} rule cleanup suggestion{'s' if created != 1 else ''}: {breakdown}"[:500]
+    body = (
+        "MaintenanceAgent found rule instances that look stale, flapping, "
+        "redundant, or pointing at dropped tables. Review and apply."
+    )
+    sf.execute(
+        """
+        INSERT INTO NOTIFICATIONS
+            (ID, KIND, TITLE, BODY, REF_TABLE, REF_ID, SEVERITY)
+        VALUES
+            (%(id)s, 'maintenance_proposals', %(title)s, %(body)s,
+             'MAINTENANCE_PROPOSALS', NULL, 'info')
+        """,
+        {"id": storage._new_id(), "title": title, "body": body},
+    )

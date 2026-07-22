@@ -909,18 +909,29 @@ class WorkflowCoordinator:
 
         for pattern in template.rule_patterns:
             scope = pattern.get("scope", "table")
+            target_config = dict(pattern.get("target_config") or {})
 
-            # Skip cross-table patterns — referential integrity rules are
-            # specific to the original table's relationships
-            if scope == "cross_table":
-                skipped_patterns.append({**pattern, "skip_reason": "cross_table scope not portable"})
-                continue
-
-            # Skip column-scoped patterns if the column doesn't exist here
-            target_config = pattern.get("target_config") or {}
-            column = target_config.get("column", "")
-            if scope == "column" and column and column.upper() not in existing_column_names:
-                skipped_patterns.append({**pattern, "skip_reason": f"column {column} not found"})
+            # Column existence — column-scoped patterns need their column on the
+            # target; multi_column (e.g. duplicate_key) needs every column in
+            # target_config["columns"]. cross_table checks the child column
+            # only; ref_* fields keep pointing at the (external) reference.
+            missing = None
+            if scope == "column":
+                column = target_config.get("column", "")
+                if column and column.upper() not in existing_column_names:
+                    missing = column
+            elif scope == "multi_column":
+                cols = target_config.get("columns") or []
+                for c in cols:
+                    if c and c.upper() not in existing_column_names:
+                        missing = c
+                        break
+            elif scope == "cross_table":
+                column = target_config.get("column", "")
+                if column and column.upper() not in existing_column_names:
+                    missing = column
+            if missing:
+                skipped_patterns.append({**pattern, "skip_reason": f"column {missing} not found"})
                 continue
 
             definition_id = pattern.get("definition_id")
@@ -928,6 +939,13 @@ class WorkflowCoordinator:
             if not definition:
                 skipped_patterns.append({**pattern, "skip_reason": "definition not found"})
                 continue
+
+            # Anomaly shapes read METRIC_SNAPSHOTS keyed by asset_id — the
+            # stored asset_id points at the origin table's TABLE_ASSETS row,
+            # so it must be rewritten to this run's asset. Otherwise anomaly
+            # checks silently read the wrong table's history.
+            if scope in ("anomaly", "anomaly_column"):
+                target_config["asset_id"] = table_asset.id
 
             threshold_config = pattern.get("threshold_config") or {}
             template_shape = pattern.get("template_shape") or definition.template_shape
@@ -938,9 +956,18 @@ class WorkflowCoordinator:
                     table_asset.database_name, table_asset.schema_name, table_asset.table_name,
                     target_config, threshold_config,
                 )
-                result = validate_sql(rule_sql, allowed_tables=[
+                allowed = [
                     f"{table_asset.database_name}.{table_asset.schema_name}.{table_asset.table_name}".upper()
-                ])
+                ]
+                # cross_table (referential_integrity) also references the FK's
+                # parent table stored in target_config as ref_database/ref_schema/ref_table.
+                if scope == "cross_table":
+                    ref_db = target_config.get("ref_database")
+                    ref_sc = target_config.get("ref_schema")
+                    ref_tb = target_config.get("ref_table")
+                    if ref_db and ref_sc and ref_tb:
+                        allowed.append(f"{ref_db}.{ref_sc}.{ref_tb}".upper())
+                result = validate_sql(rule_sql, allowed_tables=allowed)
                 if not result.is_valid:
                     skipped_patterns.append({**pattern, "skip_reason": f"SQL invalid: {result.errors}"})
                     continue
@@ -985,8 +1012,36 @@ class WorkflowCoordinator:
             storage.approve_instance(instance.id)
             approved_instance_ids.add(instance.id)
 
+        # Also run every OTHER active RULE_INSTANCES row targeting this table —
+        # anomaly instances approved via the notifications inbox, plus any
+        # previously-active rules from earlier scans that aren't in this
+        # template. Without this, a scheduled template run silently ignores
+        # anomaly rules the user approved through /proposals/{id}/approve,
+        # so they never actually fire on subsequent scans. Global governance
+        # instances (DATABASE_NAME='*') are unioned too, matching the
+        # agentic path's rule_intelligence_agent._existing_active_or_pending_instances.
+        _, table_active = storage.list_instances(
+            database_name=table_asset.database_name,
+            schema_name=table_asset.schema_name,
+            table_name=table_asset.table_name,
+            status="active",
+            is_active=True,
+            limit=1000,
+        )
+        _, global_active = storage.list_instances(
+            database_name="*",
+            status="active",
+            is_active=True,
+            limit=1000,
+        )
+        pre_union_count = len(approved_instance_ids)
+        for inst in list(table_active) + list(global_active):
+            approved_instance_ids.add(inst.id)
+        extra_added = len(approved_instance_ids) - pre_union_count
+
         logger.info(
-            f"[Coordinator] Template run — {len(approved_instance_ids)} patterns applied, "
+            f"[Coordinator] Template run — {pre_union_count} patterns applied, "
+            f"{extra_added} pre-existing active instance(s) unioned, "
             f"{len(skipped_patterns)} skipped on {table_asset.fqn}"
         )
 

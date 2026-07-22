@@ -6,11 +6,12 @@ import type { ColumnMeta, TableProfile, TopValue, ColumnProfile, HealthDot } fro
 import { useConnection } from '../ConnectionContext'
 import {
   Database, Table2, Columns3, BarChart3, Loader2, ChevronRight,
-  KeyRound, Hash, AlertCircle, ShieldCheck, History,
+  KeyRound, Hash, AlertCircle, ShieldCheck, History, Activity,
 } from 'lucide-react'
 import DataHealthPanel, { ColumnStatusDot } from './DataHealthPanel'
+import MetricsPanel from './MetricsPanel'
 
-type ExplorerTab = 'overview' | 'stats' | 'health'
+type ExplorerTab = 'overview' | 'stats' | 'health' | 'metrics'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -450,6 +451,7 @@ export default function DataExplorer() {
             { id: 'stats',    label: 'Column Stats', icon: BarChart3 },
             { id: 'health',   label: 'Data Health', icon: ShieldCheck,
               badge: health && health.rules_failing > 0 ? health.rules_failing : undefined },
+            { id: 'metrics',  label: 'Metrics', icon: Activity },
           ] as const).map(t => {
             const Icon = t.icon
             const active = tab === t.id
@@ -507,6 +509,11 @@ export default function DataExplorer() {
       {/* ── Data Health tab ────────────────────────────────────────────────── */}
       {selectedTable && tab === 'health' && (
         <DataHealthPanel database={selectedDatabase!} schema={selectedSchema!} table={selectedTable} />
+      )}
+
+      {/* ── Metrics tab ─────────────────────────────────────────────────────── */}
+      {selectedTable && tab === 'metrics' && (
+        <MetricsPanel database={selectedDatabase!} schema={selectedSchema!} table={selectedTable} />
       )}
 
       {/* ── Overview tab: meta strip + columns table ──────────────────────── */}

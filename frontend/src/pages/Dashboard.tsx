@@ -1,9 +1,9 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { findingsApi, agentRunsApi, tableHealthApi } from '../api/client'
+import { findingsApi, agentRunsApi, tableHealthApi, rulesApi } from '../api/client'
 import type { FleetOverview } from '../api/client'
-import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck, RotateCcw, TrendingUp } from 'lucide-react'
+import { AlertCircle, CheckCircle, Clock, Database, ChevronRight, ArrowLeft, Table, ShieldCheck, RotateCcw, TrendingUp, ShieldAlert } from 'lucide-react'
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip,
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -58,8 +58,14 @@ export default function Dashboard() {
   const { data: fleet, isLoading: loadingFleet } = useQuery({
     queryKey: ['fleet-health', connId, 30],
     queryFn: () => tableHealthApi.fleet({
-      connection_id: connId || undefined, days: 30, top_n: 8,
+      connection_id: connId || undefined, days: 30, top_n: 500,
     }).then(r => r.data),
+    staleTime: 60_000,
+  })
+
+  const { data: coverage, isLoading: loadingCoverage } = useQuery({
+    queryKey: ['rules-coverage', connId],
+    queryFn: () => rulesApi.coverage(connId).then(r => r.data),
     staleTime: 60_000,
   })
 
@@ -181,8 +187,14 @@ export default function Dashboard() {
       {/* Stat cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-6">
         <StatCard title="Total Findings"   value={stats?.total ?? 0}               icon={AlertCircle} color="bg-red-500"    href="/findings"           loading={loadingStats} />
-        <StatCard title="Pending Issues"   value={stats?.by_status?.detected ?? 0} icon={Clock}       color="bg-yellow-500" href="/findings?status=detected" loading={loadingStats} />
+        <StatCard title="Pending Issues"    value={(stats?.by_status?.open ?? 0) + (stats?.by_status?.reopened ?? 0)} icon={Clock} color="bg-yellow-500" href="/findings?status=open" loading={loadingStats} />
         <StatCard title="Workflow Runs"    value={scopedRuns.length}               icon={CheckCircle} color="bg-green-500"  href="/run-history"        loading={loadingRuns} />
+      </div>
+
+      {/* Rule coverage + fleet table stats */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <InstanceCoveragePanel coverage={coverage} loading={loadingCoverage} />
+        <FleetTableStats fleet={fleet} loading={loadingFleet} />
       </div>
 
       {/* ── Fleet Health KPI row ─────────────────────────────────────────
@@ -456,6 +468,136 @@ function FleetKpiTile({
         {label}
       </div>
       <div className={`mt-1 text-2xl font-bold tabular-nums ${tone ?? 'text-gray-900 dark:text-gray-100'}`}>{value}</div>
+    </div>
+  )
+}
+
+function InstanceCoveragePanel({
+  coverage,
+  loading,
+}: {
+  coverage: { active: number; passing: number; failing: number } | undefined
+  loading: boolean
+}) {
+  const active  = coverage?.active  ?? 0
+  const passing = coverage?.passing ?? 0
+  const failing = coverage?.failing ?? 0
+  const passRate = active > 0 ? Math.round((passing / active) * 100) : 0
+
+  const donutData = [
+    { name: 'Passing', value: passing, color: '#10b981' },
+    { name: 'Failing', value: failing, color: '#ef4444' },
+  ].filter(d => d.value > 0)
+
+  const scoreColor =
+    passRate >= 90 ? 'text-emerald-600 dark:text-emerald-400' :
+    passRate >= 70 ? 'text-amber-500 dark:text-amber-400' :
+                    'text-red-500 dark:text-red-400'
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <ShieldCheck className="w-4 h-4 text-primary-600" />
+        <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Instance coverage</h2>
+        <span className="text-xs text-gray-400 dark:text-gray-500">{active} active</span>
+      </div>
+
+      {loading ? (
+        <div className="h-32 flex items-center justify-center">
+          <div className="w-8 h-8 rounded-full border-2 border-gray-200 dark:border-gray-700 border-t-primary-500 animate-spin" />
+        </div>
+      ) : active === 0 ? (
+        <p className="text-sm text-gray-400 dark:text-gray-500 text-center py-8">No active instances</p>
+      ) : (
+        <div className="flex items-center gap-6">
+          {/* Donut */}
+          <div className="relative flex-shrink-0" style={{ width: 120, height: 120 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie
+                  data={donutData}
+                  cx="50%" cy="50%"
+                  innerRadius={38} outerRadius={54}
+                  dataKey="value"
+                  startAngle={90} endAngle={-270}
+                  strokeWidth={0}
+                >
+                  {donutData.map((d, i) => (
+                    <Cell key={i} fill={d.color} />
+                  ))}
+                </Pie>
+              </PieChart>
+            </ResponsiveContainer>
+            {/* Center label */}
+            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+              <span className={`text-xl font-bold ${scoreColor}`}>{passRate}%</span>
+              <span className="text-[10px] text-gray-400 dark:text-gray-500 leading-none">healthy</span>
+            </div>
+          </div>
+
+          {/* Legend */}
+          <div className="flex flex-col gap-3 min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 flex-shrink-0" />
+              <span className="text-sm text-gray-600 dark:text-gray-300 min-w-[56px]">Passing</span>
+              <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{passing}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-red-500 flex-shrink-0" />
+              <span className="text-sm text-gray-600 dark:text-gray-300 min-w-[56px]">Failing</span>
+              <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{failing}</span>
+            </div>
+            {/* Pass rate bar */}
+            <div className="mt-1">
+              <div className="h-1.5 w-40 rounded-full bg-gray-100 dark:bg-gray-700 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-emerald-500 transition-all duration-500"
+                  style={{ width: `${passRate}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function FleetTableStats({ fleet, loading }: { fleet: FleetOverview | undefined; loading: boolean }) {
+  const tables = fleet?.tables ?? []
+  const totalTables   = fleet?.tables_total ?? 0
+  const failedToday   = tables.filter(t => (t.failed ?? 0) > 0).length
+  const unhealthy     = tables.filter(t => (t.open_findings ?? 0) > 0).length
+
+  const rows = [
+    { label: 'Tables monitored',      value: totalTables,  color: 'text-blue-600 dark:text-blue-400',    icon: Database },
+    { label: 'Tables failed today',   value: failedToday,  color: failedToday  > 0 ? 'text-red-600 dark:text-red-400'     : 'text-emerald-600 dark:text-emerald-400', icon: ShieldAlert },
+    { label: 'Tables with open issues', value: unhealthy,  color: unhealthy    > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400', icon: AlertCircle },
+  ]
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <Database className="w-4 h-4 text-primary-600" />
+        <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Fleet tables</h2>
+      </div>
+      {loading ? (
+        <div className="h-32 flex items-center justify-center">
+          <div className="w-8 h-8 rounded-full border-2 border-gray-200 dark:border-gray-700 border-t-primary-500 animate-spin" />
+        </div>
+      ) : (
+        <div className="divide-y divide-gray-100 dark:divide-gray-700">
+          {rows.map(({ label, value, color, icon: Icon }) => (
+            <div key={label} className="flex items-center justify-between py-3">
+              <div className="flex items-center gap-2">
+                <Icon className={`w-4 h-4 ${color}`} />
+                <span className="text-sm text-gray-600 dark:text-gray-300">{label}</span>
+              </div>
+              <span className={`text-2xl font-bold tabular-nums ${color}`}>{value}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

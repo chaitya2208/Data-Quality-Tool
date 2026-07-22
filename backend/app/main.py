@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api import assets, scans, findings, rules, health, ai_recommendations, agent_runs, profiling, connections, schedules, settings as settings_api, table_health, mutes, validate, notifications, proposals, maintenance, lineage
+from app.api import assets, scans, findings, rules, health, ai_recommendations, agent_runs, profiling, connections, schedules, settings as settings_api, table_health, mutes, validate, notifications, proposals, maintenance, lineage, metrics
 from app.services.snowflake_session import session as sf_session
 import logging
 
@@ -100,6 +100,7 @@ app.include_router(notifications.router, prefix=f"{settings.API_V1_STR}/notifica
 app.include_router(proposals.router, prefix=f"{settings.API_V1_STR}/proposals", tags=["proposals"])
 app.include_router(validate.router, prefix=f"{settings.API_V1_STR}/validate", tags=["validate"])
 app.include_router(maintenance.router, prefix=f"{settings.API_V1_STR}/maintenance", tags=["maintenance"])
+app.include_router(metrics.router, prefix=f"{settings.API_V1_STR}/metrics", tags=["metrics"])
 
 
 @app.get("/")

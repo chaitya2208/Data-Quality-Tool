@@ -58,21 +58,49 @@ def _instance_summary(instance_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _to_out(p: Any) -> Dict[str, Any]:
+def _to_out(
+    p: Any,
+    instances: Optional[Dict[str, Any]] = None,
+    definitions: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if instances is not None:
+        inst = instances.get(p.instance_id)
+        if inst is not None:
+            defn = (definitions or {}).get(inst.definition_id)
+            summary: Optional[Dict[str, Any]] = {
+                "id": inst.id,
+                "database_name": inst.database_name,
+                "schema_name": inst.schema_name,
+                "table_name": inst.table_name,
+                "severity": inst.severity,
+                "status": inst.status,
+                "definition_name": getattr(defn, "name", None),
+                "definition_id": inst.definition_id,
+            }
+        else:
+            summary = None
+    else:
+        summary = _instance_summary(p.instance_id)
     return MaintenanceProposalOut(
         id=p.id, instance_id=p.instance_id, action=p.action,
         reason=p.reason, evidence=p.evidence, status=p.status,
         decision_reason=p.decision_reason, decided_by=p.decided_by,
         decided_at=str(p.decided_at) if p.decided_at else None,
         created_at=str(p.created_at) if p.created_at else None,
-        instance_summary=_instance_summary(p.instance_id),
+        instance_summary=summary,
     ).model_dump()
 
 
 @router.get("/pending")
 def list_pending(limit: int = 200):
     proposals = storage.list_maintenance_proposals(status="pending", limit=limit)
-    return {"items": [_to_out(p) for p in proposals]}
+    if not proposals:
+        return {"items": []}
+    instance_ids = list({p.instance_id for p in proposals})
+    instances = storage.get_instances_by_ids(instance_ids)
+    definition_ids = list({inst.definition_id for inst in instances.values() if inst.definition_id})
+    definitions = storage.get_definitions_by_ids(definition_ids) if definition_ids else {}
+    return {"items": [_to_out(p, instances, definitions) for p in proposals]}
 
 
 @router.get("/{proposal_id}")

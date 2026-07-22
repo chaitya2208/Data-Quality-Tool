@@ -425,14 +425,9 @@ export default function Findings() {
   }[s] ?? 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   const stColor = (s: string) => ({
-    detected:       'bg-red-50 text-red-700 border-red-200',
-    validated:      'bg-orange-50 text-orange-700 border-orange-200',
-    in_progress:    'bg-blue-50 text-blue-700 border-blue-200',
-    resolved:       'bg-green-50 text-green-700 border-green-200',
-    false_positive: 'bg-gray-100 text-gray-500 border-gray-300',
-    wont_fix:       'bg-yellow-50 text-yellow-700 border-yellow-200',
-    closed:         'bg-gray-50 text-gray-500 border-gray-200',
-    superseded:     'bg-purple-50 text-purple-600 border-purple-200',
+    open:     'bg-red-50 text-red-700 border-red-200',
+    reopened: 'bg-orange-50 text-orange-700 border-orange-200',
+    resolved: 'bg-green-50 text-green-700 border-green-200',
   }[s] ?? 'bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700')
 
   return (
@@ -549,14 +544,9 @@ export default function Findings() {
             <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent">
               <option value="">All Statuses</option>
-              <option value="detected">Detected</option>
-              <option value="validated">Validated</option>
-              <option value="in_progress">In Progress</option>
+              <option value="open">Open</option>
+              <option value="reopened">Reopened</option>
               <option value="resolved">Resolved</option>
-              <option value="false_positive">False Positive</option>
-              <option value="wont_fix">Won't Fix</option>
-              <option value="closed">Closed</option>
-              <option value="superseded">Superseded</option>
             </select>
           </div>
         </div>

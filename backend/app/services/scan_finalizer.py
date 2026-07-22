@@ -173,7 +173,7 @@ def _candidate_asset_ids_for_pass(table_asset_id: str, instance_id: str) -> List
             """
             SELECT DISTINCT ASSET_ID FROM FINDINGS
             WHERE INSTANCE_ID = %(iid)s
-              AND STATUS IN ('detected','validated','in_progress','assigned','acknowledged')
+              AND STATUS IN ('open','reopened')
               AND (ASSET_ID <> %(aid)s OR %(aid)s IS NULL)
             """,
             {"iid": instance_id, "aid": table_asset_id},

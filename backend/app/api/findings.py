@@ -80,8 +80,6 @@ def update_finding(finding_id: str, update_data: FindingUpdate):
         fields["status"] = status_value
         if status_value == "resolved" and not finding.resolved_at:
             fields["resolved_at"] = datetime.utcnow()
-        elif status_value == "closed" and not finding.closed_at:
-            fields["closed_at"] = datetime.utcnow()
 
     if update_data.assigned_to is not None:
         fields["assigned_to"] = update_data.assigned_to
@@ -96,8 +94,7 @@ def update_finding(finding_id: str, update_data: FindingUpdate):
     # for its run, kick an immediate verification so the workflow can complete
     # right away instead of waiting for the 5-min auto-verify cycle. Best-effort:
     # any failure here must never break the PATCH response.
-    _CLOSED_STATUSES = {"resolved", "false_positive", "wont_fix", "closed"}
-    if update_data.status is not None and fields.get("status") in _CLOSED_STATUSES:
+    if update_data.status is not None and fields.get("status") == "resolved":
         try:
             _maybe_trigger_verification(finding.scan_id)
         except Exception as e:

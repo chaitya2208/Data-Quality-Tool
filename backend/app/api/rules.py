@@ -52,6 +52,48 @@ def get_rule_stats():
     }
 
 
+@router.get("/coverage")
+def get_rule_coverage(connection_id: Optional[str] = None):
+    """Per-instance pass/fail breakdown for active instances.
+
+    An instance is 'failing' if it has at least one open finding
+    (open / reopened). It is 'passing' otherwise —
+    including instances that previously had findings but have since been
+    resolved.
+    """
+    _total, instances = storage.list_instances(status="active", limit=5000)
+    if connection_id and not storage._is_snowflake_connection(connection_id):
+        instances = [i for i in instances if getattr(i, "connection_id", None) == connection_id]
+    if not instances:
+        return {"active": 0, "passing": 0, "failing": 0, "never_run": 0}
+
+    instance_ids = [i.id for i in instances]
+    # One query: open finding count per instance
+    placeholders = ", ".join(f"%(id_{n})s" for n in range(len(instance_ids)))
+    params = {f"id_{n}": iid for n, iid in enumerate(instance_ids)}
+    rows = sf_session.query(
+        f"""
+        SELECT INSTANCE_ID, COUNT(*) AS cnt
+        FROM FINDINGS
+        WHERE INSTANCE_ID IN ({placeholders})
+          AND STATUS IN ('open', 'reopened')
+        GROUP BY INSTANCE_ID
+        """,
+        params,
+    )
+    failing_ids = {r["INSTANCE_ID"] for r in rows}
+
+    active = len(instances)
+    failing = len(failing_ids)
+    passing = active - failing
+
+    return {
+        "active":  active,
+        "passing": passing,
+        "failing": failing,
+    }
+
+
 # ── List ──────────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=RuleListResponse)

@@ -17,7 +17,7 @@ class FindingBase(BaseModel):
 
 
 class FindingCreate(FindingBase):
-    status: FindingStatus = FindingStatus.DETECTED
+    status: FindingStatus = FindingStatus.OPEN
 
 
 class FindingUpdate(BaseModel):

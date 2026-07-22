@@ -293,7 +293,7 @@ class RuleEngine:
             "title": f"{definition.name} violated on {asset.fqn.split('.')[-1]}",
             "description": description,
             "severity": instance.severity,
-            "status": "detected",
+            "status": "open",
             "context": {
                 "rule_code": definition.name,
                 "fqn": asset.fqn,
@@ -345,7 +345,7 @@ class RuleEngine:
                 "description": f"The table {asset.fqn} does not have a description/comment. "
                               f"All tables should be documented with meaningful comments.",
                 "severity": instance.severity,
-                "status": "detected",
+                "status": "open",
                 "context": {
                     "database_name": asset.database_name,
                     "schema_name": asset.schema_name,
@@ -373,7 +373,7 @@ class RuleEngine:
                 "description": f"The table {asset.fqn} does not have an assigned owner. "
                               f"All tables should have a designated owner for accountability.",
                 "severity": instance.severity,
-                "status": "detected",
+                "status": "open",
                 "context": {
                     "database_name": asset.database_name,
                     "schema_name": asset.schema_name,
@@ -401,7 +401,7 @@ class RuleEngine:
                 "description": f"The column {asset.fqn} does not have a description/comment. "
                               f"All columns should be documented with meaningful comments.",
                 "severity": instance.severity,
-                "status": "detected",
+                "status": "open",
                 "context": {
                     "database_name": asset.database_name,
                     "schema_name": asset.schema_name,

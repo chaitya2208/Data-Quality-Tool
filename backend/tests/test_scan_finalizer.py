@@ -84,7 +84,7 @@ class TestCreate:
                          "reopened": 0, "muted": 0}
         assert len(storage.findings) == 1
         f = list(storage.findings.values())[0]
-        assert f.status == "detected"
+        assert f.status == "open"
         assert f.current_fail_count == 5
         assert f.reopened_count == 0
         assert len(f.fail_history) == 1
@@ -126,7 +126,7 @@ class TestUpdate:
         earliest = datetime.datetime.utcnow() - datetime.timedelta(days=5)
         # Seed with an initial history entry (from the original CREATE)
         f = make_finding(instance_id="inst-1", asset_id="asset-1",
-                         status="detected", fail_count=3,
+                         status="open", fail_count=3,
                          first_detected_at=earliest,
                          fail_history=[{"scan_id": "scan-1", "at": "prior",
                                         "fail_count": 3, "total_count": 100}])
@@ -139,7 +139,7 @@ class TestUpdate:
         assert stats == {"updated": 1, "created": 0, "resolved": 0,
                          "reopened": 0, "muted": 0}
         f = storage.findings[f.id]
-        assert f.status == "detected"
+        assert f.status == "open"
         assert f.current_fail_count == 8
         # first_detected_at preserved — the "broken since" clock
         assert f.first_detected_at == earliest
@@ -151,7 +151,7 @@ class TestUpdate:
         history_49 = [{"scan_id": f"s{i}", "at": "x", "fail_count": 1, "total_count": 1}
                       for i in range(49)]
         f = make_finding(instance_id="inst-1", asset_id="asset-1",
-                         status="detected", fail_history=history_49)
+                         status="open", fail_history=history_49)
         storage.findings[f.id] = f
 
         finalize(scan_id="scan-50", asset_id_for_passed="asset-1",
@@ -169,7 +169,7 @@ class TestUpdate:
     def test_severity_can_change_on_update(self, finalizer_env):
         finalize, storage = finalizer_env
         f = make_finding(instance_id="inst-1", asset_id="asset-1",
-                         status="detected", severity="low")
+                         status="open", severity="low")
         storage.findings[f.id] = f
         finalize(scan_id="scan-2", asset_id_for_passed="asset-1",
                   findings_data=[_fd("inst-1", "asset-1", severity="high")],
@@ -186,7 +186,7 @@ class TestResolve:
     def test_pass_after_fail_auto_resolves(self, finalizer_env):
         finalize, storage = finalizer_env
         f = make_finding(instance_id="inst-1", asset_id="asset-1",
-                         status="detected", fail_count=5)
+                         status="open", fail_count=5)
         storage.findings[f.id] = f
 
         stats = finalize(scan_id="scan-2", asset_id_for_passed="asset-1",
@@ -240,7 +240,7 @@ class TestReopen:
         assert stats == {"reopened": 1, "created": 0, "updated": 0,
                          "resolved": 0, "muted": 0}
         f = storage.findings[f.id]
-        assert f.status == "detected"
+        assert f.status == "reopened"
         assert f.reopened_count == 1
         assert f.first_detected_at == earliest  # preserved
         assert f.resolved_at is None
@@ -298,7 +298,7 @@ class TestMutes:
     def test_muted_failure_does_not_update_open_finding(self, finalizer_env):
         finalize, storage = finalizer_env
         f = make_finding(instance_id="inst-1", asset_id="asset-1",
-                         status="detected", fail_count=3)
+                         status="open", fail_count=3)
         storage.findings[f.id] = f
         storage.create_mute("inst-1", "asset-1",
                             datetime.datetime.utcnow() + datetime.timedelta(hours=1))
@@ -315,7 +315,7 @@ class TestMutes:
         """Mutes silence noise, not fixes — a passing rule STILL resolves an
         open finding."""
         finalize, storage = finalizer_env
-        f = make_finding(instance_id="inst-1", asset_id="asset-1", status="detected")
+        f = make_finding(instance_id="inst-1", asset_id="asset-1", status="open")
         storage.findings[f.id] = f
         storage.create_mute("inst-1", "asset-1",
                             datetime.datetime.utcnow() + datetime.timedelta(hours=1))
@@ -326,7 +326,7 @@ class TestMutes:
         # muted count goes up on the PASS branch too (see finalizer L100-102)
         # since it's muted; storage/spec is that mutes silence updates but a
         # pass during a mute still resolves. Verify the finding is closed.
-        assert storage.findings[f.id].status in ("resolved", "detected")
+        assert storage.findings[f.id].status in ("resolved", "open")
 
     def test_expired_mute_does_not_apply(self, finalizer_env):
         finalize, storage = finalizer_env
@@ -349,10 +349,10 @@ class TestMixed:
         """One scan can produce a mix of all outcomes."""
         finalize, storage = finalizer_env
         # inst-A: open, failing again → UPDATE
-        fa = make_finding(instance_id="inst-A", asset_id="asset-1", status="detected")
+        fa = make_finding(instance_id="inst-A", asset_id="asset-1", status="open")
         storage.findings[fa.id] = fa
         # inst-B: open, no longer failing → RESOLVE
-        fb = make_finding(instance_id="inst-B", asset_id="asset-1", status="detected")
+        fb = make_finding(instance_id="inst-B", asset_id="asset-1", status="open")
         storage.findings[fb.id] = fb
         # inst-C: recently resolved, failing again → REOPEN
         recent = datetime.datetime.utcnow() - datetime.timedelta(days=2)

@@ -191,6 +191,10 @@ export const rulesApi = {
   list: (params?: { is_active?: boolean; category?: string; severity?: string; status?: string }) =>
     api.get<{ total: number; rules: Rule[] }>('/rules', { params }),
   stats: () => api.get<RuleStats & { pending: number; by_status: Record<string, number> }>('/rules/stats'),
+  coverage: (connectionId?: string | null) =>
+    api.get<{ active: number; passing: number; failing: number; never_run: number }>(
+      '/rules/coverage', { params: connectionId ? { connection_id: connectionId } : {} }
+    ),
   toggle: (id: string, is_active: boolean) =>
     api.patch<Rule>(`/rules/${id}`, { is_active }),
   update: (id: string, data: Partial<RuleCreatePayload>) =>
@@ -1021,6 +1025,18 @@ export const proposalsApi = {
     api.post<{ ok: boolean; instance_id: string }>(`/proposals/${id}/approve`, { decided_by: decidedBy }),
   reject: (id: string, reason?: string, decidedBy?: string) =>
     api.post<{ ok: boolean }>(`/proposals/${id}/reject`, { reason, decided_by: decidedBy }),
+  approveBatch: (proposalIds: string[], decidedBy?: string) =>
+    api.post<{
+      results: { id: string; ok: boolean; instance_id?: string; error?: string }[];
+      approved: number;
+      failed: number;
+    }>('/proposals/approve-batch', { proposal_ids: proposalIds, decided_by: decidedBy }),
+  rejectBatch: (proposalIds: string[], reason?: string, decidedBy?: string) =>
+    api.post<{
+      results: { id: string; ok: boolean; error?: string }[];
+      rejected: number;
+      failed: number;
+    }>('/proposals/reject-batch', { proposal_ids: proposalIds, reason, decided_by: decidedBy }),
 };
 
 export interface MaintenanceProposal {
@@ -1053,6 +1069,77 @@ export const maintenanceApi = {
   dismiss: (id: string, reason?: string, decidedBy?: string) =>
     api.post<{ ok: boolean }>(`/maintenance/${id}/dismiss`, { reason, decided_by: decidedBy }),
   runSweep: () => api.post<{ scanned: number; proposals_created: number; by_action: Record<string, number> }>('/maintenance/run'),
+};
+
+// ── Metric detail (anomaly monitoring) ────────────────────────────────────
+
+export interface MetricSnapshot {
+  scan_id: string | null;
+  value: number | null;
+  captured_at: string | null;
+}
+
+export interface MetricBaseline {
+  median: number | null;
+  mad: number | null;
+  sample_count: number;
+  observed_set: string[] | null;
+  window_start: string | null;
+  window_end: string | null;
+  updated_at: string | null;
+}
+
+export interface MetricInstance {
+  id: string;
+  definition_id: string;
+  threshold_config: { deviations?: number; max_pct_change?: number };
+  is_active: boolean;
+  status: string;
+  severity: string | null;
+}
+
+export interface MetricFinding {
+  id: string;
+  scan_id: string | null;
+  title: string | null;
+  severity: string | null;
+  status: string | null;
+  detected_at: string | null;
+  last_seen_at: string | null;
+}
+
+export interface MetricHistory {
+  asset: { id: string; database_name: string; schema_name: string; table_name: string };
+  metric_name: string;
+  column_name: string | null;
+  snapshots: MetricSnapshot[];
+  baseline: MetricBaseline | null;
+  instance: MetricInstance | null;
+  findings: MetricFinding[];
+}
+
+export interface AssetMetricRow {
+  column_name: string | null;
+  metric_name: string;
+  median: number | null;
+  mad: number | null;
+  sample_count: number;
+  latest_value: number | null;
+  latest_captured_at: string | null;
+  deviations_from_median: number | null;
+  history: { value: number | null; captured_at: string | null }[];
+  baseline_updated_at: string | null;
+}
+
+export const metricsApi = {
+  history: (params: { asset_id: string; metric_name: string; column_name?: string | null; limit?: number }) =>
+    api.get<MetricHistory>('/metrics/history', { params }),
+  listForAsset: (assetId: string) =>
+    api.get<{ metrics: AssetMetricRow[] }>(`/metrics/asset/${assetId}`),
+  updateThreshold: (instanceId: string, body: { deviations?: number; max_pct_change?: number }) =>
+    api.patch<{ ok: boolean; threshold_config: { deviations?: number; max_pct_change?: number } }>(
+      `/metrics/instance/${instanceId}/threshold`, body,
+    ),
 };
 
 export const agentRunsApi = {

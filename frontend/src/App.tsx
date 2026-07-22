@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock, Bell, Waypoints, CheckCheck, Inbox, ChevronRight } from 'lucide-react'
+import { Home, Database, AlertCircle, GitBranch, Menu, Library, Compass, Plug, Settings as SettingsIcon, Snowflake, Server, BookOpen, History, Clock, Bell, Waypoints, CheckCheck, Inbox, ChevronRight, Wrench } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Findings from './pages/Findings'
 import AgentWorkflow from './pages/AgentWorkflow'
@@ -13,6 +13,8 @@ import SavedWorkflows from './pages/SavedWorkflows'
 import Schedules from './pages/Schedules'
 import RunHistory from './pages/RunHistory'
 import Notifications from './pages/Notifications'
+import Maintenance from './pages/Maintenance'
+import MetricDetail from './pages/MetricDetail'
 import Lineage from './pages/Lineage'
 import { useConnection } from './ConnectionContext'
 import { notificationsApi, type Notification } from './api/client'
@@ -92,10 +94,15 @@ function NotificationsBell() {
       setItems(prev => prev.map(x => x.id === n.id ? { ...x, read_at: new Date().toISOString() } : x))
       refreshCount()
     }
-    // Anomaly-proposal notifications carry the source run_id in ref_id — deep-link
-    // the review workspace to auto-select the matching proposals.
+    // Route to the right workspace by notification kind. Anomaly proposals
+    // live in the Rule Library alongside other pending rules; maintenance
+    // proposals have their own page; anything else falls back to the history.
     if (n.kind === 'anomaly_proposals' && n.ref_id) {
-      navigate(`/notifications?ref=${encodeURIComponent(n.ref_id)}`)
+      navigate(`/rule-library?ref=${encodeURIComponent(n.ref_id)}`)
+    } else if (n.kind === 'anomaly_proposals') {
+      navigate('/rule-library')
+    } else if (n.kind === 'maintenance_proposals') {
+      navigate('/maintenance')
     } else {
       navigate('/notifications')
     }
@@ -229,6 +236,7 @@ function App() {
     { name: 'Run History',     href: '/run-history',     icon: History      },
     { name: 'Saved Workflows', href: '/saved-workflows', icon: BookOpen     },
     { name: 'Schedules',       href: '/schedules',       icon: Clock        },
+    { name: 'Maintenance',     href: '/maintenance',     icon: Wrench       },
     { name: 'Settings',        href: '/settings',        icon: SettingsIcon },
   ]
 
@@ -359,6 +367,8 @@ function App() {
             <Route path="/schedules"       element={<Schedules />}     />
             <Route path="/settings"        element={<SettingsPage />}  />
             <Route path="/notifications"   element={<Notifications />} />
+            <Route path="/maintenance"     element={<Maintenance />}   />
+            <Route path="/metrics/:assetId" element={<MetricDetail />} />
             <Route path="/lineage"         element={<Lineage />}       />
           </Routes>
         </main>

@@ -360,7 +360,7 @@ def create_finding(
     title: str,
     description: str,
     severity: str,
-    status: str = "detected",
+    status: str = "open",
     context: Optional[dict] = None,
     evidence: Optional[dict] = None,
 ) -> SimpleNamespace:
@@ -392,7 +392,7 @@ def create_finding(
 
 def create_findings_bulk(findings_data: list[dict]) -> list[SimpleNamespace]:
     """Insert many finding dicts (same shape as create_finding's kwargs, plus
-    optional 'status' defaulting to 'detected'). Returns the created findings."""
+    optional 'status' defaulting to 'open'). Returns the created findings."""
     created = []
     for fd in findings_data:
         created.append(
@@ -403,7 +403,7 @@ def create_findings_bulk(findings_data: list[dict]) -> list[SimpleNamespace]:
                 title=fd["title"],
                 description=fd["description"],
                 severity=fd["severity"],
-                status=fd.get("status", "detected"),
+                status=fd.get("status", "open"),
                 context=fd.get("context"),
                 evidence=fd.get("evidence"),
             )
@@ -532,15 +532,13 @@ def update_finding_evidence(finding_id: str, evidence: dict) -> None:
     )
 
 
-# Open (non-closed) finding statuses — anything not here is considered resolved/
-# closed and won't be superseded or shown under "Detected".
-_OPEN_FINDING_STATUSES = ("detected", "validated", "in_progress")
+_OPEN_FINDING_STATUSES = ("open", "reopened")
 
 
 def findings_with_asset_not_closed(
     connection_id: Optional[str] = None,
 ) -> list[tuple[SimpleNamespace, SimpleNamespace]]:
-    """(finding, asset) pairs for every finding not RESOLVED/CLOSED — dashboard chart.
+    """(finding, asset) pairs for every finding not RESOLVED — dashboard chart.
     Optionally scoped to one connection via the FINDINGS → SCANS.CONNECTION_ID join."""
     params: dict = {}
     conn_sql = ""
@@ -552,7 +550,7 @@ def findings_with_asset_not_closed(
                a.TABLE_NAME AS A_TABLE_NAME, a.FQN AS A_FQN
         FROM FINDINGS f
         JOIN ASSETS a ON a.ID = f.ASSET_ID
-        WHERE f.STATUS NOT IN ('resolved', 'closed', 'superseded')
+        WHERE f.STATUS NOT IN ('resolved')
         {conn_sql}
         """,
         params,
@@ -1748,7 +1746,7 @@ def get_agent_run_by_scan(scan_id: str) -> Optional[SimpleNamespace]:
 
 
 def count_open_findings_for_scan(scan_id: str) -> int:
-    """Number of still-open (detected/validated/in_progress) findings for a scan.
+    """Number of still-open (open/reopened) findings for a scan.
     Used to decide whether resolving a finding has cleared a run's whole queue."""
     if not scan_id:
         return 0
@@ -2841,8 +2839,8 @@ def get_lessons_for_synthesis(
 # updated across scans. See services/scan_finalizer.py for the state machine.
 # ═══════════════════════════════════════════════════════════════════════════
 
-_LIFECYCLE_OPEN = ("detected", "validated", "in_progress", "assigned", "acknowledged")
-_LIFECYCLE_RESOLVED = ("resolved", "false_positive", "wont_fix", "closed")
+_LIFECYCLE_OPEN = ("open", "reopened")
+_LIFECYCLE_RESOLVED = ("resolved",)
 _FAIL_HISTORY_MAX = 50
 
 
@@ -2981,7 +2979,7 @@ def reopen_finding(
     severity: Optional[str] = None, evidence: Optional[dict] = None,
 ) -> SimpleNamespace:
     """REOPEN branch: recently-resolved finding failing again. Revive it
-    (reopened_count++, status='detected') instead of creating a duplicate;
+    (reopened_count++, status='reopened') instead of creating a duplicate;
     first_detected_at stays put so the original break is preserved."""
     existing = get_finding(finding_id)
     if not existing:
@@ -2994,7 +2992,7 @@ def reopen_finding(
         "event": "reopened",
     })
     set_clauses = [
-        "STATUS = 'detected'",
+        "STATUS = 'reopened'",
         "REOPENED_COUNT = COALESCE(REOPENED_COUNT, 0) + 1",
         "LAST_SEEN_AT = CURRENT_TIMESTAMP()",
         "LAST_SCAN_ID = %(scan_id)s",
@@ -3044,7 +3042,7 @@ def create_finding_with_lifecycle(
              CURRENT_FAIL_COUNT, CURRENT_TOTAL_COUNT, FAIL_HISTORY, REOPENED_COUNT)
         SELECT
             %(id)s, %(asset_id)s, %(scan_id)s, %(instance_id)s, %(title)s, %(description)s,
-            'detected', %(severity)s,
+            'open', %(severity)s,
             PARSE_JSON(%(context)s), PARSE_JSON(%(evidence)s),
             CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), %(scan_id)s,
             %(fail_count)s, %(total_count)s, PARSE_JSON(%(fail_history)s), 0
@@ -3218,11 +3216,15 @@ def list_maintenance_proposals(
 
 
 def has_pending_maintenance_proposal(instance_id: str, action: str) -> bool:
+    """True if a proposal for (instance, action) is already pending OR was
+    previously dismissed. Dismissed proposals stay suppressed forever so the
+    weekly sweep doesn't nag the user with the same suggestion after they've
+    said no."""
     rows = sf_session.query(
         """
         SELECT ID FROM MAINTENANCE_PROPOSALS
         WHERE INSTANCE_ID = %(iid)s AND ACTION = %(action)s
-          AND STATUS = 'pending'
+          AND STATUS IN ('pending', 'dismissed')
         LIMIT 1
         """,
         {"iid": instance_id, "action": action},

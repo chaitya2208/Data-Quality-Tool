@@ -397,6 +397,18 @@ _MIGRATIONS = [
         )
         """,
     ),
+    (
+        # Data migration: old finding statuses (false_positive, wont_fix,
+        # assigned, validated, detected, etc.) were removed from the UI/enum.
+        # Any row that isn't one of the three current valid values and isn't
+        # 'superseded' (a lifecycle-internal marker) should be treated as open.
+        "backfill_legacy_finding_statuses",
+        """
+        UPDATE FINDINGS
+        SET STATUS = 'open', UPDATED_AT = CURRENT_TIMESTAMP()
+        WHERE STATUS NOT IN ('open', 'reopened', 'resolved', 'superseded')
+        """,
+    ),
 ]
 
 

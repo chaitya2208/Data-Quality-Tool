@@ -264,7 +264,7 @@ def _finding(
         "title": title,
         "description": description,
         "severity": rule.severity,
-        "status": "detected",
+        "status": "open",
         "context": context,
         "evidence": ev,
     }

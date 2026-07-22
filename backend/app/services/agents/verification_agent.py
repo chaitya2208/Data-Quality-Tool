@@ -9,7 +9,7 @@ from app.services.rule_engine import RuleEngine
 logger = logging.getLogger(__name__)
 
 # Statuses that are already considered closed — skip re-checking these
-CLOSED_STATUSES = {"resolved", "false_positive", "wont_fix", "closed", "superseded"}
+CLOSED_STATUSES = {"resolved"}
 
 
 class VerificationAgent:

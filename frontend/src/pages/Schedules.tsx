@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { fmtIST } from '../utils/dates'
 import {
   schedulesApi, workflowsApi, assetsApi,
@@ -135,11 +135,12 @@ interface ScheduleFormState {
   interval_unit: string
 }
 
-function ScheduleModal({
-  existing, onClose,
+export function ScheduleModal({
+  existing, onClose, prefillWorkflowId,
 }: {
   existing: Schedule | null
   onClose: () => void
+  prefillWorkflowId?: string
 }) {
   const qc = useQueryClient()
   const { selectedId } = useConnection()
@@ -214,6 +215,17 @@ function ScheduleModal({
       return next
     })
   }
+
+  // Apply a caller-provided prefill (e.g. "Create Schedule" from Saved
+  // Workflows) once workflows have loaded and only on initial open — later
+  // manual changes to the picker shouldn't be re-overwritten.
+  const prefillApplied = useRef(false)
+  useEffect(() => {
+    if (existing || !prefillWorkflowId || prefillApplied.current) return
+    if (!workflows.length) return
+    onPickWorkflow(prefillWorkflowId)
+    prefillApplied.current = true
+  }, [prefillWorkflowId, existing, workflows])
 
   const buildPayload = (): ScheduleCreatePayload => ({
     name: form.name.trim(),
@@ -418,9 +430,25 @@ function ScheduleModal({
 export default function Schedules() {
   const qc = useQueryClient()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [modalOpen, setModalOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<Schedule | null>(null)
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+  const [prefillWorkflowId, setPrefillWorkflowId] = useState<string | undefined>(undefined)
+
+  // Deep link: /schedules?new_from_workflow=<id> opens the create modal with
+  // that saved workflow preselected. Clears the param after consuming so a
+  // refresh doesn't re-open the modal.
+  useEffect(() => {
+    const wfId = searchParams.get('new_from_workflow')
+    if (wfId) {
+      setEditTarget(null)
+      setPrefillWorkflowId(wfId)
+      setModalOpen(true)
+      searchParams.delete('new_from_workflow')
+      setSearchParams(searchParams, { replace: true })
+    }
+  }, [searchParams, setSearchParams])
 
   const { data: schedules = [], isLoading } = useQuery({
     queryKey: ['schedules'],
@@ -577,7 +605,8 @@ export default function Schedules() {
       {modalOpen && (
         <ScheduleModal
           existing={editTarget}
-          onClose={() => { setModalOpen(false); setEditTarget(null) }}
+          prefillWorkflowId={prefillWorkflowId}
+          onClose={() => { setModalOpen(false); setEditTarget(null); setPrefillWorkflowId(undefined) }}
         />
       )}
     </div>
