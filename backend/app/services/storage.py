@@ -464,7 +464,11 @@ def list_findings(
         where.append("ASSET_ID = %(asset_id)s")
         params["asset_id"] = asset_id
     if scan_id:
-        where.append("SCAN_ID = %(scan_id)s")
+        # Findings touched by this scan — created here (SCAN_ID) OR updated/
+        # reopened here (LAST_SCAN_ID). UPDATE and REOPEN preserve the original
+        # SCAN_ID and only move LAST_SCAN_ID, so filtering on SCAN_ID alone
+        # would hide still-open incidents this scan re-detected.
+        where.append("(SCAN_ID = %(scan_id)s OR LAST_SCAN_ID = %(scan_id)s)")
         params["scan_id"] = scan_id
     if connection_id:
         where.append(_findings_connection_clause(connection_id, params))
@@ -502,7 +506,19 @@ def list_findings(
 
 
 def list_findings_by_scan(scan_id: str) -> list[SimpleNamespace]:
-    rows = sf_session.query("SELECT * FROM FINDINGS WHERE SCAN_ID = %(scan_id)s", {"scan_id": scan_id})
+    """All findings involved in a specific scan — created here (SCAN_ID) OR
+    updated/reopened here (LAST_SCAN_ID). Filtering on SCAN_ID alone misses
+    still-open findings the lifecycle finalizer's UPDATE and REOPEN branches
+    touched (they preserve the original SCAN_ID and only move LAST_SCAN_ID),
+    which is what made a run report findings_count=1 but return 0 findings to
+    the workflow UI (rules_used_count=0, 0/0 resolved)."""
+    rows = sf_session.query(
+        """
+        SELECT * FROM FINDINGS
+        WHERE SCAN_ID = %(scan_id)s OR LAST_SCAN_ID = %(scan_id)s
+        """,
+        {"scan_id": scan_id},
+    )
     return [_finding_from_row(r) for r in rows]
 
 
@@ -1748,13 +1764,19 @@ def get_agent_run_by_scan(scan_id: str) -> Optional[SimpleNamespace]:
 
 
 def count_open_findings_for_scan(scan_id: str) -> int:
-    """Number of still-open (detected/validated/in_progress) findings for a scan.
-    Used to decide whether resolving a finding has cleared a run's whole queue."""
+    """Number of still-open (detected/validated/in_progress) findings involved
+    in a scan. Used to decide whether resolving a finding has cleared a run's
+    whole queue. Matches on SCAN_ID (created here) OR LAST_SCAN_ID (updated/
+    reopened here) — see list_findings_by_scan for the same reasoning."""
     if not scan_id:
         return 0
     in_open = ", ".join(f"'{s}'" for s in _OPEN_FINDING_STATUSES)
     rows = sf_session.query(
-        f"SELECT COUNT(*) AS CNT FROM FINDINGS WHERE SCAN_ID = %(scan_id)s AND STATUS IN ({in_open})",
+        f"""
+        SELECT COUNT(*) AS CNT FROM FINDINGS
+        WHERE (SCAN_ID = %(scan_id)s OR LAST_SCAN_ID = %(scan_id)s)
+          AND STATUS IN ({in_open})
+        """,
         {"scan_id": scan_id},
     )
     return rows[0]["CNT"] if rows else 0
@@ -2751,6 +2773,36 @@ def get_feedback_memo(bare_table_name: str, table_type: str) -> Optional[dict]:
     except Exception as e:
         logger.warning(f"[storage] get_feedback_memo failed: {type(e).__name__}: {e}")
         return None
+
+
+def get_feedback_memos_by_bare_name(bare_table_name: str) -> dict[str, dict]:
+    """All feedback memos for a bare table name, keyed by TABLE_TYPE — one
+    query instead of the per-type serial loop the intelligence agent used to
+    run at prompt-build time (7 sequential Snowflake round-trips → 1).
+    Empty dict if none exist."""
+    try:
+        rows = sf_session.query(
+            """
+            SELECT TABLE_TYPE, MEMO, LESSON_COUNT, UPDATED_AT
+            FROM DQ_APP.RULE_FEEDBACK_MEMOS
+            WHERE BARE_TABLE_NAME = %(name)s
+            """,
+            {"name": bare_table_name.upper()},
+        )
+        out: dict[str, dict] = {}
+        for r in rows:
+            memo = _parse_json(r.get("MEMO"))
+            if not isinstance(memo, dict):
+                continue
+            memo["_lesson_count"] = r.get("LESSON_COUNT", 0)
+            memo["_updated_at"] = str(r.get("UPDATED_AT", ""))
+            ttype = (r.get("TABLE_TYPE") or "").lower()
+            if ttype:
+                out[ttype] = memo
+        return out
+    except Exception as e:
+        logger.warning(f"[storage] get_feedback_memos_by_bare_name failed: {type(e).__name__}: {e}")
+        return {}
 
 
 def upsert_feedback_memo(

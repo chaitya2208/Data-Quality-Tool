@@ -1550,14 +1550,19 @@ class RuleIntelligenceAgent:
             parts.append("\n".join(lines))
 
         # ── Synthesised feedback memo (highest signal) ───────────────────
+        # Single batched query for every table_type we might match. The
+        # previous per-type serial loop ran 7 Snowflake round-trips at the
+        # start of every RuleIntelligence call — measured ~2-4s of dead time
+        # per run — and only one of those queries could ever hit a row.
         memo = None
         try:
             bare_table = table_asset.fqn.upper().split(".")[-1]
-            # We don't know table_type yet (that's Claude's output), so we try
-            # common types; the memo for the right type will have higher
-            # confidence and the others will be absent.
+            memos_by_type = storage.get_feedback_memos_by_bare_name(bare_table)
+            # Priority order matches the old loop's fall-through: fact wins if
+            # both fact and dimension memos exist and both clear the confidence
+            # gate, etc.
             for ttype in ["fact", "dimension", "staging", "audit", "reference", "config", "unknown"]:
-                m = storage.get_feedback_memo(bare_table, ttype)
+                m = memos_by_type.get(ttype)
                 if m and m.get("confidence", 0) >= 40:
                     memo = m
                     break

@@ -80,8 +80,11 @@ class TestCreate:
             findings_data=[_fd("inst-1", "asset-1")],
             executed_instance_ids={"inst-1"},
         )
-        assert stats == {"created": 1, "updated": 0, "resolved": 0,
-                         "reopened": 0, "muted": 0}
+        assert {k: stats[k] for k in ("created", "updated", "resolved", "reopened", "muted")} == \
+               {"created": 1, "updated": 0, "resolved": 0, "reopened": 0, "muted": 0}
+        # events surface per-finding lifecycle info for the UI (see finalizer)
+        assert len(stats["events"]) == 1
+        assert stats["events"][0]["event"] == "created"
         assert len(storage.findings) == 1
         f = list(storage.findings.values())[0]
         assert f.status == "detected"
@@ -136,8 +139,13 @@ class TestUpdate:
                          findings_data=[_fd("inst-1", "asset-1", fail_count=8)],
                          executed_instance_ids={"inst-1"})
 
-        assert stats == {"updated": 1, "created": 0, "resolved": 0,
-                         "reopened": 0, "muted": 0}
+        assert {k: stats[k] for k in ("created", "updated", "resolved", "reopened", "muted")} == \
+               {"updated": 1, "created": 0, "resolved": 0, "reopened": 0, "muted": 0}
+        # Update event carries prev→curr counts so the UI can show the delta
+        evt = stats["events"][0]
+        assert evt["event"] == "updated"
+        assert evt["prev_fail_count"] == 3
+        assert evt["curr_fail_count"] == 8
         f = storage.findings[f.id]
         assert f.status == "detected"
         assert f.current_fail_count == 8
@@ -192,8 +200,9 @@ class TestResolve:
         stats = finalize(scan_id="scan-2", asset_id_for_passed="asset-1",
                          findings_data=[],  # rule passed
                          executed_instance_ids={"inst-1"})
-        assert stats == {"resolved": 1, "created": 0, "updated": 0,
-                         "reopened": 0, "muted": 0}
+        assert {k: stats[k] for k in ("created", "updated", "resolved", "reopened", "muted")} == \
+               {"resolved": 1, "created": 0, "updated": 0, "reopened": 0, "muted": 0}
+        assert stats["events"][0]["event"] == "resolved"
         assert storage.findings[f.id].status == "resolved"
         assert storage.findings[f.id].resolution_notes == "Auto-resolved by rescan"
         assert storage.findings[f.id].resolved_at is not None
@@ -203,8 +212,9 @@ class TestResolve:
         stats = finalize(scan_id="scan-1", asset_id_for_passed="asset-1",
                           findings_data=[],
                           executed_instance_ids={"inst-1"})
-        assert stats == {"resolved": 0, "created": 0, "updated": 0,
-                         "reopened": 0, "muted": 0}
+        assert {k: stats[k] for k in ("created", "updated", "resolved", "reopened", "muted")} == \
+               {"resolved": 0, "created": 0, "updated": 0, "reopened": 0, "muted": 0}
+        assert stats["events"] == []
 
     def test_pass_does_not_touch_already_resolved_findings(self, finalizer_env):
         finalize, storage = finalizer_env
@@ -237,8 +247,9 @@ class TestReopen:
         stats = finalize(scan_id="scan-2", asset_id_for_passed="asset-1",
                          findings_data=[_fd("inst-1", "asset-1", fail_count=4)],
                          executed_instance_ids={"inst-1"})
-        assert stats == {"reopened": 1, "created": 0, "updated": 0,
-                         "resolved": 0, "muted": 0}
+        assert {k: stats[k] for k in ("created", "updated", "resolved", "reopened", "muted")} == \
+               {"reopened": 1, "created": 0, "updated": 0, "resolved": 0, "muted": 0}
+        assert stats["events"][0]["event"] == "reopened"
         f = storage.findings[f.id]
         assert f.status == "detected"
         assert f.reopened_count == 1
@@ -291,8 +302,8 @@ class TestMutes:
         stats = finalize(scan_id="scan-1", asset_id_for_passed="asset-1",
                          findings_data=[_fd("inst-1", "asset-1")],
                          executed_instance_ids={"inst-1"})
-        assert stats == {"muted": 1, "created": 0, "updated": 0,
-                         "resolved": 0, "reopened": 0}
+        assert {k: stats[k] for k in ("created", "updated", "resolved", "reopened", "muted")} == \
+               {"muted": 1, "created": 0, "updated": 0, "resolved": 0, "reopened": 0}
         assert len(storage.findings) == 0
 
     def test_muted_failure_does_not_update_open_finding(self, finalizer_env):

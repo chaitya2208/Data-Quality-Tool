@@ -165,7 +165,28 @@ class FindingsAgent:
         )
 
         findings = storage.list_findings_by_scan(scan.id)
-        logger.info(f"[FindingsAgent] Done — {len(findings)} findings")
+        # Annotate each finding with the lifecycle event that produced it in
+        # this scan (created / updated / reopened) plus prev/curr counts, so
+        # the UI can show "was N failing rows, now M" instead of a static
+        # count that hides whether anything changed. Events for findings this
+        # scan didn't touch (rare — e.g. a finding on a different asset) get
+        # no event and the UI treats them as pre-existing / unchanged.
+        events_by_id = {e["finding_id"]: e for e in stats.get("events", [])}
+        for f in findings:
+            evt = events_by_id.get(f.id)
+            if evt:
+                f.lifecycle_event = evt["event"]
+                f.prev_fail_count = evt.get("prev_fail_count")
+                f.prev_total_count = evt.get("prev_total_count")
+        logger.info(
+            f"[FindingsAgent] Done — {len(findings)} findings "
+            f"(created={stats['created']} updated={stats['updated']} "
+            f"reopened={stats['reopened']} auto_resolved={stats['resolved']})"
+        )
+        # Stash lifecycle stats on the scan object so the coordinator can
+        # write them into the findings_agent task output without needing a
+        # separate return channel.
+        setattr(scan, "lifecycle_stats", stats)
         return findings
 
     def _resolve_handler_codes(self, instance_ids: Set[str]) -> Set[str]:

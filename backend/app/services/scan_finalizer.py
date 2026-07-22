@@ -55,7 +55,7 @@ def finalize_scan(
     asset_id_for_passed: str,
     findings_data: List[Dict[str, Any]],
     executed_instance_ids: Set[str],
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """Apply the lifecycle state machine.
 
     Args:
@@ -74,9 +74,19 @@ def finalize_scan(
             Used to compute the passed set = executed - failed.
 
     Returns:
-        {"updated": n, "resolved": n, "reopened": n, "created": n, "muted": n}
+        Counts by branch — `{"updated": n, "resolved": n, "reopened": n,
+        "created": n, "muted": n}` — plus `"events"`: a list of per-finding
+        lifecycle events for THIS scan, shape
+            {finding_id, event: "created"|"updated"|"reopened"|"resolved",
+             instance_id, asset_id, prev_fail_count, prev_total_count,
+             curr_fail_count, curr_total_count}
+        so callers can render "N created / M updated (was → now) / K reopened"
+        instead of a static "N findings" that hides what actually changed.
     """
-    stats = {"updated": 0, "resolved": 0, "reopened": 0, "created": 0, "muted": 0}
+    stats: Dict[str, Any] = {
+        "updated": 0, "resolved": 0, "reopened": 0, "created": 0, "muted": 0,
+        "events": [],
+    }
 
     failed_by_instance: Dict[str, Dict[str, Any]] = {}
     for fd in findings_data:
@@ -102,6 +112,16 @@ def finalize_scan(
                     continue
                 storage.auto_resolve_finding(existing.id, scan_id)
                 stats["resolved"] += 1
+                stats["events"].append({
+                    "finding_id": existing.id,
+                    "event": "resolved",
+                    "instance_id": instance_id,
+                    "asset_id": asset_id,
+                    "prev_fail_count": getattr(existing, "current_fail_count", None),
+                    "prev_total_count": getattr(existing, "current_total_count", None),
+                    "curr_fail_count": 0,
+                    "curr_total_count": getattr(existing, "current_total_count", None),
+                })
                 resolved_any = True
         if not resolved_any:
             pass  # rule passed, nothing was open — noop
@@ -125,33 +145,71 @@ def finalize_scan(
 
         open_f = storage.find_open_finding(instance_id, asset_id)
         if open_f:
+            prev_fail = getattr(open_f, "current_fail_count", None)
+            prev_total = getattr(open_f, "current_total_count", None)
             storage.apply_finding_update(
                 open_f.id, scan_id,
                 fail_count=fail_count, total_count=total_count,
                 severity=severity, evidence=evidence,
             )
             stats["updated"] += 1
+            stats["events"].append({
+                "finding_id": open_f.id,
+                "event": "updated",
+                "instance_id": instance_id,
+                "asset_id": asset_id,
+                "prev_fail_count": prev_fail,
+                "prev_total_count": prev_total,
+                "curr_fail_count": fail_count,
+                "curr_total_count": total_count,
+            })
             continue
 
         resolved_f = storage.find_recently_resolved_finding(
             instance_id, asset_id, within_days=REOPEN_WINDOW_DAYS,
         )
         if resolved_f:
+            prev_fail = getattr(resolved_f, "current_fail_count", None)
+            prev_total = getattr(resolved_f, "current_total_count", None)
             storage.reopen_finding(
                 resolved_f.id, scan_id,
                 fail_count=fail_count, total_count=total_count,
                 severity=severity, evidence=evidence,
             )
             stats["reopened"] += 1
+            stats["events"].append({
+                "finding_id": resolved_f.id,
+                "event": "reopened",
+                "instance_id": instance_id,
+                "asset_id": asset_id,
+                # For a reopen, "previous" is the state just before it was
+                # resolved — same fields on the row (they aren't zeroed on
+                # auto-resolve). Lets the UI say "was 5 failing rows, resolved,
+                # now failing again with 7".
+                "prev_fail_count": prev_fail,
+                "prev_total_count": prev_total,
+                "curr_fail_count": fail_count,
+                "curr_total_count": total_count,
+            })
             continue
 
-        storage.create_finding_with_lifecycle(
+        created = storage.create_finding_with_lifecycle(
             asset_id=asset_id, scan_id=scan_id, instance_id=instance_id,
             title=fd["title"], description=fd["description"],
             severity=severity, context=fd.get("context"), evidence=evidence,
             fail_count=fail_count, total_count=total_count,
         )
         stats["created"] += 1
+        stats["events"].append({
+            "finding_id": created.id,
+            "event": "created",
+            "instance_id": instance_id,
+            "asset_id": asset_id,
+            "prev_fail_count": None,
+            "prev_total_count": None,
+            "curr_fail_count": fail_count,
+            "curr_total_count": total_count,
+        })
 
     logger.info(
         f"[finalize_scan] scan={scan_id} updated={stats['updated']} "
