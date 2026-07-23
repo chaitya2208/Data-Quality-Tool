@@ -749,7 +749,7 @@ export interface SystemInfo {
 
 export const settingsApi = {
   get: () => api.get<SettingsMap>('/settings'),
-  update: (updates: Record<string, number>) => api.patch<SettingsMap>('/settings', { updates }),
+  update: (updates: Record<string, number | string>) => api.patch<SettingsMap>('/settings', { updates }),
   systemInfo: () => api.get<SystemInfo>('/settings/system-info'),
 };
 

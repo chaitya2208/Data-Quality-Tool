@@ -8,6 +8,7 @@ from pathlib import Path
 from app.services.snowflake_session import session as sf_session
 from app.services.rule_engine import initialize_default_rules
 from app.services.connection_seed import seed_default_connection
+from app.services.migrations import run_migrations
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -28,9 +29,18 @@ def _strip_line_comment(line: str) -> str:
     return line if idx == -1 else line[:idx]
 
 
+def _substitute_env(sql: str) -> str:
+    """Replace hardcoded PLAYGROUND_DB.DQ_APP with env-configured values."""
+    from app.core.config import settings
+    db = settings.SNOWFLAKE_DATABASE
+    schema = settings.SNOWFLAKE_APP_SCHEMA
+    return sql.replace("PLAYGROUND_DB.DQ_APP", f"{db}.{schema}").replace("PLAYGROUND_DB", db)
+
+
 def _run_sql_file(path: Path) -> None:
     logger.info(f"Running {path.name}...")
     sql_text = path.read_text(encoding="utf-8")
+    sql_text = _substitute_env(sql_text)
     cleaned = "\n".join(_strip_line_comment(line) for line in sql_text.splitlines())
     statements = [s.strip() for s in cleaned.split(";") if s.strip()]
     conn = sf_session.get_connection()
@@ -50,6 +60,14 @@ def setup_database():
         if sql_file.name.startswith("_"):
             continue
         _run_sql_file(sql_file)
+
+    # Run the same idempotent migrations the backend runs at startup — creates
+    # the ~17 additional tables that live in migrations.py (WORKFLOW_TEMPLATES,
+    # SCHEDULES, LINEAGE_*, METRIC_*, NOTIFICATIONS, PENDING_PROPOSALS,
+    # RELATIONSHIP_CATALOG, …) so setup_db.py alone leaves a fresh env fully
+    # schema-complete without having to boot uvicorn first.
+    logger.info("Running migrations...")
+    run_migrations()
 
     # Seed default rule definitions and the default Snowflake connection.
     logger.info("Initializing default rules...")

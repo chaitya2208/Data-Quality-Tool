@@ -111,6 +111,45 @@ class SnowflakeSession:
 
         self._connection = snowflake.connector.connect(**params, insecure_mode=True, login_timeout=120)
         logger.info("Snowflake connection established.")
+        # UI-configurable role/warehouse override, applied right after login so
+        # every subsequent query runs under the user's chosen defaults instead
+        # of the .env baseline. No-op when the settings are empty.
+        try:
+            self.apply_session_defaults()
+        except Exception as e:
+            logger.warning(f"apply_session_defaults on connect failed: {e}")
+
+    def apply_session_defaults(self) -> None:
+        """Read default_role / default_warehouse from settings and USE them on
+        the shared connection. Called on connect() and after a settings PATCH."""
+        # Deferred import — settings_service imports storage which uses this session.
+        from app.services.settings_service import get_default_role, get_default_warehouse
+        role = get_default_role()
+        wh = get_default_warehouse()
+        if not role and not wh:
+            return
+        conn = self.get_connection()
+        with self._exec_lock:
+            cur = conn.cursor()
+            try:
+                if role:
+                    logger.info(f"Applying default role from settings: {role}")
+                    cur.execute(f"USE ROLE {role}")
+                if wh:
+                    logger.info(f"Applying default warehouse from settings: {wh}")
+                    cur.execute(f"USE WAREHOUSE {wh}")
+            finally:
+                cur.close()
+        # Refresh the cached "current_role" so /ai/context reflects the new state
+        if self._context_cache:
+            try:
+                rows = self.query("SELECT CURRENT_ROLE() AS R, CURRENT_WAREHOUSE() AS W")
+                if rows:
+                    r = rows[0]
+                    if r.get("R") or r.get("r"):
+                        self._context_cache["current_role"] = r.get("R") or r.get("r")
+            except Exception:
+                pass
 
     def get_connection(self):
         if not self._connection:
@@ -249,8 +288,14 @@ class SnowflakeSession:
                 "SELECT CURRENT_ROLE() as r, CURRENT_WAREHOUSE() as w"
             )
             state = cur.fetchone() or {}
-            orig_role = state.get("R") or state.get("r") or settings.SNOWFLAKE_ROLE
-            orig_wh   = state.get("W") or state.get("w") or settings.SNOWFLAKE_WAREHOUSE
+            # Prefer the just-observed session role/wh; fall back to UI-configured
+            # defaults, then to .env. This keeps restore consistent with whatever
+            # apply_session_defaults() put in place at connect time.
+            from app.services.settings_service import get_default_role, get_default_warehouse
+            orig_role = (state.get("R") or state.get("r")
+                         or get_default_role() or settings.SNOWFLAKE_ROLE)
+            orig_wh   = (state.get("W") or state.get("w")
+                         or get_default_warehouse() or settings.SNOWFLAKE_WAREHOUSE)
 
             try:
                 logger.debug(f"USE ROLE {role}")

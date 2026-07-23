@@ -2613,7 +2613,7 @@ def append_intelligence_log_lessons(
     can read them as grounded guidance rather than raw thinking blobs.
 
     Table DDL (run once in Snowflake):
-        CREATE TABLE IF NOT EXISTS DQ_APP.RULE_REVIEW_LESSONS (
+        CREATE TABLE IF NOT EXISTS RULE_REVIEW_LESSONS (
             ID          VARCHAR PRIMARY KEY,
             RUN_ID      VARCHAR,
             TABLE_FQN   VARCHAR,
@@ -2629,7 +2629,7 @@ def append_intelligence_log_lessons(
         for lesson in lessons:
             sf_session.execute(
                 """
-                INSERT INTO DQ_APP.RULE_REVIEW_LESSONS
+                INSERT INTO RULE_REVIEW_LESSONS
                     (ID, RUN_ID, TABLE_FQN, VERDICT, CHECK_CONCEPT, COLUMN_NAME, SEVERITY, REASON)
                 SELECT %(id)s, %(run_id)s, %(table_fqn)s, %(verdict)s,
                        %(check_concept)s, %(column_name)s, %(severity)s, %(reason)s
@@ -2660,7 +2660,7 @@ def get_review_lessons_for_table(table_fqn: str, limit: int = 20) -> list:
         rows = sf_session.query(
             """
             SELECT VERDICT, CHECK_CONCEPT, COLUMN_NAME, SEVERITY, REASON, CREATED_AT
-            FROM DQ_APP.RULE_REVIEW_LESSONS
+            FROM RULE_REVIEW_LESSONS
             WHERE UPPER(SPLIT_PART(TABLE_FQN, '.', 3)) = %(table_name)s
                OR TABLE_FQN = %(fqn)s
             ORDER BY CREATED_AT DESC
@@ -2793,7 +2793,7 @@ def get_feedback_memo(bare_table_name: str, table_type: str) -> Optional[dict]:
         rows = sf_session.query(
             """
             SELECT MEMO, LESSON_COUNT, UPDATED_AT
-            FROM DQ_APP.RULE_FEEDBACK_MEMOS
+            FROM RULE_FEEDBACK_MEMOS
             WHERE BARE_TABLE_NAME = %(name)s
               AND TABLE_TYPE      = %(type)s
             LIMIT 1
@@ -2822,7 +2822,7 @@ def get_feedback_memos_by_bare_name(bare_table_name: str) -> dict[str, dict]:
         rows = sf_session.query(
             """
             SELECT TABLE_TYPE, MEMO, LESSON_COUNT, UPDATED_AT
-            FROM DQ_APP.RULE_FEEDBACK_MEMOS
+            FROM RULE_FEEDBACK_MEMOS
             WHERE BARE_TABLE_NAME = %(name)s
             """,
             {"name": bare_table_name.upper()},
@@ -2852,7 +2852,7 @@ def upsert_feedback_memo(
     """Insert or replace the feedback memo for this (bare_table_name, table_type)."""
     existing = sf_session.query(
         """
-        SELECT ID FROM DQ_APP.RULE_FEEDBACK_MEMOS
+        SELECT ID FROM RULE_FEEDBACK_MEMOS
         WHERE BARE_TABLE_NAME = %(name)s AND TABLE_TYPE = %(type)s
         LIMIT 1
         """,
@@ -2861,7 +2861,7 @@ def upsert_feedback_memo(
     if existing:
         sf_session.execute(
             """
-            UPDATE DQ_APP.RULE_FEEDBACK_MEMOS
+            UPDATE RULE_FEEDBACK_MEMOS
             SET MEMO         = PARSE_JSON(%(memo)s),
                 LESSON_COUNT = %(count)s,
                 UPDATED_AT   = CURRENT_TIMESTAMP()
@@ -2878,7 +2878,7 @@ def upsert_feedback_memo(
     else:
         sf_session.execute(
             """
-            INSERT INTO DQ_APP.RULE_FEEDBACK_MEMOS
+            INSERT INTO RULE_FEEDBACK_MEMOS
                 (ID, BARE_TABLE_NAME, TABLE_TYPE, MEMO, LESSON_COUNT)
             SELECT %(id)s, %(name)s, %(type)s, PARSE_JSON(%(memo)s), %(count)s
             """,
@@ -2904,7 +2904,7 @@ def get_lessons_for_synthesis(
         rows = sf_session.query(
             """
             SELECT VERDICT, CHECK_CONCEPT, COLUMN_NAME, SEVERITY, REASON
-            FROM DQ_APP.RULE_REVIEW_LESSONS
+            FROM RULE_REVIEW_LESSONS
             WHERE UPPER(SPLIT_PART(TABLE_FQN, '.', 3)) = %(bare)s
             ORDER BY CREATED_AT DESC
             LIMIT %(limit)s

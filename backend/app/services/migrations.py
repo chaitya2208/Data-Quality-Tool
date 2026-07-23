@@ -118,7 +118,7 @@ _MIGRATIONS = [
     (
         "create_rule_review_lessons",
         """
-        CREATE TABLE IF NOT EXISTS DQ_APP.RULE_REVIEW_LESSONS (
+        CREATE TABLE IF NOT EXISTS RULE_REVIEW_LESSONS (
             ID            VARCHAR(36)    NOT NULL PRIMARY KEY,
             RUN_ID        VARCHAR(36)    NOT NULL,
             TABLE_FQN     VARCHAR(500)   NOT NULL,
@@ -134,7 +134,7 @@ _MIGRATIONS = [
     (
         "create_rule_feedback_memos",
         """
-        CREATE TABLE IF NOT EXISTS DQ_APP.RULE_FEEDBACK_MEMOS (
+        CREATE TABLE IF NOT EXISTS RULE_FEEDBACK_MEMOS (
             ID                 VARCHAR(36)    NOT NULL PRIMARY KEY,
             BARE_TABLE_NAME    VARCHAR(200)   NOT NULL,
             TABLE_TYPE         VARCHAR(50)    NOT NULL,
@@ -377,6 +377,33 @@ _MIGRATIONS = [
             CREATED_BY  VARCHAR(255),
             CREATED_AT  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
             UPDATED_AT  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            PRIMARY KEY (ID)
+        )
+        """,
+    ),
+    # Cross-table FK relationships discovered by relationship_discovery so
+    # RuleIntelligenceAgent's referential_integrity proposals have real
+    # ref_table/ref_column candidates. Read/written by storage.py
+    # list_relationships/save_relationships.
+    (
+        "create_relationship_catalog",
+        """
+        CREATE TABLE IF NOT EXISTS RELATIONSHIP_CATALOG (
+            ID               VARCHAR(36)  NOT NULL,
+            DATABASE_NAME    VARCHAR(255) NOT NULL,
+            SCHEMA_NAME      VARCHAR(255) NOT NULL,
+            FROM_TABLE       VARCHAR(255) NOT NULL,
+            FROM_COLUMN      VARCHAR(255) NOT NULL,
+            TO_TABLE         VARCHAR(255) NOT NULL,
+            TO_COLUMN        VARCHAR(255) NOT NULL,
+            STATUS           VARCHAR(20)  NOT NULL DEFAULT 'confirmed',
+            CONFIDENCE       VARCHAR(30)  NOT NULL DEFAULT 'name_match',
+            ORPHAN_RATE      FLOAT,
+            SAMPLE_TOTAL     NUMBER(38,0),
+            SAMPLE_ORPHANS   NUMBER(38,0),
+            DISCOVERED_AT    TIMESTAMP_TZ(9) NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+            LAST_VERIFIED_AT TIMESTAMP_TZ(9) NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+            CREATED_AT       TIMESTAMP_TZ(9) NOT NULL DEFAULT CURRENT_TIMESTAMP(),
             PRIMARY KEY (ID)
         )
         """,
