@@ -72,8 +72,15 @@ python setup_db.py
 ```
 
 This will:
-- Create the DQ_APP schema and all app tables in Snowflake (see `backend/snowflake/*.sql`)
+- Create the DQ_APP schema and all app tables in Snowflake (base DDL in
+  `backend/snowflake/*.sql` plus every incremental table defined in
+  `backend/app/services/migrations.py` — ~30 tables total including
+  RELATIONSHIP_CATALOG, LINEAGE_*, METRIC_*, SCHEDULES, WORKFLOW_TEMPLATES,
+  NOTIFICATIONS, PENDING_PROPOSALS, etc.)
 - Seed default rules (MISSING_TABLE_COMMENT, MISSING_TABLE_OWNER, MISSING_COLUMN_COMMENT, plus the 12 dynamic rule codes)
+- Seed the default Snowflake connection row from your `.env`
+
+Everything is idempotent — safe to re-run.
 
 ## Step 3: Start the Backend Server
 
